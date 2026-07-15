@@ -108,10 +108,14 @@ class DiffusionLoRAManager:
         # Track the maximum LoRA rank we've allocated buffers for.
         self._max_lora_rank: int = 0
 
-        # Merge-on-load state (see __init__ docstring). `_pristine_weights`
-        # holds copies of base weights taken just before the first merge into
-        # that layer; unmerge restores from these bitwise-exactly.
+        # Merge-on-load state (see __init__ docstring). `merge_on_load` keeps
+        # the user's request; `_merge_enabled` is the effective mode, cleared
+        # if ineligible target layers force a fallback to installed wrappers.
+        # `_pristine_weights` holds copies of base weights taken just before
+        # the first merge into that layer; unmerge restores from these
+        # bitwise-exactly.
         self.merge_on_load = merge_on_load
+        self._merge_enabled: bool = merge_on_load
         self._merged: bool = False
         self._pristine_weights: dict[str, torch.Tensor] = {}
         # True once wrappers have been installed into the module tree the
@@ -469,7 +473,7 @@ class DiffusionLoRAManager:
         # Shadow mode: keep wrappers uninstalled so the module tree stays
         # identical to the non-LoRA case (installed wrappers fragment
         # torch.compile'd graphs, costing far more than the LoRA matmuls).
-        install = self._wrappers_installed or not self.merge_on_load
+        install = self._wrappers_installed or not self._merge_enabled
         if not install:
             ineligible = [name for _, _, name, w in created if not self._layer_merge_eligible(w)]
             if ineligible:
@@ -479,7 +483,7 @@ class DiffusionLoRAManager:
                     len(ineligible),
                     ineligible[0],
                 )
-                self.merge_on_load = False
+                self._merge_enabled = False
                 install = True
 
         for component, module_name, full_module_name, lora_layer in created:
@@ -692,7 +696,7 @@ class DiffusionLoRAManager:
         self._active_adapter_id = adapter_id
         self._update_adapter_scale(adapter_id, scale)
 
-        if self.merge_on_load:
+        if self._merge_enabled:
             self._merge_active_adapter()
 
     def _module_merge_eligible(self, base_layer: nn.Module | None) -> bool:
@@ -754,7 +758,7 @@ class DiffusionLoRAManager:
         ineligible = [name for name, layer in self._lora_modules.items() if not self._layer_merge_eligible(layer)]
         if ineligible:
             # Merging only runs in shadow mode (creation-time fallback installs
-            # wrappers and clears merge_on_load), so there is nothing to fall
+            # wrappers and clears _merge_enabled), so there is nothing to fall
             # back to; failing loudly beats silently dropping the adapter.
             raise RuntimeError(
                 f"merge_on_load: {len(ineligible)} layer(s) cannot be weight-merged (e.g. {ineligible[0]})"
@@ -774,7 +778,7 @@ class DiffusionLoRAManager:
             merged_layers += 1
 
         self._merged = merged_layers > 0
-        logger.info("Merged active LoRA into base weights: %d layers", merged_layers)
+        logger.debug("Merged active LoRA into base weights: %d layers", merged_layers)
 
     def _unmerge_active_adapter(self) -> None:
         """Restore pristine base weights for all previously merged layers."""

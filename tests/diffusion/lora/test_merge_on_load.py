@@ -62,6 +62,12 @@ class _MergeableLoRALayer(torch.nn.Module):
             b.zero_()
         self._diffusion_lora_active_slices = (False,) * self.n_slices
 
+    def create_lora_weights(self, max_loras, lora_config, model_config=None):
+        max_rank = lora_config.max_lora_rank
+        self.lora_a_stacked = tuple(torch.zeros(1, 1, max_rank, IN_DIM) for _ in self.output_slices)
+        self.lora_b_stacked = tuple(torch.zeros(1, 1, s, max_rank) for s in self.output_slices)
+        self._diffusion_lora_active_slices = (False,) * self.n_slices
+
 
 class _StubLoRAModel:
     def __init__(self, loras: dict[str, LoRALayerWeights]):
@@ -165,6 +171,35 @@ def test_scale_change_remerges():
     assert torch.allclose(layer.base_layer.weight, expected, atol=1e-6)
 
 
+def test_rank_growth_while_merged():
+    """A larger-rank adapter arriving while another is merged goes through
+    _ensure_max_lora_rank, which recreates buffers and re-activates the merged
+    adapter mid-flight; the final weight must be pristine + the new delta."""
+    layer = _MergeableLoRALayer((6,))
+    manager = _make_manager(merge_on_load=True, layer=layer)
+    small = _make_lora(rank=2, out_dim=6, seed=5)
+    big = _make_lora(rank=16, out_dim=6, seed=6)
+    _register(manager, 1, small)
+    _register(manager, 2, big)
+
+    w0 = layer.base_layer.weight.detach().clone()
+    manager._ensure_max_lora_rank(small.rank)
+    manager._activate_adapter(1, scale=1.0)
+    assert manager._merged
+    assert manager._max_lora_rank < big.rank  # next adapter must force a rank bump
+
+    # Mirrors _load_adapter: the bump happens while adapter 1 is still merged.
+    manager._ensure_max_lora_rank(big.rank)
+    manager._activate_adapter(2, scale=1.0)
+
+    expected = w0 + big.lora_b @ big.lora_a
+    assert torch.allclose(layer.base_layer.weight, expected, atol=1e-5)
+    assert torch.equal(manager._pristine_weights["transformer.foo"], w0)
+
+    manager._deactivate_all_adapters()
+    assert torch.equal(layer.base_layer.weight, w0)
+
+
 def test_packed_layer_merges_only_active_slices():
     layer = _MergeableLoRALayer((4, 3))
     manager = _make_manager(merge_on_load=True, layer=layer)
@@ -245,7 +280,7 @@ def test_merge_mode_shadow_wraps_without_installing(monkeypatch):
     # Module tree untouched (torch.compile graphs unaffected), wrapper tracked.
     assert replace_calls == []
     assert "transformer.foo" in manager._lora_modules
-    assert manager.merge_on_load
+    assert manager._merge_enabled
     assert not manager._wrappers_installed
 
 
@@ -258,7 +293,9 @@ def test_standard_mode_installs_wrappers(monkeypatch):
 def test_merge_mode_quantized_target_falls_back_to_install(monkeypatch):
     manager, replace_calls = _run_replace(monkeypatch, merge_on_load=True, quant_method=object())
     assert replace_calls == ["foo"]
-    assert not manager.merge_on_load
+    # The user's request is preserved; only the effective mode is cleared.
+    assert manager.merge_on_load
+    assert not manager._merge_enabled
     assert manager._wrappers_installed
 
 
