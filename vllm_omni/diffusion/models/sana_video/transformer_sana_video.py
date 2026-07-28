@@ -1,0 +1,765 @@
+# Copyright 2025 The HuggingFace Team and SANA-Video Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import math
+from collections.abc import Iterable
+from dataclasses import dataclass, fields
+
+import torch
+from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps, get_1d_rotary_pos_embed
+from diffusers.models.normalization import AdaLayerNormSingle, RMSNorm
+from torch import nn
+from vllm.model_executor.models.utils import AutoWeightsLoader
+
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.layer import Attention as OmniAttention
+
+
+@dataclass
+class SanaVideoTransformerConfig:
+    in_channels: int = 16
+    out_channels: int | None = 16
+    num_attention_heads: int = 20
+    attention_head_dim: int = 112
+    num_layers: int = 20
+    num_cross_attention_heads: int | None = 20
+    cross_attention_head_dim: int | None = 112
+    cross_attention_dim: int | None = 2240
+    caption_channels: int = 2304
+    mlp_ratio: float = 2.5
+    dropout: float = 0.0
+    attention_bias: bool = False
+    sample_size: int = 30
+    patch_size: tuple[int, int, int] = (1, 2, 2)
+    norm_elementwise_affine: bool = False
+    norm_eps: float = 1e-6
+    interpolation_scale: int | None = None
+    guidance_embeds: bool = False
+    guidance_embeds_scale: float = 0.1
+    qk_norm: str | None = "rms_norm_across_heads"
+    rope_max_seq_len: int = 1024
+
+    @classmethod
+    def from_dict(cls, config: dict) -> "SanaVideoTransformerConfig":
+        field_names = {field.name for field in fields(cls)}
+        unknown = {key for key in config if key not in field_names and not key.startswith("_")}
+        if unknown:
+            raise ValueError(f"Unsupported SANA-Video transformer config fields: {sorted(unknown)}")
+        values = {key: value for key, value in config.items() if key in field_names}
+        if "patch_size" in values:
+            values["patch_size"] = tuple(values["patch_size"])
+        return cls(**values)
+
+
+@dataclass
+class SanaVideoTransformerOutput:
+    sample: torch.Tensor
+
+
+class GLUMBTempConv(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        expand_ratio: float = 4,
+        norm_type: str | None = None,
+        residual_connection: bool = True,
+    ) -> None:
+        super().__init__()
+
+        hidden_channels = int(expand_ratio * in_channels)
+        self.norm_type = norm_type
+        self.residual_connection = residual_connection
+
+        self.nonlinearity = nn.SiLU()
+        self.conv_inverted = nn.Conv2d(in_channels, hidden_channels * 2, 1, 1, 0)
+        self.conv_depth = nn.Conv2d(hidden_channels * 2, hidden_channels * 2, 3, 1, 1, groups=hidden_channels * 2)
+        self.conv_point = nn.Conv2d(hidden_channels, out_channels, 1, 1, 0, bias=False)
+
+        self.norm = None
+        if norm_type == "rms_norm":
+            self.norm = RMSNorm(out_channels, eps=1e-5, elementwise_affine=True, bias=True)
+
+        self.conv_temp = nn.Conv2d(out_channels, out_channels, kernel_size=(3, 1), stride=1, padding=(1, 0), bias=False)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.residual_connection:
+            residual = hidden_states
+        batch_size, num_frames, height, width, num_channels = hidden_states.shape
+        hidden_states = hidden_states.view(batch_size * num_frames, height, width, num_channels).permute(0, 3, 1, 2)
+
+        hidden_states = self.conv_inverted(hidden_states)
+        hidden_states = self.nonlinearity(hidden_states)
+
+        hidden_states = self.conv_depth(hidden_states)
+        hidden_states, gate = torch.chunk(hidden_states, 2, dim=1)
+        hidden_states = hidden_states * self.nonlinearity(gate)
+
+        hidden_states = self.conv_point(hidden_states)
+
+        # Temporal aggregation
+        hidden_states_temporal = hidden_states.view(batch_size, num_frames, num_channels, height * width).permute(
+            0, 2, 1, 3
+        )
+        hidden_states = hidden_states_temporal + self.conv_temp(hidden_states_temporal)
+        hidden_states = hidden_states.permute(0, 2, 3, 1).view(batch_size, num_frames, height, width, num_channels)
+
+        if self.norm_type == "rms_norm":
+            # move channel to the last dimension so we apply RMSnorm across channel dimension
+            hidden_states = self.norm(hidden_states.movedim(1, -1)).movedim(-1, 1)
+
+        if self.residual_connection:
+            hidden_states = hidden_states + residual
+
+        return hidden_states
+
+
+class SanaLinearAttention(nn.Module):
+    """SANA's ReLU-kernel linear self-attention.
+
+    This is intentionally not routed through the unified softmax attention
+    layer because doing so would change the model's attention algorithm.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        head_dim: int,
+        dropout: float,
+        bias: bool,
+        qk_norm: str | None,
+    ) -> None:
+        super().__init__()
+        inner_dim = num_heads * head_dim
+        self.heads = num_heads
+        self.to_q = nn.Linear(dim, inner_dim, bias=bias)
+        self.to_k = nn.Linear(dim, inner_dim, bias=bias)
+        self.to_v = nn.Linear(dim, inner_dim, bias=bias)
+        self.norm_q = RMSNorm(inner_dim, eps=1e-5, elementwise_affine=True) if qk_norm is not None else None
+        self.norm_k = RMSNorm(inner_dim, eps=1e-5, elementwise_affine=True) if qk_norm is not None else None
+        self.to_out = nn.ModuleList([nn.Linear(inner_dim, dim, bias=True), nn.Dropout(dropout)])
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        original_dtype = hidden_states.dtype
+        query = self.to_q(hidden_states)
+        key = self.to_k(hidden_states)
+        value = self.to_v(hidden_states)
+
+        if self.norm_q is not None:
+            query = self.norm_q(query)
+        if self.norm_k is not None:
+            key = self.norm_k(key)
+
+        query = query.unflatten(2, (self.heads, -1))
+        key = key.unflatten(2, (self.heads, -1))
+        value = value.unflatten(2, (self.heads, -1))
+        # B,N,H,C
+
+        query = torch.relu(query)
+        key = torch.relu(key)
+
+        if rotary_emb is not None:
+
+            def apply_rotary_emb(
+                hidden_states: torch.Tensor,
+                freqs_cos: torch.Tensor,
+                freqs_sin: torch.Tensor,
+            ):
+                x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
+                cos = freqs_cos[..., 0::2]
+                sin = freqs_sin[..., 1::2]
+                out = torch.empty_like(hidden_states)
+                out[..., 0::2] = x1 * cos - x2 * sin
+                out[..., 1::2] = x1 * sin + x2 * cos
+                return out.type_as(hidden_states)
+
+            query_rotate = apply_rotary_emb(query, *rotary_emb)
+            key_rotate = apply_rotary_emb(key, *rotary_emb)
+
+        # B,H,C,N
+        query = query.permute(0, 2, 3, 1)
+        key = key.permute(0, 2, 3, 1)
+        query_rotate = query_rotate.permute(0, 2, 3, 1)
+        key_rotate = key_rotate.permute(0, 2, 3, 1)
+        value = value.permute(0, 2, 3, 1)
+
+        query_rotate, key_rotate, value = query_rotate.float(), key_rotate.float(), value.float()
+
+        z = 1 / (key.sum(dim=-1, keepdim=True).transpose(-2, -1) @ query + 1e-15)
+
+        scores = torch.matmul(value, key_rotate.transpose(-1, -2))
+        hidden_states = torch.matmul(scores, query_rotate)
+
+        hidden_states = hidden_states * z
+        # B,H,C,N
+        hidden_states = hidden_states.flatten(1, 2).transpose(1, 2)
+        hidden_states = hidden_states.to(original_dtype)
+
+        hidden_states = self.to_out[0](hidden_states)
+        hidden_states = self.to_out[1](hidden_states)
+
+        return hidden_states
+
+
+class WanRotaryPosEmbed(nn.Module):
+    def __init__(
+        self,
+        attention_head_dim: int,
+        patch_size: tuple[int, int, int],
+        max_seq_len: int,
+        theta: float = 10000.0,
+    ):
+        super().__init__()
+
+        self.attention_head_dim = attention_head_dim
+        self.patch_size = patch_size
+        self.max_seq_len = max_seq_len
+
+        h_dim = w_dim = 2 * (attention_head_dim // 6)
+        t_dim = attention_head_dim - h_dim - w_dim
+
+        self.t_dim = t_dim
+        self.h_dim = h_dim
+        self.w_dim = w_dim
+
+        freqs_dtype = torch.float32 if torch.backends.mps.is_available() else torch.float64
+
+        freqs_cos = []
+        freqs_sin = []
+
+        for dim in [t_dim, h_dim, w_dim]:
+            freq_cos, freq_sin = get_1d_rotary_pos_embed(
+                dim,
+                max_seq_len,
+                theta,
+                use_real=True,
+                repeat_interleave_real=True,
+                freqs_dtype=freqs_dtype,
+            )
+            freqs_cos.append(freq_cos)
+            freqs_sin.append(freq_sin)
+
+        self.register_buffer("freqs_cos", torch.cat(freqs_cos, dim=1), persistent=False)
+        self.register_buffer("freqs_sin", torch.cat(freqs_sin, dim=1), persistent=False)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, num_channels, num_frames, height, width = hidden_states.shape
+        p_t, p_h, p_w = self.patch_size
+        ppf, pph, ppw = num_frames // p_t, height // p_h, width // p_w
+
+        split_sizes = [self.t_dim, self.h_dim, self.w_dim]
+
+        freqs_cos = self.freqs_cos.split(split_sizes, dim=1)
+        freqs_sin = self.freqs_sin.split(split_sizes, dim=1)
+
+        freqs_cos_f = freqs_cos[0][:ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_cos_h = freqs_cos[1][:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_cos_w = freqs_cos[2][:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
+
+        freqs_sin_f = freqs_sin[0][:ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_sin_h = freqs_sin[1][:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_sin_w = freqs_sin[2][:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
+
+        freqs_cos = torch.cat([freqs_cos_f, freqs_cos_h, freqs_cos_w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
+        freqs_sin = torch.cat([freqs_sin_f, freqs_sin_h, freqs_sin_w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
+
+        return freqs_cos, freqs_sin
+
+
+class SanaModulatedNorm(nn.Module):
+    def __init__(self, dim: int, elementwise_affine: bool = False, eps: float = 1e-6):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, elementwise_affine=elementwise_affine, eps=eps)
+
+    def forward(self, hidden_states: torch.Tensor, temb: torch.Tensor, scale_shift_table: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.norm(hidden_states)
+        shift, scale = (scale_shift_table[None, None] + temb[:, :, None].to(scale_shift_table.device)).unbind(dim=2)
+        hidden_states = hidden_states * (1 + scale) + shift
+        return hidden_states
+
+
+class SanaCombinedTimestepGuidanceEmbeddings(nn.Module):
+    def __init__(self, embedding_dim):
+        super().__init__()
+        self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
+        self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
+
+        self.guidance_condition_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
+        self.guidance_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
+
+        self.silu = nn.SiLU()
+        self.linear = nn.Linear(embedding_dim, 6 * embedding_dim, bias=True)
+
+    def forward(self, timestep: torch.Tensor, guidance: torch.Tensor = None, hidden_dtype: torch.dtype = None):
+        timesteps_proj = self.time_proj(timestep)
+        timesteps_emb = self.timestep_embedder(timesteps_proj.to(dtype=hidden_dtype))  # (N, D)
+
+        guidance_proj = self.guidance_condition_proj(guidance)
+        guidance_emb = self.guidance_embedder(guidance_proj.to(dtype=hidden_dtype))
+        conditioning = timesteps_emb + guidance_emb
+
+        return self.linear(self.silu(conditioning)), conditioning
+
+
+class SanaCrossAttention(nn.Module):
+    """SANA cross-attention backed by vLLM-Omni's unified attention layer."""
+
+    def __init__(
+        self,
+        dim: int,
+        cross_attention_dim: int,
+        num_heads: int,
+        head_dim: int,
+        dropout: float,
+        bias: bool,
+        out_bias: bool,
+        qk_norm: str | None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        inner_dim = num_heads * head_dim
+        self.heads = num_heads
+        self.head_dim = head_dim
+        self.to_q = nn.Linear(dim, inner_dim, bias=bias)
+        self.to_k = nn.Linear(cross_attention_dim, inner_dim, bias=bias)
+        self.to_v = nn.Linear(cross_attention_dim, inner_dim, bias=bias)
+        self.norm_q = RMSNorm(inner_dim, eps=1e-5, elementwise_affine=True) if qk_norm is not None else None
+        self.norm_k = RMSNorm(inner_dim, eps=1e-5, elementwise_affine=True) if qk_norm is not None else None
+        self.to_out = nn.ModuleList([nn.Linear(inner_dim, dim, bias=out_bias), nn.Dropout(dropout)])
+        self.attn = OmniAttention(
+            num_heads=num_heads,
+            head_size=head_dim,
+            num_kv_heads=num_heads,
+            softmax_scale=1.0 / (head_dim**0.5),
+            causal=False,
+            role="cross",
+            qkv_layout="BSND",
+            prefix=prefix,
+            skip_sequence_parallel=True,
+            disable_kv_quant=True,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        query = self.to_q(hidden_states)
+        key = self.to_k(encoder_hidden_states)
+        value = self.to_v(encoder_hidden_states)
+
+        if self.norm_q is not None:
+            query = self.norm_q(query)
+        if self.norm_k is not None:
+            key = self.norm_k(key)
+
+        query = query.unflatten(2, (self.heads, self.head_dim))
+        key = key.unflatten(2, (self.heads, self.head_dim))
+        value = value.unflatten(2, (self.heads, self.head_dim))
+
+        if attention_mask is not None:
+            if attention_mask.ndim == 2:
+                attention_mask = (1 - attention_mask.to(query.dtype)) * -10000.0
+                attention_mask = attention_mask[:, None, None, :]
+            elif attention_mask.ndim == 3:
+                attention_mask = attention_mask[:, None, :, :]
+
+        attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
+        hidden_states = self.attn(query, key, value, attn_metadata)
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.type_as(query)
+
+        hidden_states = self.to_out[0](hidden_states)
+        return self.to_out[1](hidden_states)
+
+
+class SanaVideoTransformerBlock(nn.Module):
+    r"""
+    Transformer block introduced in [Sana-Video](https://huggingface.co/papers/2509.24695).
+    """
+
+    def __init__(
+        self,
+        dim: int = 2240,
+        num_attention_heads: int = 20,
+        attention_head_dim: int = 112,
+        dropout: float = 0.0,
+        num_cross_attention_heads: int | None = 20,
+        cross_attention_head_dim: int | None = 112,
+        cross_attention_dim: int | None = 2240,
+        attention_bias: bool = True,
+        norm_elementwise_affine: bool = False,
+        norm_eps: float = 1e-6,
+        attention_out_bias: bool = True,
+        mlp_ratio: float = 3.0,
+        qk_norm: str | None = "rms_norm_across_heads",
+        rope_max_seq_len: int = 1024,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+
+        # 1. Self Attention
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=norm_eps)
+        self.attn1 = SanaLinearAttention(
+            dim=dim,
+            num_heads=num_attention_heads,
+            head_dim=attention_head_dim,
+            dropout=dropout,
+            bias=attention_bias,
+            qk_norm=qk_norm,
+        )
+
+        # 2. Cross Attention
+        self.attn2 = None
+        if cross_attention_dim is not None:
+            self.norm2 = nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine, eps=norm_eps)
+            self.attn2 = SanaCrossAttention(
+                dim=dim,
+                cross_attention_dim=cross_attention_dim,
+                num_heads=num_cross_attention_heads,
+                head_dim=cross_attention_head_dim,
+                dropout=dropout,
+                bias=True,
+                out_bias=attention_out_bias,
+                qk_norm=qk_norm,
+                prefix=f"{prefix}.attn2" if prefix else "attn2",
+            )
+
+        # 3. Feed-forward
+        self.ff = GLUMBTempConv(dim, dim, mlp_ratio, norm_type=None, residual_connection=False)
+
+        self.scale_shift_table = nn.Parameter(torch.randn(6, dim) / dim**0.5)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        encoder_hidden_states: torch.Tensor | None = None,
+        encoder_attention_mask: torch.Tensor | None = None,
+        timestep: torch.LongTensor | None = None,
+        frames: int = None,
+        height: int = None,
+        width: int = None,
+        rotary_emb: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        batch_size = hidden_states.shape[0]
+
+        # 1. Modulation
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.scale_shift_table[None, None] + timestep.reshape(batch_size, timestep.shape[1], 6, -1)
+        ).unbind(dim=2)
+
+        # 2. Self Attention
+        norm_hidden_states = self.norm1(hidden_states)
+        norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
+        norm_hidden_states = norm_hidden_states.to(hidden_states.dtype)
+
+        attn_output = self.attn1(norm_hidden_states, rotary_emb=rotary_emb)
+        hidden_states = hidden_states + gate_msa * attn_output
+
+        # 3. Cross Attention
+        if self.attn2 is not None:
+            attn_output = self.attn2(
+                hidden_states,
+                encoder_hidden_states,
+                encoder_attention_mask,
+            )
+            hidden_states = attn_output + hidden_states
+
+        # 4. Feed-forward
+        norm_hidden_states = self.norm2(hidden_states)
+        norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
+
+        norm_hidden_states = norm_hidden_states.unflatten(1, (frames, height, width))
+        ff_output = self.ff(norm_hidden_states)
+        ff_output = ff_output.flatten(1, 3)
+        hidden_states = hidden_states + gate_mlp * ff_output
+
+        return hidden_states
+
+
+class SanaVideoTransformer3DModel(nn.Module):
+    r"""
+    A 3D Transformer model introduced in [Sana-Video](https://huggingface.co/papers/2509.24695) family of models.
+
+    Args:
+        in_channels (`int`, defaults to `16`):
+            The number of channels in the input.
+        out_channels (`int`, *optional*, defaults to `16`):
+            The number of channels in the output.
+        num_attention_heads (`int`, defaults to `20`):
+            The number of heads to use for multi-head attention.
+        attention_head_dim (`int`, defaults to `112`):
+            The number of channels in each head.
+        num_layers (`int`, defaults to `20`):
+            The number of layers of Transformer blocks to use.
+        num_cross_attention_heads (`int`, *optional*, defaults to `20`):
+            The number of heads to use for cross-attention.
+        cross_attention_head_dim (`int`, *optional*, defaults to `112`):
+            The number of channels in each head for cross-attention.
+        cross_attention_dim (`int`, *optional*, defaults to `2240`):
+            The number of channels in the cross-attention output.
+        caption_channels (`int`, defaults to `2304`):
+            The number of channels in the caption embeddings.
+        mlp_ratio (`float`, defaults to `2.5`):
+            The expansion ratio to use in the GLUMBConv layer.
+        dropout (`float`, defaults to `0.0`):
+            The dropout probability.
+        attention_bias (`bool`, defaults to `False`):
+            Whether to use bias in the attention layer.
+        sample_size (`int`, defaults to `32`):
+            The base size of the input latent.
+        patch_size (`int`, defaults to `1`):
+            The size of the patches to use in the patch embedding layer.
+        norm_elementwise_affine (`bool`, defaults to `False`):
+            Whether to use elementwise affinity in the normalization layer.
+        norm_eps (`float`, defaults to `1e-6`):
+            The epsilon value for the normalization layer.
+        qk_norm (`str`, *optional*, defaults to `None`):
+            The normalization to use for the query and key.
+    """
+
+    _no_split_modules = ["SanaVideoTransformerBlock", "SanaModulatedNorm"]
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        return AutoWeightsLoader(self).load_weights(weights)
+
+    def __init__(
+        self,
+        in_channels: int = 16,
+        out_channels: int | None = 16,
+        num_attention_heads: int = 20,
+        attention_head_dim: int = 112,
+        num_layers: int = 20,
+        num_cross_attention_heads: int | None = 20,
+        cross_attention_head_dim: int | None = 112,
+        cross_attention_dim: int | None = 2240,
+        caption_channels: int = 2304,
+        mlp_ratio: float = 2.5,
+        dropout: float = 0.0,
+        attention_bias: bool = False,
+        sample_size: int = 30,
+        patch_size: tuple[int, int, int] = (1, 2, 2),
+        norm_elementwise_affine: bool = False,
+        norm_eps: float = 1e-6,
+        interpolation_scale: int | None = None,
+        guidance_embeds: bool = False,
+        guidance_embeds_scale: float = 0.1,
+        qk_norm: str | None = "rms_norm_across_heads",
+        rope_max_seq_len: int = 1024,
+    ) -> None:
+        super().__init__()
+
+        out_channels = out_channels or in_channels
+        self.config = SanaVideoTransformerConfig(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            num_attention_heads=num_attention_heads,
+            attention_head_dim=attention_head_dim,
+            num_layers=num_layers,
+            num_cross_attention_heads=num_cross_attention_heads,
+            cross_attention_head_dim=cross_attention_head_dim,
+            cross_attention_dim=cross_attention_dim,
+            caption_channels=caption_channels,
+            mlp_ratio=mlp_ratio,
+            dropout=dropout,
+            attention_bias=attention_bias,
+            sample_size=sample_size,
+            patch_size=tuple(patch_size),
+            norm_elementwise_affine=norm_elementwise_affine,
+            norm_eps=norm_eps,
+            interpolation_scale=interpolation_scale,
+            guidance_embeds=guidance_embeds,
+            guidance_embeds_scale=guidance_embeds_scale,
+            qk_norm=qk_norm,
+            rope_max_seq_len=rope_max_seq_len,
+        )
+        inner_dim = num_attention_heads * attention_head_dim
+
+        # 1. Patch & position embedding
+        self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)
+        self.patch_embedding = nn.Conv3d(in_channels, inner_dim, kernel_size=patch_size, stride=patch_size)
+
+        # 2. Additional condition embeddings
+        if guidance_embeds:
+            self.time_embed = SanaCombinedTimestepGuidanceEmbeddings(inner_dim)
+        else:
+            self.time_embed = AdaLayerNormSingle(inner_dim)
+
+        self.caption_projection = PixArtAlphaTextProjection(in_features=caption_channels, hidden_size=inner_dim)
+        self.caption_norm = RMSNorm(inner_dim, eps=1e-5, elementwise_affine=True)
+
+        # 3. Transformer blocks
+        self.transformer_blocks = nn.ModuleList(
+            [
+                SanaVideoTransformerBlock(
+                    inner_dim,
+                    num_attention_heads,
+                    attention_head_dim,
+                    dropout=dropout,
+                    num_cross_attention_heads=num_cross_attention_heads,
+                    cross_attention_head_dim=cross_attention_head_dim,
+                    cross_attention_dim=cross_attention_dim,
+                    attention_bias=attention_bias,
+                    norm_elementwise_affine=norm_elementwise_affine,
+                    norm_eps=norm_eps,
+                    mlp_ratio=mlp_ratio,
+                    qk_norm=qk_norm,
+                    prefix=f"transformer_blocks.{layer_idx}",
+                )
+                for layer_idx in range(num_layers)
+            ]
+        )
+
+        # 4. Output blocks
+        self.scale_shift_table = nn.Parameter(torch.randn(2, inner_dim) / inner_dim**0.5)
+        self.norm_out = SanaModulatedNorm(inner_dim, elementwise_affine=False, eps=1e-6)
+        self.proj_out = nn.Linear(inner_dim, math.prod(patch_size) * out_channels)
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return next(self.parameters()).dtype
+
+    @classmethod
+    def from_config(cls, config: dict | SanaVideoTransformerConfig) -> "SanaVideoTransformer3DModel":
+        if isinstance(config, dict):
+            config = SanaVideoTransformerConfig.from_dict(config)
+        return cls(**{field.name: getattr(config, field.name) for field in fields(config)})
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        guidance: torch.Tensor | None = None,
+        encoder_attention_mask: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        controlnet_block_samples: tuple[torch.Tensor] | None = None,
+        return_dict: bool = True,
+    ) -> tuple[torch.Tensor, ...] | SanaVideoTransformerOutput:
+        """
+        The [`SanaVideoTransformer3DModel`] forward method.
+
+        Args:
+            hidden_states (`torch.Tensor` of shape `(batch_size, in_channels, num_frames, height, width)`):
+                Input `hidden_states`.
+            encoder_hidden_states (`torch.Tensor` of shape `(batch_size, sequence_len, embed_dims)`):
+                Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
+            timestep (`torch.LongTensor`):
+                Used to indicate denoising step.
+            guidance (`torch.Tensor`, *optional*):
+                Guidance scale embedding.
+            encoder_attention_mask (`torch.Tensor`, *optional*):
+                Cross-attention mask applied to `encoder_hidden_states`.
+            attention_mask (`torch.Tensor`, *optional*):
+                Self-attention mask applied to `hidden_states`.
+            controlnet_block_samples (`tuple` of `torch.Tensor`, *optional*):
+                A list of tensors that if specified are added to the residuals of transformer blocks.
+            return_dict (`bool`, *optional*, defaults to `True`):
+            Whether or not to return a [`SanaVideoTransformerOutput`] instead of a plain tuple.
+
+        Returns:
+            If `return_dict` is True, a [`SanaVideoTransformerOutput`] is returned, otherwise a
+            `tuple` where the first element is the sample tensor.
+        """
+        # ensure attention_mask is a bias, and give it a singleton query_tokens dimension.
+        #   we may have done this conversion already, e.g. if we came here via UNet2DConditionModel#forward.
+        #   we can tell by counting dims; if ndim == 2: it's a mask rather than a bias.
+        # expects mask of shape:
+        #   [batch, key_tokens]
+        # adds singleton query_tokens dimension:
+        #   [batch,                    1, key_tokens]
+        # this helps to broadcast it as a bias over attention scores, which will be in one of the following shapes:
+        #   [batch,  heads, query_tokens, key_tokens] (e.g. torch sdp attn)
+        #   [batch * heads, query_tokens, key_tokens] (e.g. xformers or classic attn)
+        if attention_mask is not None and attention_mask.ndim == 2:
+            # assume that mask is expressed as:
+            #   (1 = keep,      0 = discard)
+            # convert mask into a bias that can be added to attention scores:
+            #       (keep = +0,     discard = -10000.0)
+            attention_mask = (1 - attention_mask.to(hidden_states.dtype)) * -10000.0
+            attention_mask = attention_mask.unsqueeze(1)
+
+        # convert encoder_attention_mask to a bias the same way we do for attention_mask
+        if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
+            encoder_attention_mask = (1 - encoder_attention_mask.to(hidden_states.dtype)) * -10000.0
+            encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
+
+        # 1. Input
+        batch_size, num_channels, num_frames, height, width = hidden_states.shape
+        p_t, p_h, p_w = self.config.patch_size
+        post_patch_num_frames = num_frames // p_t
+        post_patch_height = height // p_h
+        post_patch_width = width // p_w
+
+        rotary_emb = self.rope(hidden_states)
+
+        hidden_states = self.patch_embedding(hidden_states)
+        hidden_states = hidden_states.flatten(2).transpose(1, 2)
+
+        if guidance is not None:
+            timestep, embedded_timestep = self.time_embed(
+                timestep.flatten(), guidance=guidance, hidden_dtype=hidden_states.dtype
+            )
+        else:
+            timestep, embedded_timestep = self.time_embed(
+                timestep.flatten(), batch_size=batch_size, hidden_dtype=hidden_states.dtype
+            )
+
+        timestep = timestep.view(batch_size, -1, timestep.size(-1))
+        embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.size(-1))
+
+        encoder_hidden_states = self.caption_projection(encoder_hidden_states)
+        encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.shape[-1])
+
+        encoder_hidden_states = self.caption_norm(encoder_hidden_states)
+
+        # 2. Transformer blocks
+        for index_block, block in enumerate(self.transformer_blocks):
+            hidden_states = block(
+                hidden_states,
+                attention_mask,
+                encoder_hidden_states,
+                encoder_attention_mask,
+                timestep,
+                post_patch_num_frames,
+                post_patch_height,
+                post_patch_width,
+                rotary_emb,
+            )
+            if controlnet_block_samples is not None and 0 < index_block <= len(controlnet_block_samples):
+                hidden_states = hidden_states + controlnet_block_samples[index_block - 1]
+
+        # 3. Normalization
+        hidden_states = self.norm_out(hidden_states, embedded_timestep, self.scale_shift_table)
+
+        hidden_states = self.proj_out(hidden_states)
+
+        # 5. Unpatchify
+        hidden_states = hidden_states.reshape(
+            batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
+        )
+        hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
+        output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+
+        if not return_dict:
+            return (output,)
+
+        return SanaVideoTransformerOutput(sample=output)
