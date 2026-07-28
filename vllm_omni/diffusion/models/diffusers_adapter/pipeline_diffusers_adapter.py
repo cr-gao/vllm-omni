@@ -372,6 +372,13 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
             if self._accept_call_kwargs is None or key in self._accept_call_kwargs:
                 kwargs[key] = value
 
+        self._pipeline_utils.update_call_kwargs(
+            req,
+            sampling,
+            self._accept_call_kwargs,
+            kwargs,
+        )
+
         # Special format fields in sampling params
         if output_type := sampling.output_type or self.od_config.output_type:
             kwargs["output_type"] = output_type

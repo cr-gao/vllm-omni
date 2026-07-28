@@ -6,6 +6,7 @@ from typing import Any
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 
@@ -20,6 +21,43 @@ class BasePipelineUtils:
 
     def validate_runtime_sampling_params(self, sampling: OmniDiffusionSamplingParams) -> None:
         pass
+
+    def update_call_kwargs(
+        self,
+        req: DiffusionRequestBatch,
+        sampling: OmniDiffusionSamplingParams,
+        accepted_call_kwargs: set[str] | None,
+        call_kwargs: dict[str, Any],
+    ) -> None:
+        pass
+
+
+class SanaVideoPipelineUtils(BasePipelineUtils):
+    def update_call_kwargs(
+        self,
+        req: DiffusionRequestBatch,
+        sampling: OmniDiffusionSamplingParams,
+        accepted_call_kwargs: set[str] | None,
+        call_kwargs: dict[str, Any],
+    ) -> None:
+        # Diffusers SANA-Video calls the shared request's `num_frames`
+        # parameter `frames`.
+        if (
+            sampling.num_frames is not None
+            and accepted_call_kwargs is not None
+            and "frames" in accepted_call_kwargs
+            and "num_frames" not in accepted_call_kwargs
+        ):
+            call_kwargs["frames"] = sampling.num_frames
+
+        # SANA's startup dummy dimensions can map to a resolution bucket that
+        # conflicts with the upstream pipeline's divisibility validation.
+        if (
+            req.is_dummy_run()
+            and accepted_call_kwargs is not None
+            and "use_resolution_binning" in accepted_call_kwargs
+        ):
+            call_kwargs["use_resolution_binning"] = False
 
 
 class WanPipelineUtils(BasePipelineUtils):
@@ -49,6 +87,8 @@ class WanPipelineUtils(BasePipelineUtils):
 
 
 PIPELINE_UTILS_REGISTRY: dict[str, type[BasePipelineUtils]] = {
+    "SanaVideoPipeline": SanaVideoPipelineUtils,
+    "SanaImageToVideoPipeline": SanaVideoPipelineUtils,
     "WanPipeline": WanPipelineUtils,
     "WanImageToVideoPipeline": WanPipelineUtils,
     "WanVACEPipeline": WanPipelineUtils,
