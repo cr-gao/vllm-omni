@@ -12,6 +12,7 @@ import pytest
 import requests
 import torch
 from safetensors.torch import load_file
+from torch import nn
 
 from tests.e2e.accuracy.helpers import assert_video_metadata, assert_video_similarity_metrics, probe_video
 from tests.helpers.mark import hardware_marks
@@ -28,6 +29,10 @@ VARIANTS = {
     "480p": ("Efficient-Large-Model/SANA-Video_2B_480p_diffusers", 480, 832),
     "720p": ("Efficient-Large-Model/SANA-Video_2B_720p_diffusers", 704, 1280),
 }
+REVISIONS = {
+    "480p": "fed3bce411c58a0f688a31afe8f52e61acc2b15f",
+    "720p": "8bda5e623d0f48cd6da3b387b10ca35d15cf1c4e",
+}
 
 pytestmark = [
     pytest.mark.full_model,
@@ -37,6 +42,23 @@ pytestmark = [
         reason="Set SANA_VIDEO_GOLDEN_BASE_URL after publishing the frozen v1 S3 assets.",
     ),
 ]
+
+
+class _TransformerCheckpoint(nn.Module):
+    def __init__(self, transformer: nn.Module, model: str, revision: str) -> None:
+        super().__init__()
+        from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+
+        self.transformer = transformer
+        self.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=model,
+                subfolder="transformer",
+                revision=revision,
+                prefix="transformer.",
+                fall_back_to_pt=True,
+            )
+        ]
 
 
 def _sha256(path: Path) -> str:
@@ -71,17 +93,38 @@ def test_sana_video_transformer_matches_frozen_golden(
     accuracy_artifact_root: Path,
 ) -> None:
     del _hardware
+    from vllm.config import LoadConfig
+    from vllm.transformers_utils.config import get_hf_file_to_dict
+
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
     from vllm_omni.diffusion.models.sana_video import SanaVideoTransformer3DModel
 
     model, _, _ = VARIANTS[variant]
+    revision = REVISIONS[variant]
     output_dir = accuracy_artifact_root / "sana_video" / variant
     _download_variant(variant, output_dir)
     case = load_file(output_dir / "transformer_case.safetensors")
-    transformer = SanaVideoTransformer3DModel.from_pretrained(
-        model,
-        subfolder="transformer",
-        torch_dtype=torch.bfloat16,
-    ).to("cuda")
+    transformer_config = get_hf_file_to_dict("transformer/config.json", model, revision=revision)
+    assert transformer_config is not None
+    transformer = SanaVideoTransformer3DModel.from_config(transformer_config).to(
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    checkpoint = _TransformerCheckpoint(transformer, model, revision)
+    od_config = OmniDiffusionConfig(
+        model=model,
+        model_class_name="SanaVideoPipeline",
+        dtype=torch.bfloat16,
+        revision=revision,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config=od_config)
+    transformer.load_weights(
+        (name.removeprefix("transformer."), tensor)
+        for name, tensor in loader.get_all_weights(checkpoint)
+        if name.startswith("transformer.")
+    )
+    transformer.eval()
     with torch.inference_mode():
         actual = transformer(
             case["hidden_states"].to("cuda"),
