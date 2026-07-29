@@ -258,8 +258,6 @@ SERVER_CASES = [
             server_args=[
                 "--model-class-name",
                 pipeline_class,
-                "--revision",
-                REVISIONS[variant],
             ],
         ),
         id=f"{variant}-{task}",
