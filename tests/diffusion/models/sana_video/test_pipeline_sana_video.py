@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from PIL import Image
@@ -120,6 +121,36 @@ def test_sana_video_i2v_remote_720p_uses_loaded_transformer_config():
     assert processed.prompt["multi_modal_data"]["image"].size == (1280, 704)
 
 
+@pytest.mark.parametrize(
+    "frames",
+    [
+        [[Image.new("RGB", (16, 16)) for _ in range(2)]],
+        np.zeros((1, 2, 16, 16, 3), dtype=np.float32),
+        [[np.zeros((16, 16, 3), dtype=np.float32) for _ in range(2)]],
+    ],
+)
+def test_sana_video_diffusers_i2v_preserves_postprocessed_frames(frames):
+    from vllm_omni.diffusion.models.sana_video import get_sana_video_i2v_post_process_func
+
+    post_process = get_sana_video_i2v_post_process_func(SimpleNamespace(diffusion_load_format="diffusers"))
+
+    result = post_process(frames)
+
+    assert result["payload"]["video"] is frames
+
+
+def test_sana_video_diffusers_i2v_still_postprocesses_native_tensor():
+    from vllm_omni.diffusion.models.sana_video import get_sana_video_i2v_post_process_func
+
+    decoded_video = torch.zeros(1, 3, 2, 16, 16)
+    post_process = get_sana_video_i2v_post_process_func(SimpleNamespace(diffusion_load_format="diffusers"))
+
+    result = post_process(decoded_video)
+
+    assert isinstance(result["payload"]["video"], np.ndarray)
+    assert result["payload"]["video"].shape == (1, 2, 16, 16, 3)
+
+
 def test_sana_video_720p_model_id_fallback(monkeypatch):
     from vllm_omni.diffusion.models.sana_video import pipeline_sana_video
 
@@ -224,6 +255,109 @@ def test_diffusers_adapter_selects_sana_pipeline_utils(pipeline_class_name):
     )
 
     assert isinstance(get_pipeline_utils(pipeline_class_name), SanaVideoPipelineUtils)
+
+
+def test_diffusers_adapter_resolves_requested_sana_i2v_pipeline():
+    from diffusers import SanaImageToVideoPipeline, SanaVideoPipeline
+
+    from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import (
+        SanaVideoPipelineUtils,
+        get_pipeline_utils_for_config,
+        resolve_diffusers_pipeline_class,
+    )
+
+    od_config = SimpleNamespace(
+        model_class_name="SanaImageToVideoPipeline",
+        diffusers_pipeline_cls=SanaVideoPipeline,
+    )
+
+    assert isinstance(get_pipeline_utils_for_config(od_config), SanaVideoPipelineUtils)
+    assert resolve_diffusers_pipeline_class(od_config) is SanaImageToVideoPipeline
+
+
+def test_diffusers_adapter_pipeline_override_is_sana_specific():
+    from diffusers import DiffusionPipeline
+
+    from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import resolve_diffusers_pipeline_class
+
+    class OtherPipeline(DiffusionPipeline):
+        pass
+
+    od_config = SimpleNamespace(
+        model_class_name="DiffusersAdapterPipeline",
+        diffusers_pipeline_cls=OtherPipeline,
+    )
+
+    assert resolve_diffusers_pipeline_class(od_config) is OtherPipeline
+
+
+def test_diffusers_adapter_loads_resolved_pipeline_class(monkeypatch):
+    from vllm_omni.diffusion.models.diffusers_adapter import pipeline_diffusers_adapter
+    from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
+
+    loaded = []
+    expected_pipeline = object()
+
+    class ResolvedPipeline:
+        @classmethod
+        def from_pretrained(cls, model_id, **kwargs):
+            loaded.append((model_id, kwargs))
+            return expected_pipeline
+
+    monkeypatch.setattr(
+        pipeline_diffusers_adapter,
+        "resolve_diffusers_pipeline_class",
+        lambda _od_config: ResolvedPipeline,
+    )
+    adapter = object.__new__(DiffusersAdapterPipeline)
+    adapter.od_config = SimpleNamespace(diffusers_pipeline_cls=object)
+
+    result = adapter._load_pipeline_from_pretrained("sana-checkpoint", {"torch_dtype": torch.bfloat16})
+
+    assert result is expected_pipeline
+    assert loaded == [("sana-checkpoint", {"torch_dtype": torch.bfloat16})]
+
+
+def test_diffusers_adapter_sana_i2v_override_reports_image_capability():
+    from diffusers import SanaVideoPipeline
+
+    from vllm_omni.diffusion.io_support import supports_multimodal_input
+
+    od_config = SimpleNamespace(
+        diffusion_load_format="diffusers",
+        model_class_name="SanaImageToVideoPipeline",
+        diffusers_pipeline_cls=SanaVideoPipeline,
+    )
+
+    assert supports_multimodal_input(od_config) == (True, False)
+
+
+def test_diffusers_adapter_sana_i2v_warmup_supplies_image():
+    from diffusers import SanaVideoPipeline
+
+    from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = SimpleNamespace(
+        diffusion_load_format="diffusers",
+        model_class_name="SanaImageToVideoPipeline",
+        diffusers_pipeline_cls=SanaVideoPipeline,
+    )
+    captured_requests = []
+    engine.pre_process_func = lambda request: request
+
+    def capture_request(request):
+        captured_requests.append(request)
+        return SimpleNamespace(error=None)
+
+    engine.add_req_and_wait_for_response = capture_request
+
+    engine._dummy_run()
+
+    assert len(captured_requests) == 1
+    prompt = captured_requests[0].prompt
+    assert isinstance(prompt, dict)
+    assert isinstance(prompt["multi_modal_data"]["image"], Image.Image)
 
 
 def test_diffusers_adapter_disables_resolution_binning_for_warmup():

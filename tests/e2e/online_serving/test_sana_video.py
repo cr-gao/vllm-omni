@@ -13,8 +13,14 @@ from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHand
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-MODEL_480P = "Efficient-Large-Model/SANA-Video_2B_480p_diffusers"
-MODEL_720P = "Efficient-Large-Model/SANA-Video_2B_720p_diffusers"
+MODEL_480P = os.environ.get(
+    "SANA_VIDEO_480P_MODEL",
+    "Efficient-Large-Model/SANA-Video_2B_480p_diffusers",
+)
+MODEL_720P = os.environ.get(
+    "SANA_VIDEO_720P_MODEL",
+    "Efficient-Large-Model/SANA-Video_2B_720p_diffusers",
+)
 PROMPT = "A cat walking on grass toward the camera. motion score: 30."
 NEGATIVE_PROMPT = "blurry, low quality, temporal artifacts"
 
@@ -71,14 +77,32 @@ def test_sana_video_t2v_backends(omni_server: OmniServer, openai_client: OpenAIC
 
 
 def _i2v_cases():
-    return [
+    cases = [
         pytest.param(
             OmniServerParams(model=model, server_args=["--model-class-name", "SanaImageToVideoPipeline"]),
-            id=variant,
+            id=f"native-{variant}",
             marks=SINGLE_CARD_MARKS,
         )
         for variant, model in (("480p", MODEL_480P), ("720p", MODEL_720P))
     ]
+    cases.append(
+        pytest.param(
+            OmniServerParams(
+                model=MODEL_480P,
+                server_args=[
+                    "--model-class-name",
+                    "SanaImageToVideoPipeline",
+                    "--diffusion-load-format",
+                    "diffusers",
+                    "--diffusion-attention-backend",
+                    "TORCH_SDPA",
+                ],
+            ),
+            id="diffusers-adapter-480p",
+            marks=SINGLE_CARD_MARKS,
+        )
+    )
+    return cases
 
 
 @pytest.mark.core_model

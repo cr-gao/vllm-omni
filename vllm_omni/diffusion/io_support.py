@@ -6,11 +6,15 @@ from __future__ import annotations
 import inspect
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import resolve_diffusers_pipeline_class
 from vllm_omni.diffusion.registry import DiffusionModelRegistry
 
 
 def supports_multimodal_input(od_config: OmniDiffusionConfig) -> tuple[bool, bool]:
-    if od_config.diffusion_load_format == "diffusers" and (pipe_cls := od_config.diffusers_pipeline_cls) is not None:
+    if (
+        od_config.diffusion_load_format == "diffusers"
+        and (pipe_cls := resolve_diffusers_pipeline_class(od_config)) is not None
+    ):
         signature = inspect.signature(pipe_cls.__call__)
         support_image_input = "image" in signature.parameters
         support_audio_input = (

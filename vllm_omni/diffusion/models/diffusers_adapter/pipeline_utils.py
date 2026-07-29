@@ -13,6 +13,14 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 class BasePipelineUtils:
     """No-op hooks for pipeline-specific diffusers adapter behavior."""
 
+    def resolve_pipeline_class(
+        self,
+        od_config: OmniDiffusionConfig,
+        configured_pipeline_class: type[DiffusionPipeline] | None,
+    ) -> type[DiffusionPipeline] | None:
+        """Resolve the concrete Diffusers class used to load a checkpoint."""
+        return configured_pipeline_class
+
     def update_load_kwargs(self, od_config: OmniDiffusionConfig, load_kwargs: dict[str, Any]) -> None:
         pass
 
@@ -33,6 +41,20 @@ class BasePipelineUtils:
 
 
 class SanaVideoPipelineUtils(BasePipelineUtils):
+    def resolve_pipeline_class(
+        self,
+        od_config: OmniDiffusionConfig,
+        configured_pipeline_class: type[DiffusionPipeline] | None,
+    ) -> type[DiffusionPipeline] | None:
+        # Both released SANA-Video checkpoints declare SanaVideoPipeline in
+        # model_index.json. Honour an explicit Omni I2V class selection by
+        # loading the same components into Diffusers' I2V pipeline instead.
+        if od_config.model_class_name == "SanaImageToVideoPipeline":
+            from diffusers import SanaImageToVideoPipeline
+
+            return SanaImageToVideoPipeline
+        return configured_pipeline_class
+
     def update_call_kwargs(
         self,
         req: DiffusionRequestBatch,
@@ -98,3 +120,20 @@ def get_pipeline_utils(pipeline_class_name: str | None) -> BasePipelineUtils:
         return BasePipelineUtils()
     pipeline_utils_cls = PIPELINE_UTILS_REGISTRY.get(pipeline_class_name, BasePipelineUtils)
     return pipeline_utils_cls()
+
+
+def get_pipeline_utils_for_config(od_config: OmniDiffusionConfig) -> BasePipelineUtils:
+    """Return model-specific adapter hooks for the requested or configured class."""
+    requested_class_name = od_config.model_class_name
+    if requested_class_name in PIPELINE_UTILS_REGISTRY:
+        return get_pipeline_utils(requested_class_name)
+
+    configured_pipeline_class = od_config.diffusers_pipeline_cls
+    configured_class_name = configured_pipeline_class.__name__ if configured_pipeline_class is not None else None
+    return get_pipeline_utils(configured_class_name)
+
+
+def resolve_diffusers_pipeline_class(od_config: OmniDiffusionConfig) -> type[DiffusionPipeline] | None:
+    """Resolve the concrete Diffusers pipeline used for loading and capability checks."""
+    pipeline_utils = get_pipeline_utils_for_config(od_config)
+    return pipeline_utils.resolve_pipeline_class(od_config, od_config.diffusers_pipeline_cls)
