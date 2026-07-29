@@ -190,6 +190,32 @@ def test_diffusers_adapter_maps_num_frames_to_frames():
     assert kwargs["generator"].initial_seed() == 42
 
 
+def test_diffusers_adapter_maps_i2v_image_when_pipeline_accepts_it():
+    from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
+    from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import SanaVideoPipelineUtils
+
+    adapter = object.__new__(DiffusersAdapterPipeline)
+    adapter._accept_call_kwargs = {"prompt", "negative_prompt", "image", "frames", "generator"}
+    adapter._pipeline_utils = SanaVideoPipelineUtils()
+    adapter.od_config = SimpleNamespace(diffusers_call_kwargs={}, output_type=None)
+    image = Image.new("RGB", (320, 192))
+
+    kwargs = adapter._build_call_kwargs(
+        _make_request_batch(
+            {"prompt": "a robot walks", "negative_prompt": "blurry", "multi_modal_data": {"image": image}},
+            num_frames=9,
+            seed=42,
+            generator_device="cpu",
+        )
+    )
+
+    assert kwargs["image"] is image
+    assert kwargs["prompt"] == "a robot walks"
+    assert kwargs["negative_prompt"] == "blurry"
+    assert kwargs["frames"] == 9
+    assert kwargs["generator"].initial_seed() == 42
+
+
 @pytest.mark.parametrize("pipeline_class_name", ["SanaVideoPipeline", "SanaImageToVideoPipeline"])
 def test_diffusers_adapter_selects_sana_pipeline_utils(pipeline_class_name):
     from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import (
@@ -287,16 +313,23 @@ def test_forward_maps_omni_request_to_sana_generation_args():
     assert calls[0]["generator"].initial_seed() == 42
 
 
-def test_t2v_720p_uses_variant_default_resolution():
+@pytest.mark.parametrize(
+    ("sample_size", "expected_height", "expected_width"),
+    [
+        (30, 480, 832),
+        (22, 704, 1280),
+    ],
+)
+def test_t2v_uses_variant_default_resolution(sample_size, expected_height, expected_width):
     from vllm_omni.diffusion.models.sana_video import SanaVideoPipeline
 
     pipeline = object.__new__(SanaVideoPipeline)
-    pipeline.transformer = SimpleNamespace(config=SimpleNamespace(sample_size=22))
+    pipeline.transformer = SimpleNamespace(config=SimpleNamespace(sample_size=sample_size))
     calls = []
 
     def fake_generate(**kwargs):
         calls.append(kwargs)
-        return SimpleNamespace(frames=torch.zeros(1, 3, 9, 704, 1280))
+        return SimpleNamespace(frames=torch.zeros(1, 3, 9, expected_height, expected_width))
 
     pipeline._generate = fake_generate
     output = pipeline.forward(
@@ -310,9 +343,9 @@ def test_t2v_720p_uses_variant_default_resolution():
         )
     )
 
-    assert output.output.shape == (1, 3, 9, 704, 1280)
-    assert calls[0]["height"] == 704
-    assert calls[0]["width"] == 1280
+    assert output.output.shape == (1, 3, 9, expected_height, expected_width)
+    assert calls[0]["height"] == expected_height
+    assert calls[0]["width"] == expected_width
 
 
 def test_forward_requires_exactly_one_nonempty_prompt():

@@ -21,37 +21,37 @@ NEGATIVE_PROMPT = "blurry, low quality, temporal artifacts"
 SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100"})
 
 
-def _backend_cases():
-    return [
-        pytest.param(
-            OmniServerParams(model=MODEL_480P, server_args=["--model-class-name", "SanaVideoPipeline"]),
-            id="native-480p",
-            marks=SINGLE_CARD_MARKS,
-        ),
-        pytest.param(
-            OmniServerParams(
-                model=MODEL_480P,
-                server_args=[
-                    "--diffusion-load-format",
-                    "diffusers",
-                    "--diffusion-attention-backend",
-                    "TORCH_SDPA",
-                ],
-            ),
-            id="diffusers-adapter-480p",
-            marks=SINGLE_CARD_MARKS,
-        ),
-        pytest.param(
-            OmniServerParams(model=MODEL_720P, server_args=["--model-class-name", "SanaVideoPipeline"]),
-            id="native-720p",
-            marks=SINGLE_CARD_MARKS,
-        ),
-    ]
+def _t2v_backend_cases():
+    cases = []
+    for variant, model in (("480p", MODEL_480P), ("720p", MODEL_720P)):
+        cases.extend(
+            [
+                pytest.param(
+                    OmniServerParams(model=model, server_args=["--model-class-name", "SanaVideoPipeline"]),
+                    id=f"native-{variant}",
+                    marks=SINGLE_CARD_MARKS,
+                ),
+                pytest.param(
+                    OmniServerParams(
+                        model=model,
+                        server_args=[
+                            "--diffusion-load-format",
+                            "diffusers",
+                            "--diffusion-attention-backend",
+                            "TORCH_SDPA",
+                        ],
+                    ),
+                    id=f"diffusers-adapter-{variant}",
+                    marks=SINGLE_CARD_MARKS,
+                ),
+            ]
+        )
+    return cases
 
 
 @pytest.mark.core_model
 @pytest.mark.diffusion
-@pytest.mark.parametrize("omni_server", _backend_cases(), indirect=True)
+@pytest.mark.parametrize("omni_server", _t2v_backend_cases(), indirect=True)
 def test_sana_video_t2v_backends(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
     request_config = {
         "model": omni_server.model,
