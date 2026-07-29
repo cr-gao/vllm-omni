@@ -19,6 +19,8 @@ import os
 import warnings
 from collections.abc import Iterable
 
+import numpy as np
+import PIL.Image
 import torch
 from diffusers.schedulers import DPMSolverMultistepScheduler
 from diffusers.utils.torch_utils import randn_tensor
@@ -135,12 +137,30 @@ def resolve_sana_video_sample_size(od_config: OmniDiffusionConfig) -> int:
 
 
 def get_sana_video_post_process_func(od_config: OmniDiffusionConfig):
-    del od_config
     video_processor = VideoProcessor()
+    is_diffusers_adapter = od_config.diffusion_load_format == "diffusers"
 
     def post_process_func(video: torch.Tensor, output_type: str = "np", sampling_params=None):
-        if output_type == "latent":
+        if output_type == "latent" or (
+            sampling_params is not None and getattr(sampling_params, "output_type", None) == "latent"
+        ):
             return video
+
+        first_frame = video
+        while isinstance(first_frame, (list, tuple)) and first_frame:
+            first_frame = first_frame[0]
+        is_postprocessed_frame_sequence = isinstance(video, np.ndarray) or isinstance(
+            first_frame,
+            (PIL.Image.Image, np.ndarray),
+        )
+        if is_diffusers_adapter and is_postprocessed_frame_sequence:
+            if sampling_params is not None and getattr(sampling_params, "enable_frame_interpolation", False):
+                raise ValueError(
+                    "Frame interpolation is not supported for SANA-Video with the Diffusers adapter because "
+                    "Diffusers returns already postprocessed frames."
+                )
+            return {"payload": {"video": video}, "metadata": {}}
+
         video_metadata = {}
         if sampling_params is not None and getattr(sampling_params, "enable_frame_interpolation", False):
             video, multiplier = interpolate_video_tensor(

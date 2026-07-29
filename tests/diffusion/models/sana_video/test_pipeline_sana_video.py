@@ -161,21 +161,29 @@ def test_sana_video_i2v_remote_720p_uses_loaded_transformer_config():
         [[np.zeros((16, 16, 3), dtype=np.float32) for _ in range(2)]],
     ],
 )
-def test_sana_video_diffusers_i2v_preserves_postprocessed_frames(frames):
-    from vllm_omni.diffusion.models.sana_video import get_sana_video_i2v_post_process_func
+@pytest.mark.parametrize(
+    "factory_name",
+    ["get_sana_video_post_process_func", "get_sana_video_i2v_post_process_func"],
+)
+def test_sana_video_diffusers_preserves_postprocessed_frames(frames, factory_name):
+    from vllm_omni.diffusion.models import sana_video
 
-    post_process = get_sana_video_i2v_post_process_func(SimpleNamespace(diffusion_load_format="diffusers"))
+    post_process = getattr(sana_video, factory_name)(SimpleNamespace(diffusion_load_format="diffusers"))
 
     result = post_process(frames)
 
     assert result["payload"]["video"] is frames
 
 
-def test_sana_video_diffusers_i2v_still_postprocesses_native_tensor():
-    from vllm_omni.diffusion.models.sana_video import get_sana_video_i2v_post_process_func
+@pytest.mark.parametrize(
+    "factory_name",
+    ["get_sana_video_post_process_func", "get_sana_video_i2v_post_process_func"],
+)
+def test_sana_video_diffusers_still_postprocesses_native_tensor(factory_name):
+    from vllm_omni.diffusion.models import sana_video
 
     decoded_video = torch.zeros(1, 3, 2, 16, 16)
-    post_process = get_sana_video_i2v_post_process_func(SimpleNamespace(diffusion_load_format="diffusers"))
+    post_process = getattr(sana_video, factory_name)(SimpleNamespace(diffusion_load_format="diffusers"))
 
     result = post_process(decoded_video)
 

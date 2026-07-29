@@ -7,7 +7,6 @@ import os
 import warnings
 from math import sqrt
 
-import numpy as np
 import PIL.Image
 import torch
 from diffusers.utils.torch_utils import randn_tensor
@@ -33,32 +32,7 @@ from vllm_omni.inputs.data import OmniTextPrompt
 
 
 def get_sana_video_i2v_post_process_func(od_config: OmniDiffusionConfig):
-    native_post_process = get_sana_video_post_process_func(od_config)
-    if od_config.diffusion_load_format == "diffusers":
-
-        def post_process_diffusers_output(video, output_type: str = "np", sampling_params=None):
-            if sampling_params is not None and sampling_params.output_type == "latent":
-                return video
-
-            first_frame = video
-            while isinstance(first_frame, (list, tuple)) and first_frame:
-                first_frame = first_frame[0]
-            is_postprocessed_frame_sequence = isinstance(video, np.ndarray) or isinstance(
-                first_frame, (PIL.Image.Image, np.ndarray)
-            )
-            if is_postprocessed_frame_sequence:
-                if sampling_params is not None and getattr(sampling_params, "enable_frame_interpolation", False):
-                    raise ValueError(
-                        "Frame interpolation is not supported for SANA-Video I2V with the Diffusers adapter because "
-                        "Diffusers returns already postprocessed frames."
-                    )
-                return {"payload": {"video": video}}
-
-            return native_post_process(video, output_type=output_type, sampling_params=sampling_params)
-
-        return post_process_diffusers_output
-
-    return native_post_process
+    return get_sana_video_post_process_func(od_config)
 
 
 def get_sana_video_i2v_pre_process_func(od_config: OmniDiffusionConfig):
