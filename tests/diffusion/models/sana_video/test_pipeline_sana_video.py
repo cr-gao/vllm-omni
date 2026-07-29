@@ -238,6 +238,53 @@ def test_sana_video_i2v_forward_maps_image_request():
     assert calls[0]["generator"].initial_seed() == 42
 
 
+def test_sana_video_i2v_uses_diffusers_complex_instruction_default():
+    import inspect
+
+    from diffusers import SanaImageToVideoPipeline as DiffusersSanaImageToVideoPipeline
+
+    from vllm_omni.diffusion.models.sana_video import SanaImageToVideoPipeline
+
+    reference_default = (
+        inspect.signature(DiffusersSanaImageToVideoPipeline.__call__).parameters["complex_human_instruction"].default
+    )
+    native_default = (
+        inspect.signature(SanaImageToVideoPipeline._generate_i2v).parameters["complex_human_instruction"].default
+    )
+    assert native_default == reference_default
+
+    class StopAfterPromptEncodingError(Exception):
+        pass
+
+    pipeline = object.__new__(SanaImageToVideoPipeline)
+    pipeline.device = torch.device("cpu")
+    pipeline.check_inputs = lambda **_kwargs: None
+    captured = {}
+
+    def capture_encode_prompt(*_args, **kwargs):
+        captured.update(kwargs)
+        raise StopAfterPromptEncodingError
+
+    pipeline.encode_prompt = capture_encode_prompt
+    with pytest.raises(StopAfterPromptEncodingError):
+        pipeline._generate_i2v(
+            image=Image.new("RGB", (320, 192)),
+            prompt="a robot walks",
+            negative_prompt="blurry",
+            height=192,
+            width=320,
+            frames=9,
+            num_inference_steps=2,
+            guidance_scale=4.5,
+            generator=torch.Generator(device="cpu").manual_seed(42),
+            latents=None,
+            use_resolution_binning=False,
+            max_sequence_length=300,
+        )
+
+    assert captured["complex_human_instruction"] == reference_default
+
+
 def test_diffusers_adapter_maps_num_frames_to_frames():
     from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
     from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import SanaVideoPipelineUtils

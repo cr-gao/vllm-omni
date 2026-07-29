@@ -30,6 +30,34 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniTextPrompt
 
+SANA_VIDEO_I2V_COMPLEX_HUMAN_INSTRUCTION = [
+    (
+        "Given a user prompt, generate an 'Enhanced prompt' that provides detailed visual descriptions suitable for "
+        "video generation. Evaluate the level of detail in the user prompt:"
+    ),
+    (
+        "- If the prompt is simple, focus on adding specifics about colors, shapes, sizes, textures, motion, and "
+        "temporal relationships to create vivid and dynamic scenes."
+    ),
+    ("- If the prompt is already detailed, refine and enhance the existing details slightly without overcomplicating."),
+    "Here are examples of how to transform or refine prompts:",
+    (
+        "- User Prompt: A cat sleeping -> Enhanced: A small, fluffy white cat slowly settling into a curled position, "
+        "peacefully falling asleep on a warm sunny windowsill, with gentle sunlight filtering through surrounding "
+        "pots of blooming red flowers."
+    ),
+    (
+        "- User Prompt: A busy city street -> Enhanced: A bustling city street scene at dusk, featuring glowing street "
+        "lamps gradually lighting up, a diverse crowd of people in colorful clothing walking past, and a double-decker "
+        "bus smoothly passing by towering glass skyscrapers."
+    ),
+    (
+        "Please generate only the enhanced description for the prompt below and avoid including any additional "
+        "commentary or evaluations:"
+    ),
+    "User Prompt: ",
+]
+
 
 def get_sana_video_i2v_post_process_func(od_config: OmniDiffusionConfig):
     return get_sana_video_post_process_func(od_config)
@@ -203,6 +231,7 @@ class SanaImageToVideoPipeline(SanaVideoPipeline, SupportImageInput):
         latents: torch.Tensor | None,
         use_resolution_binning: bool,
         max_sequence_length: int,
+        complex_human_instruction: list[str] = SANA_VIDEO_I2V_COMPLEX_HUMAN_INSTRUCTION,
     ) -> torch.Tensor:
         orig_height, orig_width = height, width
         if use_resolution_binning:
@@ -234,6 +263,7 @@ class SanaImageToVideoPipeline(SanaVideoPipeline, SupportImageInput):
             device=self.device,
             clean_caption=False,
             max_sequence_length=max_sequence_length,
+            complex_human_instruction=complex_human_instruction,
         )
         if self.do_classifier_free_guidance:
             prompt_embeds = torch.cat([negative_embeds, prompt_embeds])
