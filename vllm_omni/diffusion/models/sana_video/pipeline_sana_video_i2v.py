@@ -36,9 +36,7 @@ def get_sana_video_i2v_post_process_func(od_config: OmniDiffusionConfig):
 
 
 def get_sana_video_i2v_pre_process_func(od_config: OmniDiffusionConfig):
-    default_height, default_width = get_sana_video_default_resolution(
-        resolve_sana_video_sample_size(od_config)
-    )
+    default_height, default_width = get_sana_video_default_resolution(resolve_sana_video_sample_size(od_config))
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         prompt = request.prompt
@@ -48,9 +46,7 @@ def get_sana_video_i2v_pre_process_func(od_config: OmniDiffusionConfig):
         multi_modal_data = prompt.get("multi_modal_data") or {}
         raw_image = multi_modal_data.get("image")
         if raw_image is None:
-            raise ValueError(
-                'SANA-Video I2V requires `"multi_modal_data": {"image": <PIL image or file path>}`.'
-            )
+            raise ValueError('SANA-Video I2V requires `"multi_modal_data": {"image": <PIL image or file path>}`.')
         if isinstance(raw_image, str):
             if not os.path.isfile(raw_image):
                 raise ValueError(f"SANA-Video I2V image path does not exist: {raw_image}")
@@ -160,9 +156,7 @@ class SanaImageToVideoPipeline(SanaVideoPipeline, SupportImageInput):
         if not isinstance(image, PIL.Image.Image):
             raise TypeError("SANA-Video I2V expects a preprocessed PIL image.")
         sampling = req.sampling_params
-        default_height, default_width = get_sana_video_default_resolution(
-            self.transformer.config.sample_size
-        )
+        default_height, default_width = get_sana_video_default_resolution(self.transformer.config.sample_size)
         height = sampling.height or default_height
         width = sampling.width or default_width
         frames = sampling.num_frames or 81

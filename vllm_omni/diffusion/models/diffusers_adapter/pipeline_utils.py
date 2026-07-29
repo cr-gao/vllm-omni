@@ -52,11 +52,7 @@ class SanaVideoPipelineUtils(BasePipelineUtils):
 
         # SANA's startup dummy dimensions can map to a resolution bucket that
         # conflicts with the upstream pipeline's divisibility validation.
-        if (
-            req.is_dummy_run()
-            and accepted_call_kwargs is not None
-            and "use_resolution_binning" in accepted_call_kwargs
-        ):
+        if req.is_dummy_run() and accepted_call_kwargs is not None and "use_resolution_binning" in accepted_call_kwargs:
             call_kwargs["use_resolution_binning"] = False
 
 

@@ -145,7 +145,7 @@ def retrieve_timesteps(
     timesteps: list[int] | None = None,
     sigmas: list[float] | None = None,
     **kwargs,
-):
+) -> tuple[torch.Tensor, int]:
     r"""
     Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
     custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
@@ -691,9 +691,7 @@ class SanaVideoPipeline(
             raise ValueError("Prompt is required for SANA-Video generation.")
 
         sampling = req.sampling_params
-        default_height, default_width = get_sana_video_default_resolution(
-            self.transformer.config.sample_size
-        )
+        default_height, default_width = get_sana_video_default_resolution(self.transformer.config.sample_size)
         height = sampling.height or default_height
         width = sampling.width or default_width
         num_frames = sampling.num_frames or 81

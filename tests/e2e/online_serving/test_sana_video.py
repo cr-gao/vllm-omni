@@ -98,8 +98,6 @@ def test_sana_video_i2v_variants(omni_server: OmniServer, openai_client: OpenAIC
             "guidance_scale": 4.0,
             "seed": 42,
         },
-        "image_reference": (
-            f"data:image/jpeg;base64,{generate_synthetic_image(320, 192, seed=42)['base64']}"
-        ),
+        "image_reference": (f"data:image/jpeg;base64,{generate_synthetic_image(320, 192, seed=42)['base64']}"),
     }
     openai_client.send_video_diffusion_request(request_config)

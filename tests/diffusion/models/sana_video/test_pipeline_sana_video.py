@@ -57,14 +57,8 @@ def test_sana_video_pipeline_import_and_registry():
         "pipeline_sana_video_i2v",
         "SanaImageToVideoPipeline",
     )
-    assert (
-        _DIFFUSION_POST_PROCESS_FUNCS["SanaImageToVideoPipeline"]
-        == "get_sana_video_i2v_post_process_func"
-    )
-    assert (
-        _DIFFUSION_PRE_PROCESS_FUNCS["SanaImageToVideoPipeline"]
-        == "get_sana_video_i2v_pre_process_func"
-    )
+    assert _DIFFUSION_POST_PROCESS_FUNCS["SanaImageToVideoPipeline"] == "get_sana_video_i2v_post_process_func"
+    assert _DIFFUSION_PRE_PROCESS_FUNCS["SanaImageToVideoPipeline"] == "get_sana_video_i2v_pre_process_func"
 
 
 def test_component_discovery_declarations():

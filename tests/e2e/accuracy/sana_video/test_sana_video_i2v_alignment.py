@@ -76,14 +76,20 @@ def test_sana_video_i2v_first_frame_latents_match_diffusers(variant: str, _hardw
         "DistributedAutoencoderKLLTX2Video": DistributedAutoencoderKLLTX2Video,
         "DistributedAutoencoderKLWan": DistributedAutoencoderKLWan,
     }
-    reference_vae = vae_classes[config["vae_class"]].from_pretrained(
-        config["model"],
-        subfolder="vae",
-        torch_dtype=config["dtype"],
-    ).to("cuda")
-    native_vae = native_vae_classes[config["native_vae_class"]].from_config(
-        dict(reference_vae.config)
-    ).to(device="cuda", dtype=config["dtype"])
+    reference_vae = (
+        vae_classes[config["vae_class"]]
+        .from_pretrained(
+            config["model"],
+            subfolder="vae",
+            torch_dtype=config["dtype"],
+        )
+        .to("cuda")
+    )
+    native_vae = (
+        native_vae_classes[config["native_vae_class"]]
+        .from_config(dict(reference_vae.config))
+        .to(device="cuda", dtype=config["dtype"])
+    )
     native_vae.load_state_dict(reference_vae.state_dict())
     reference_vae.eval()
     native_vae.eval()

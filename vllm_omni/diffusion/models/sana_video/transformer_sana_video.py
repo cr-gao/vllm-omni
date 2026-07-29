@@ -673,7 +673,7 @@ class SanaVideoTransformer3DModel(nn.Module):
             controlnet_block_samples (`tuple` of `torch.Tensor`, *optional*):
                 A list of tensors that if specified are added to the residuals of transformer blocks.
             return_dict (`bool`, *optional*, defaults to `True`):
-            Whether or not to return a [`SanaVideoTransformerOutput`] instead of a plain tuple.
+                Whether to return `SanaVideoTransformerOutput` instead of a plain tuple.
 
         Returns:
             If `return_dict` is True, a [`SanaVideoTransformerOutput`] is returned, otherwise a
