@@ -244,10 +244,10 @@ path uses `DistributedAutoencoderKLLTX2Video`; both wrap their corresponding
 Diffusers VAE implementations. The native denoising loop intentionally keeps
 Diffusers' checkpoint-compatible `DPMSolverMultistepScheduler`.
 
-For the Diffusers adapter, 480p I2V has completed end-to-end serving
-validation. Adapter 720p I2V has not yet been validated and is not claimed as
-a supported combination. Adapter T2V has separate 480p and 720p validation;
-see the recipe for the exact backend matrix.
+The Diffusers adapter has completed end-to-end I2V serving validation at both
+480p and 720p. For online adapter serving, select the matching checkpoint and
+use `WIDTH=1280 HEIGHT=704` for the 720p request. Adapter T2V is also validated
+at both resolutions; see the recipe for the exact backend matrix.
 
 See the [SANA-Video recipe](../../../recipes/NVIDIA/SANA-Video-2B.md) for
 online serving, native/adapter validation boundaries, and hardware notes.

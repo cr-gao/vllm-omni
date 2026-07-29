@@ -43,18 +43,26 @@ For native 720p I2V, start the server with
 `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` and call the client with
 `WIDTH=1280 HEIGHT=704` in addition to `INPUT_IMAGE`.
 
-For the validated 480p Diffusers-adapter compatibility path:
+The Diffusers-adapter compatibility path is validated at both resolutions:
 
 ```bash
+# 480p
 MODEL=Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
   bash run_server_sana_video_diffusers.sh
 
 INPUT_IMAGE=/path/to/input.jpg OUTPUT_PATH=sana_video_i2v_adapter.mp4 \
   bash run_curl_sana_video.sh
+
+# 720p
+MODEL=Efficient-Large-Model/SANA-Video_2B_720p_diffusers \
+  bash run_server_sana_video_diffusers.sh
+
+INPUT_IMAGE=/path/to/input.jpg WIDTH=1280 HEIGHT=704 \
+  OUTPUT_PATH=sana_video_i2v_adapter_720p.mp4 \
+  bash run_curl_sana_video.sh
 ```
 
-The adapter's 720p I2V combination has not completed end-to-end validation
-and is not claimed here. Native 480p uses the
+Native 480p uses the
 `DistributedAutoencoderKLWan` wrapper; native 720p uses
 `DistributedAutoencoderKLLTX2Video`. These wrappers retain the corresponding
 Diffusers autoencoder implementations, and the native SANA denoising loop

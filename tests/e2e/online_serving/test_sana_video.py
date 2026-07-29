@@ -77,31 +77,32 @@ def test_sana_video_t2v_backends(omni_server: OmniServer, openai_client: OpenAIC
 
 
 def _i2v_cases():
-    cases = [
-        pytest.param(
-            OmniServerParams(model=model, server_args=["--model-class-name", "SanaImageToVideoPipeline"]),
-            id=f"native-{variant}",
-            marks=SINGLE_CARD_MARKS,
+    cases = []
+    for variant, model in (("480p", MODEL_480P), ("720p", MODEL_720P)):
+        cases.extend(
+            [
+                pytest.param(
+                    OmniServerParams(model=model, server_args=["--model-class-name", "SanaImageToVideoPipeline"]),
+                    id=f"native-{variant}",
+                    marks=SINGLE_CARD_MARKS,
+                ),
+                pytest.param(
+                    OmniServerParams(
+                        model=model,
+                        server_args=[
+                            "--model-class-name",
+                            "SanaImageToVideoPipeline",
+                            "--diffusion-load-format",
+                            "diffusers",
+                            "--diffusion-attention-backend",
+                            "TORCH_SDPA",
+                        ],
+                    ),
+                    id=f"diffusers-adapter-{variant}",
+                    marks=SINGLE_CARD_MARKS,
+                ),
+            ]
         )
-        for variant, model in (("480p", MODEL_480P), ("720p", MODEL_720P))
-    ]
-    cases.append(
-        pytest.param(
-            OmniServerParams(
-                model=MODEL_480P,
-                server_args=[
-                    "--model-class-name",
-                    "SanaImageToVideoPipeline",
-                    "--diffusion-load-format",
-                    "diffusers",
-                    "--diffusion-attention-backend",
-                    "TORCH_SDPA",
-                ],
-            ),
-            id="diffusers-adapter-480p",
-            marks=SINGLE_CARD_MARKS,
-        )
-    )
     return cases
 
 

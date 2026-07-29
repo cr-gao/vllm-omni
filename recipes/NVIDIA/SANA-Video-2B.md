@@ -17,8 +17,8 @@
 Use the native `SanaVideoPipeline` for T2V and
 `SanaImageToVideoPipeline` for I2V. Both native pipelines support the 480p
 and 720p checkpoints. Use `--diffusion-load-format diffusers` when you need
-the black-box Diffusers compatibility baseline; adapter T2V is validated at
-both resolutions, while adapter I2V is currently validated only at 480p.
+the black-box Diffusers compatibility baseline; adapter T2V and I2V are
+validated at both resolutions.
 
 The native pipeline loads the 480p checkpoint through
 `DistributedAutoencoderKLWan` and the 720p checkpoint through
@@ -43,10 +43,11 @@ configuration and numerical behavior.
 
 ### 1x RTX 5090 32GB
 
-The 720p checkpoint was validated with BF16 on one RTX 5090. An 81-frame,
-1280×704, 50-step request took 33.56 seconds and reserved 23.58 GiB peak GPU
-memory. The 480p VAE is decoded in FP32 to match the upstream recipe; a
-9-frame, one-step 832×480 smoke run reserved 21.13 GiB.
+The 720p checkpoint was validated with BF16 on one RTX 5090. A native
+81-frame, 1280×704, 50-step request took 33.56 seconds and reserved 23.58 GiB
+peak GPU memory. The corresponding Diffusers-adapter I2V request took about
+36.5 seconds and peaked at 25.6 GiB. The 480p VAE is decoded in FP32 to match
+the upstream recipe; a 9-frame, one-step 832×480 smoke run reserved 21.13 GiB.
 
 Here, an 81-frame request at 16 FPS is the standard SANA-Video checkpoint
 profile and produces approximately five seconds of video. It is not
@@ -118,33 +119,37 @@ works; `num_frames` is adapted to Diffusers' `frames` argument. The script
 selects `TORCH_SDPA` because SANA-Video uses an attention mask that the
 AITER-backed Diffusers attention path does not accept.
 
-The equivalent validated 480p I2V adapter command is:
+The validated I2V adapter commands are:
 
 ```bash
+# 480p
 MODEL=Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
   bash examples/online_serving/image_to_video/run_server_sana_video_diffusers.sh
 
 INPUT_IMAGE=input.jpg OUTPUT_PATH=sana_video_i2v_adapter.mp4 \
   bash examples/online_serving/image_to_video/run_curl_sana_video.sh
-```
 
-Do not use this adapter command as evidence of 720p I2V support: that
-combination has not yet completed the end-to-end serving validation.
+# 720p
+MODEL=Efficient-Large-Model/SANA-Video_2B_720p_diffusers \
+  bash examples/online_serving/image_to_video/run_server_sana_video_diffusers.sh
+
+INPUT_IMAGE=input.jpg WIDTH=1280 HEIGHT=704 \
+  OUTPUT_PATH=sana_video_i2v_adapter_720p.mp4 \
+  bash examples/online_serving/image_to_video/run_curl_sana_video.sh
+```
 
 #### Validation boundary
 
-The current automated serving coverage is intentionally narrower than the
-pipeline registry:
+The automated serving matrix covers both checkpoint variants:
 
 | Backend | 480p T2V | 720p T2V | 480p I2V | 720p I2V |
 |---|---|---|---|---|
 | Native vLLM-Omni | Validated | Validated | Validated | Validated |
-| Diffusers adapter | Validated | Validated | Validated | Not yet validated; not claimed |
+| Diffusers adapter | Validated | Validated | Validated | Validated |
 
 Use the native `SanaVideoPipeline` and `SanaImageToVideoPipeline` for the
-supported SANA execution paths. The Diffusers adapter is retained as a
-compatibility/reference backend; the table above describes automated
-validation coverage and must not be read as a broader adapter support claim.
+primary SANA execution paths. The Diffusers adapter is retained as a
+validated compatibility/reference backend.
 
 #### Known limitations
 

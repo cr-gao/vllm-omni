@@ -1,6 +1,8 @@
 #!/bin/bash
 # SANA-Video-2B image-to-video serving through the Diffusers adapter.
-# The 480p checkpoint is validated; 720p adapter I2V is not yet claimed.
+# Both 480p and 720p checkpoints are validated. For 720p:
+# MODEL=Efficient-Large-Model/SANA-Video_2B_720p_diffusers bash run_server_sana_video_diffusers.sh
+# INPUT_IMAGE=input.jpg WIDTH=1280 HEIGHT=704 bash run_curl_sana_video.sh
 
 set -euo pipefail
 

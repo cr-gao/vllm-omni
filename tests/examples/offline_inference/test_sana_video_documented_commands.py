@@ -18,6 +18,7 @@ T2V_DIR = REPO_ROOT / "examples" / "offline_inference" / "text_to_video"
 T2V_README = T2V_DIR / "text_to_video.md"
 T2V_SCRIPT = T2V_DIR / "text_to_video.py"
 ONLINE_I2V_DIR = REPO_ROOT / "examples" / "online_serving" / "image_to_video"
+ONLINE_I2V_README = ONLINE_I2V_DIR / "README.md"
 RECIPE = REPO_ROOT / "recipes" / "NVIDIA" / "SANA-Video-2B.md"
 SUPPORTED_MODELS = REPO_ROOT / "docs" / "models" / "supported_models.md"
 
@@ -107,7 +108,15 @@ def test_sana_video_adapter_i2v_server_command_is_explicit() -> None:
     assert "--diffusion-load-format diffusers" in script
     assert "--diffusion-attention-backend TORCH_SDPA" in script
     assert "SANA-Video_2B_480p_diffusers" in script
-    assert "720p adapter I2V is not yet claimed" in script
+    assert "SANA-Video_2B_720p_diffusers" in script
+    assert "WIDTH=1280 HEIGHT=704" in script
+
+
+def test_sana_video_adapter_720p_i2v_usage_is_documented() -> None:
+    for markdown_path in (ONLINE_I2V_README, RECIPE):
+        markdown = markdown_path.read_text(encoding="utf-8")
+        assert "MODEL=Efficient-Large-Model/SANA-Video_2B_720p_diffusers" in markdown
+        assert "WIDTH=1280 HEIGHT=704" in markdown
 
 
 def test_sana_video_online_i2v_scripts_are_executable() -> None:
@@ -138,5 +147,5 @@ def test_sana_video_support_matrix_matches_validation_boundary() -> None:
     supported_models = SUPPORTED_MODELS.read_text(encoding="utf-8")
 
     assert "| Native vLLM-Omni | Validated | Validated | Validated | Validated |" in recipe
-    assert "| Diffusers adapter | Validated | Validated | Validated | Not yet validated; not claimed |" in recipe
-    assert "Diffusers adapter validated only at 480p" in supported_models
+    assert "| Diffusers adapter | Validated | Validated | Validated | Validated |" in recipe
+    assert "Diffusers adapter validated at 480p/720p" in supported_models
