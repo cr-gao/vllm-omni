@@ -40,6 +40,70 @@ _GOLDEN_PREFIX = torch.tensor(
 )
 
 
+@pytest.mark.parametrize(
+    ("elementwise_affine", "bias", "expected_state_keys"),
+    [
+        (False, False, set()),
+        (False, True, set()),
+        (True, False, {"weight"}),
+        (True, True, {"weight", "bias"}),
+    ],
+)
+@pytest.mark.parametrize(
+    ("input_dtype", "parameter_dtype"),
+    [
+        (torch.float16, torch.float16),
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float32, torch.float32),
+        (torch.float64, torch.float64),
+        (torch.float16, torch.float32),
+        (torch.bfloat16, torch.float32),
+        (torch.float32, torch.float16),
+        (torch.float32, torch.bfloat16),
+    ],
+)
+def test_sana_rms_norm_matches_diffusers(
+    elementwise_affine,
+    bias,
+    expected_state_keys,
+    input_dtype,
+    parameter_dtype,
+):
+    from diffusers.models.normalization import RMSNorm as DiffusersRMSNorm
+
+    from vllm_omni.diffusion.models.sana_video.transformer_sana_video import SanaRMSNorm
+
+    reference = DiffusersRMSNorm(8, eps=1e-5, elementwise_affine=elementwise_affine, bias=bias).to(
+        dtype=parameter_dtype
+    )
+    actual = SanaRMSNorm(8, eps=1e-5, elementwise_affine=elementwise_affine, bias=bias).to(dtype=parameter_dtype)
+
+    assert actual.eps == reference.eps
+    assert actual.elementwise_affine == reference.elementwise_affine
+    assert actual.dim == reference.dim
+    assert set(actual.state_dict()) == expected_state_keys
+    assert set(actual.state_dict()) == set(reference.state_dict())
+
+    if elementwise_affine:
+        weight = torch.linspace(0.5, 1.5, 8, dtype=parameter_dtype)
+        actual.weight.data.copy_(weight)
+        reference.weight.data.copy_(weight)
+        if bias:
+            norm_bias = torch.linspace(-0.25, 0.25, 8, dtype=parameter_dtype)
+            actual.bias.data.copy_(norm_bias)
+            reference.bias.data.copy_(norm_bias)
+    else:
+        assert actual.weight is None
+        assert actual.bias is None
+
+    hidden_states = torch.linspace(-2.0, 2.0, 48, dtype=input_dtype).reshape(2, 3, 8)
+    expected = reference(hidden_states)
+    result = actual(hidden_states)
+
+    assert result.dtype == expected.dtype
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("freqs_dtype", [torch.float32, torch.float64])
 @pytest.mark.parametrize(("dim", "max_seq_len", "theta"), [(4, 8, 10000.0), (12, 32, 256.0)])
 def test_native_rope_matches_diffusers(dim, max_seq_len, theta, freqs_dtype):
@@ -72,6 +136,7 @@ def test_tiny_transformer_matches_diffusers_and_frozen_output():
     from vllm_omni.diffusion.models.sana_video import SanaVideoTransformer3DModel
     from vllm_omni.diffusion.models.sana_video.transformer_sana_video import (
         SanaLinearAttention,
+        SanaRMSNorm,
         SanaVideoTransformerConfig,
         SanaVideoTransformerOutput,
     )
@@ -89,6 +154,11 @@ def test_tiny_transformer_matches_diffusers_and_frozen_output():
     assert isinstance(block.attn1, SanaLinearAttention)
     assert isinstance(block.attn2.attn, Attention)
     assert block.attn2.attn.role == "cross"
+    assert isinstance(block.attn1.norm_q, SanaRMSNorm)
+    assert isinstance(block.attn1.norm_k, SanaRMSNorm)
+    assert isinstance(block.attn2.norm_q, SanaRMSNorm)
+    assert isinstance(block.attn2.norm_k, SanaRMSNorm)
+    assert isinstance(model.caption_norm, SanaRMSNorm)
 
     torch.manual_seed(11)
     hidden_states = torch.randn(1, 4, 3, 4, 4)

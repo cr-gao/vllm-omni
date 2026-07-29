@@ -13,12 +13,13 @@
 # limitations under the License.
 
 import math
+import numbers
 from collections.abc import Iterable
 from dataclasses import dataclass, fields
 
 import torch
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
-from diffusers.models.normalization import AdaLayerNormSingle, RMSNorm
+from diffusers.models.normalization import AdaLayerNormSingle
 from torch import nn
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
@@ -67,6 +68,49 @@ class SanaVideoTransformerOutput:
     sample: torch.Tensor
 
 
+class SanaRMSNorm(nn.Module):
+    """RMSNorm with the parameter and dtype semantics used by SANA checkpoints."""
+
+    def __init__(
+        self,
+        dim: int | Iterable[int],
+        eps: float,
+        elementwise_affine: bool = True,
+        bias: bool = False,
+    ) -> None:
+        super().__init__()
+
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+
+        if isinstance(dim, numbers.Integral):
+            dim = (dim,)
+        self.dim = torch.Size(dim)
+
+        self.weight: nn.Parameter | None = None
+        self.bias: nn.Parameter | None = None
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(self.dim))
+            if bias:
+                self.bias = nn.Parameter(torch.zeros(self.dim))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
+
+        if self.weight is not None:
+            if self.weight.dtype in (torch.float16, torch.bfloat16):
+                hidden_states = hidden_states.to(self.weight.dtype)
+            hidden_states = hidden_states * self.weight
+            if self.bias is not None:
+                hidden_states = hidden_states + self.bias
+        else:
+            hidden_states = hidden_states.to(input_dtype)
+
+        return hidden_states
+
+
 def _get_1d_rotary_pos_embed(
     dim: int,
     max_seq_len: int,
@@ -107,7 +151,7 @@ class GLUMBTempConv(nn.Module):
 
         self.norm = None
         if norm_type == "rms_norm":
-            self.norm = RMSNorm(out_channels, eps=1e-5, elementwise_affine=True, bias=True)
+            self.norm = SanaRMSNorm(out_channels, eps=1e-5, elementwise_affine=True, bias=True)
 
         self.conv_temp = nn.Conv2d(out_channels, out_channels, kernel_size=(3, 1), stride=1, padding=(1, 0), bias=False)
 
@@ -165,8 +209,8 @@ class SanaLinearAttention(nn.Module):
         self.to_q = nn.Linear(dim, inner_dim, bias=bias)
         self.to_k = nn.Linear(dim, inner_dim, bias=bias)
         self.to_v = nn.Linear(dim, inner_dim, bias=bias)
-        self.norm_q = RMSNorm(inner_dim, eps=1e-5, elementwise_affine=True) if qk_norm is not None else None
-        self.norm_k = RMSNorm(inner_dim, eps=1e-5, elementwise_affine=True) if qk_norm is not None else None
+        self.norm_q = SanaRMSNorm(inner_dim, eps=1e-5, elementwise_affine=True) if qk_norm is not None else None
+        self.norm_k = SanaRMSNorm(inner_dim, eps=1e-5, elementwise_affine=True) if qk_norm is not None else None
         self.to_out = nn.ModuleList([nn.Linear(inner_dim, dim, bias=True), nn.Dropout(dropout)])
 
     def forward(
@@ -350,8 +394,8 @@ class SanaCrossAttention(nn.Module):
         self.to_q = nn.Linear(dim, inner_dim, bias=bias)
         self.to_k = nn.Linear(cross_attention_dim, inner_dim, bias=bias)
         self.to_v = nn.Linear(cross_attention_dim, inner_dim, bias=bias)
-        self.norm_q = RMSNorm(inner_dim, eps=1e-5, elementwise_affine=True) if qk_norm is not None else None
-        self.norm_k = RMSNorm(inner_dim, eps=1e-5, elementwise_affine=True) if qk_norm is not None else None
+        self.norm_q = SanaRMSNorm(inner_dim, eps=1e-5, elementwise_affine=True) if qk_norm is not None else None
+        self.norm_k = SanaRMSNorm(inner_dim, eps=1e-5, elementwise_affine=True) if qk_norm is not None else None
         self.to_out = nn.ModuleList([nn.Linear(inner_dim, dim, bias=out_bias), nn.Dropout(dropout)])
         self.attn = OmniAttention(
             num_heads=num_heads,
@@ -615,7 +659,7 @@ class SanaVideoTransformer3DModel(nn.Module):
             self.time_embed = AdaLayerNormSingle(inner_dim)
 
         self.caption_projection = PixArtAlphaTextProjection(in_features=caption_channels, hidden_size=inner_dim)
-        self.caption_norm = RMSNorm(inner_dim, eps=1e-5, elementwise_affine=True)
+        self.caption_norm = SanaRMSNorm(inner_dim, eps=1e-5, elementwise_affine=True)
 
         # 3. Transformer blocks
         self.transformer_blocks = nn.ModuleList(
