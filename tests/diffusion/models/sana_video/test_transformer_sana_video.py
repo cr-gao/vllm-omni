@@ -40,6 +40,29 @@ _GOLDEN_PREFIX = torch.tensor(
 )
 
 
+@pytest.mark.parametrize("freqs_dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(("dim", "max_seq_len", "theta"), [(4, 8, 10000.0), (12, 32, 256.0)])
+def test_native_rope_matches_diffusers(dim, max_seq_len, theta, freqs_dtype):
+    from diffusers.models.embeddings import get_1d_rotary_pos_embed
+
+    from vllm_omni.diffusion.models.sana_video.transformer_sana_video import (
+        _get_1d_rotary_pos_embed,
+    )
+
+    expected_cos, expected_sin = get_1d_rotary_pos_embed(
+        dim,
+        max_seq_len,
+        theta,
+        use_real=True,
+        repeat_interleave_real=True,
+        freqs_dtype=freqs_dtype,
+    )
+    actual_cos, actual_sin = _get_1d_rotary_pos_embed(dim, max_seq_len, theta, freqs_dtype)
+
+    torch.testing.assert_close(actual_cos, expected_cos, rtol=0, atol=0)
+    torch.testing.assert_close(actual_sin, expected_sin, rtol=0, atol=0)
+
+
 def test_tiny_transformer_matches_diffusers_and_frozen_output():
     from diffusers import SanaVideoTransformer3DModel as DiffusersTransformer
     from diffusers.configuration_utils import ConfigMixin

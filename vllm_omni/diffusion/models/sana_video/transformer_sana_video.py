@@ -17,7 +17,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, fields
 
 import torch
-from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps, get_1d_rotary_pos_embed
+from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
 from diffusers.models.normalization import AdaLayerNormSingle, RMSNorm
 from torch import nn
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -65,6 +65,24 @@ class SanaVideoTransformerConfig:
 @dataclass
 class SanaVideoTransformerOutput:
     sample: torch.Tensor
+
+
+def _get_1d_rotary_pos_embed(
+    dim: int,
+    max_seq_len: int,
+    theta: float,
+    freqs_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Generate the real-valued 1D RoPE representation used by SANA-Video."""
+    if dim % 2 != 0:
+        raise ValueError(f"RoPE dimension must be even, got {dim}")
+
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=freqs_dtype) / dim))
+    positions = torch.arange(max_seq_len, dtype=freqs_dtype)
+    freqs = torch.outer(positions, freqs)
+    freqs_cos = freqs.cos().float().repeat_interleave(2, dim=-1)
+    freqs_sin = freqs.sin().float().repeat_interleave(2, dim=-1)
+    return freqs_cos, freqs_sin
 
 
 class GLUMBTempConv(nn.Module):
@@ -244,14 +262,7 @@ class WanRotaryPosEmbed(nn.Module):
         freqs_sin = []
 
         for dim in [t_dim, h_dim, w_dim]:
-            freq_cos, freq_sin = get_1d_rotary_pos_embed(
-                dim,
-                max_seq_len,
-                theta,
-                use_real=True,
-                repeat_interleave_real=True,
-                freqs_dtype=freqs_dtype,
-            )
+            freq_cos, freq_sin = _get_1d_rotary_pos_embed(dim, max_seq_len, theta, freqs_dtype)
             freqs_cos.append(freq_cos)
             freqs_sin.append(freq_sin)
 
