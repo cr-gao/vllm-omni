@@ -71,6 +71,38 @@ def test_component_discovery_declarations():
     assert SanaVideoPipeline.supports_step_execution is False
 
 
+def test_sana_video_loads_concrete_gemma_tokenizer(monkeypatch):
+    from vllm_omni.diffusion.models.sana_video import pipeline_sana_video
+
+    captured = {}
+    expected = object()
+
+    def fake_from_pretrained_with_prefetch(loader, model, **kwargs):
+        captured.update(loader=loader, model=model, kwargs=kwargs)
+        return expected
+
+    monkeypatch.setattr(
+        pipeline_sana_video,
+        "from_pretrained_with_prefetch",
+        fake_from_pretrained_with_prefetch,
+    )
+
+    result = pipeline_sana_video._load_sana_tokenizer(
+        "Efficient-Large-Model/SANA-Video_2B_480p_diffusers",
+        ["tokenizer", "text_encoder"],
+        local_files_only=False,
+    )
+
+    assert result is expected
+    assert captured["loader"] == pipeline_sana_video.GemmaTokenizer.from_pretrained
+    assert captured["model"] == "Efficient-Large-Model/SANA-Video_2B_480p_diffusers"
+    assert captured["kwargs"] == {
+        "subfolder": "tokenizer",
+        "prefetch_list": ["tokenizer", "text_encoder"],
+        "local_files_only": False,
+    }
+
+
 def test_sana_video_declares_extra_body_params():
     from vllm_omni.model_extras import get_extra_body_params
 

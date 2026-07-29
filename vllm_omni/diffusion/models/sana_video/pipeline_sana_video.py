@@ -24,7 +24,7 @@ from diffusers.schedulers import DPMSolverMultistepScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from torch import nn
-from transformers import AutoModel, AutoTokenizer, Gemma2PreTrainedModel, GemmaTokenizer, GemmaTokenizerFast
+from transformers import AutoModel, Gemma2PreTrainedModel, GemmaTokenizer, GemmaTokenizerFast
 from vllm.transformers_utils.config import get_hf_file_to_dict
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -58,6 +58,27 @@ def _resolve_vae_class_and_dtype(
         raise ValueError(f"Unsupported SANA-Video VAE class: {vae_class_name!r}")
     vae_dtype = torch.float32 if vae_class_name == "AutoencoderKLWan" else pipeline_dtype
     return vae_classes[vae_class_name], vae_dtype
+
+
+def _load_sana_tokenizer(
+    model: str,
+    component_subfolders: list[str],
+    local_files_only: bool,
+) -> GemmaTokenizer:
+    # Transformers v5 AutoTokenizer first tries to resolve an AutoConfig from
+    # the requested subfolder. Released SANA-Video repositories correctly
+    # contain tokenizer metadata under tokenizer/, but their model config lives
+    # under text_encoder/, so that extra tokenizer/config.json lookup fails for
+    # Hub model IDs. Both released checkpoints use GemmaTokenizer; loading the
+    # concrete class also matches Diffusers and avoids the unrelated config
+    # lookup.
+    return from_pretrained_with_prefetch(
+        GemmaTokenizer.from_pretrained,
+        model,
+        subfolder="tokenizer",
+        prefetch_list=component_subfolders,
+        local_files_only=local_files_only,
+    )
 
 
 ASPECT_RATIO_480_BIN = {
@@ -308,11 +329,9 @@ class SanaVideoPipeline(
         component_subfolders = ["tokenizer", "text_encoder", "vae", "scheduler"]
         prefetch_subfolders(model, component_subfolders, local_files_only=local_files_only)
 
-        tokenizer = from_pretrained_with_prefetch(
-            AutoTokenizer.from_pretrained,
+        tokenizer = _load_sana_tokenizer(
             model,
-            subfolder="tokenizer",
-            prefetch_list=component_subfolders,
+            component_subfolders,
             local_files_only=local_files_only,
         )
         text_encoder = from_pretrained_with_prefetch(
