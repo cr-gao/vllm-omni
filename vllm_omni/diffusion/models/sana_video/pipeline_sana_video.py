@@ -66,6 +66,7 @@ def _load_sana_tokenizer(
     model: str,
     component_subfolders: list[str],
     local_files_only: bool,
+    revision: str | None = None,
 ) -> GemmaTokenizer:
     # Transformers v5 AutoTokenizer first tries to resolve an AutoConfig from
     # the requested subfolder. Released SANA-Video repositories correctly
@@ -74,12 +75,14 @@ def _load_sana_tokenizer(
     # Hub model IDs. Both released checkpoints use GemmaTokenizer; loading the
     # concrete class also matches Diffusers and avoids the unrelated config
     # lookup.
+    revision_kwargs = {"revision": revision} if revision is not None else {}
     return from_pretrained_with_prefetch(
         GemmaTokenizer.from_pretrained,
         model,
         subfolder="tokenizer",
         prefetch_list=component_subfolders,
         local_files_only=local_files_only,
+        **revision_kwargs,
     )
 
 
@@ -127,7 +130,15 @@ def resolve_sana_video_sample_size(od_config: OmniDiffusionConfig) -> int:
     model = getattr(od_config, "model", None)
     if sample_size is None and model:
         try:
-            transformer_config = get_hf_file_to_dict("transformer/config.json", model) or {}
+            revision = None if os.path.exists(model) else getattr(od_config, "revision", None)
+            transformer_config = (
+                get_hf_file_to_dict(
+                    "transformer/config.json",
+                    model,
+                    revision=revision,
+                )
+                or {}
+            )
             sample_size = transformer_config.get("sample_size")
         except (OSError, ValueError):
             pass
@@ -342,17 +353,25 @@ class SanaVideoPipeline(
     ]:
         model = od_config.model
         local_files_only = os.path.exists(model)
+        revision = None if local_files_only else od_config.revision
+        revision_kwargs = {"revision": revision} if revision is not None else {}
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         device = self.device
         # Transformer weights are streamed by DiffusersPipelineLoader below.
         # Prefetch only components loaded through from_pretrained here.
         component_subfolders = ["tokenizer", "text_encoder", "vae", "scheduler"]
-        prefetch_subfolders(model, component_subfolders, local_files_only=local_files_only)
+        prefetch_subfolders(
+            model,
+            component_subfolders,
+            local_files_only=local_files_only,
+            revision=revision,
+        )
 
         tokenizer = _load_sana_tokenizer(
             model,
             component_subfolders,
             local_files_only=local_files_only,
+            revision=revision,
         )
         text_encoder = from_pretrained_with_prefetch(
             AutoModel.from_pretrained,
@@ -361,9 +380,15 @@ class SanaVideoPipeline(
             prefetch_list=component_subfolders,
             local_files_only=local_files_only,
             torch_dtype=dtype,
+            **revision_kwargs,
         ).to(device)
 
-        model_index = _load_json(model, "model_index.json", local_files_only)
+        model_index = _load_json(
+            model,
+            "model_index.json",
+            local_files_only,
+            revision=revision,
+        )
         vae_class_name = model_index.get("vae", [None, "AutoencoderKLWan"])[1]
         # The released 480p checkpoint uses Wan VAE weights that are decoded
         # in FP32 in the upstream reference recipe. The 720p LTX2 VAE is
@@ -376,20 +401,27 @@ class SanaVideoPipeline(
             prefetch_list=component_subfolders,
             local_files_only=local_files_only,
             torch_dtype=vae_dtype,
+            **revision_kwargs,
         ).to(device)
 
-        transformer_config = _load_json(model, "transformer/config.json", local_files_only)
+        transformer_config = _load_json(
+            model,
+            "transformer/config.json",
+            local_files_only,
+            revision=revision,
+        )
         transformer = SanaVideoTransformer3DModel.from_config(transformer_config).to(dtype=dtype, device=device)
         scheduler = DPMSolverMultistepScheduler.from_pretrained(
             model,
             subfolder="scheduler",
             local_files_only=local_files_only,
+            **revision_kwargs,
         )
         self.weights_sources[:] = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=model,
                 subfolder="transformer",
-                revision=None,
+                revision=revision,
                 prefix=f"{prefix}transformer." if prefix else "transformer.",
                 fall_back_to_pt=True,
             )
