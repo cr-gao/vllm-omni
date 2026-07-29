@@ -23,8 +23,10 @@ LTX2 Video VAE.
 
 - Upstream project: <https://github.com/NVlabs/Sana>
 - Diffusers documentation: <https://huggingface.co/docs/diffusers/api/pipelines/sana_video>
-- Offline example:
+- Offline T2V example:
   [`examples/offline_inference/text_to_video/text_to_video.py`](../../examples/offline_inference/text_to_video/text_to_video.py)
+- Offline I2V example:
+  [`examples/offline_inference/image_to_video/image_to_video.py`](../../examples/offline_inference/image_to_video/image_to_video.py)
 
 ## Hardware Support
 
@@ -36,6 +38,12 @@ The 720p checkpoint was validated with BF16 on one RTX 5090. An 81-frame,
 1280×704, 50-step request took 33.56 seconds and reserved 23.58 GiB peak GPU
 memory. The 480p VAE is decoded in FP32 to match the upstream recipe; a
 9-frame, one-step 832×480 smoke run reserved 21.13 GiB.
+
+Here, an 81-frame request at 16 FPS is the standard SANA-Video checkpoint
+profile and produces approximately five seconds of video. It is not
+minute-scale "long video" generation. The latter requires the separate
+LongSANA/LongLive block-autoregressive workflow, which this pipeline does not
+implement.
 
 #### Native offline inference
 
@@ -62,7 +70,7 @@ SanaImageToVideoPipeline`.
 
 ```bash
 python examples/offline_inference/image_to_video/image_to_video.py \
-  --model /root/autodl-tmp/models/SANA-Video_2B_480p_diffusers \
+  --model Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
   --model-class-name SanaImageToVideoPipeline \
   --image input.jpg \
   --prompt "A cat turns toward the camera with smooth, natural motion." \
@@ -79,7 +87,7 @@ VAE; use `--height 704 --width 1280`.
 For online I2V serving:
 
 ```bash
-MODEL=/root/autodl-tmp/models/SANA-Video_2B_480p_diffusers \
+MODEL=Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
   bash examples/online_serving/image_to_video/run_server_sana_video.sh
 
 INPUT_IMAGE=input.jpg OUTPUT_PATH=sana_video_i2v.mp4 \
@@ -100,6 +108,21 @@ To run the black-box compatibility backend, replace the server script with
 `num_frames` is adapted to Diffusers' `frames` argument. The script selects
 `TORCH_SDPA` because SANA-Video uses an attention mask that the AITER-backed
 Diffusers attention path does not accept.
+
+#### Validation boundary
+
+The current automated serving coverage is intentionally narrower than the
+pipeline registry:
+
+| Backend | 480p T2V | 720p T2V | 480p I2V | 720p I2V |
+|---|---|---|---|---|
+| Native vLLM-Omni | Validated | Validated | Validated | Validated |
+| Diffusers adapter | Validated | Not yet validated | Not yet validated | Not yet validated |
+
+Use the native `SanaVideoPipeline` and `SanaImageToVideoPipeline` for the
+supported SANA execution paths. The Diffusers adapter is retained as a
+compatibility/reference backend; the table above describes automated
+validation coverage and must not be read as a broader adapter support claim.
 
 #### Known limitations
 
