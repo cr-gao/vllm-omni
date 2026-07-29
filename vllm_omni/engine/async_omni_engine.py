@@ -217,6 +217,7 @@ class AsyncOmniEngine:
             model=model,
             trust_remote_code=trust_remote_code,
             deploy_config_path=deploy_config_path,
+            revision=kwargs.get("revision"),
         )
         self.endpoint_restrictions = pipeline_config.endpoint_restrictions if pipeline_config is not None else ()
         self._duplex_runtime_extension_path = (

@@ -63,7 +63,10 @@ def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: 
         logger.error(f"Failed to inject omni connector config into stage: {e}")
 
 
-def _try_get_class_name_from_diffusers_config(model: str) -> str | None:
+def _try_get_class_name_from_diffusers_config(
+    model: str,
+    revision: str | None = None,
+) -> str | None:
     """Try to get class name from diffusers model configuration files.
 
     Args:
@@ -72,7 +75,7 @@ def _try_get_class_name_from_diffusers_config(model: str) -> str | None:
     Returns:
         Model type string if found, None otherwise
     """
-    model_index = get_hf_file_to_dict("model_index.json", model, revision=None)
+    model_index = get_hf_file_to_dict("model_index.json", model, revision=revision)
     if model_index and isinstance(model_index, dict) and "_class_name" in model_index:
         logger.debug(f"Found model_type '{model_index['_class_name']}' in model_index.json")
         return model_index["_class_name"]
@@ -226,7 +229,10 @@ def _try_resolve_omni_model_type(model: str) -> str | None:
     return best_match
 
 
-def resolve_model_config_path(model: str) -> str:
+def resolve_model_config_path(
+    model: str,
+    revision: str | None = None,
+) -> str:
     """Resolve the stage config file path from the model name.
 
     Resolves stage configuration path based on the model type and device type.
@@ -245,22 +251,29 @@ def resolve_model_config_path(model: str) -> str:
     """
     # Try to get config from standard transformers format first
     try:
-        hf_config = get_config(model, trust_remote_code=True)
+        hf_config = get_config(
+            model,
+            trust_remote_code=True,
+            revision=revision,
+        )
         model_type = hf_config.model_type
     except (ValueError, Exception):
         # If standard transformers format fails, try diffusers format
-        if file_or_path_exists(model, "model_index.json", revision=None):
-            model_type = _try_get_class_name_from_diffusers_config(model)
+        if file_or_path_exists(model, "model_index.json", revision=revision):
+            model_type = _try_get_class_name_from_diffusers_config(
+                model,
+                revision=revision,
+            )
             if model_type is None:
                 raise ValueError(
                     f"Could not determine model_type for diffusers model: {model}. "
                     f"Please ensure the model has 'model_type' in transformer/config.json or model_index.json"
                 )
-        elif file_or_path_exists(model, "config.json", revision=None):
+        elif file_or_path_exists(model, "config.json", revision=revision):
             # Try to read config.json manually for custom models like Bagel that fail get_config
             # but have a valid config.json with model_type
             try:
-                config_dict = get_hf_file_to_dict("config.json", model, revision=None)
+                config_dict = get_hf_file_to_dict("config.json", model, revision=revision)
                 if config_dict and "model_type" in config_dict:
                     model_type = config_dict["model_type"]
                 else:
@@ -284,7 +297,7 @@ def resolve_model_config_path(model: str) -> str:
                 )
 
     default_config_path = current_omni_platform.get_default_stage_config_path()
-    if model_type == "vla" and _looks_like_dreamzero(model):
+    if model_type == "vla" and _looks_like_dreamzero(model, revision=revision):
         model_type = "dreamzero"
 
     if model_type in _DIFFUSERS_CLASS_TO_CONFIG:
@@ -312,6 +325,7 @@ def load_stage_configs_from_model(
     *,
     trust_remote_code: bool | None,
     base_engine_args: dict | None = None,
+    revision: str | None = None,
     deploy_config_path: str | None = None,
     stage_overrides: dict[str, dict[str, Any]] | None = None,
     strategy_config_path: str | None = None,
@@ -344,6 +358,8 @@ def load_stage_configs_from_model(
         base_engine_args = {}
 
     cli_overrides = _convert_dataclasses_to_dict(dict(base_engine_args))
+    if revision is not None:
+        cli_overrides.setdefault("revision", revision)
     # A False inherited from the engine-args dump is the store_true flag's
     # default, not an explicit choice — drop it so only the tri-state
     # parameter below decides (see with_trust_remote_code_override).
@@ -388,7 +404,7 @@ def load_stage_configs_from_model(
             strategy_config_path,
             model,
         )
-    stage_config_path = resolve_model_config_path(model)
+    stage_config_path = resolve_model_config_path(model, revision=revision)
     if stage_config_path is None:
         return [], None
     stage_configs = load_stage_configs_from_yaml(
@@ -586,6 +602,7 @@ def load_and_resolve_stage_configs(
         the strategy-derived pipeline-wide load-balancer policy (``None`` when no
         strategy set one), returned for the engine to apply.
     """
+    revision = kwargs.get("revision") if kwargs is not None else None
     if stage_configs_path is not None and deploy_config_path is not None:
         raise ValueError(
             "--stage-configs-path and --deploy-config are mutually exclusive: "
@@ -619,6 +636,7 @@ def load_and_resolve_stage_configs(
             model,
             trust_remote_code=trust_remote_code,
             base_engine_args=kwargs,
+            revision=revision,
             deploy_config_path=deploy_config_path,
             stage_overrides=stage_overrides,
             strategy_config_path=strategy_config_path,
@@ -630,11 +648,12 @@ def load_and_resolve_stage_configs(
             else:
                 stage_configs = []
     elif stage_configs_path is None:
-        config_path = resolve_model_config_path(model)
+        config_path = resolve_model_config_path(model, revision=revision)
         stage_configs, omni_lb_policy = load_stage_configs_from_model(
             model,
             trust_remote_code=trust_remote_code,
             base_engine_args=kwargs,
+            revision=revision,
             stage_overrides=stage_overrides,
             strategy_config_path=strategy_config_path,
         )

@@ -679,7 +679,11 @@ async def build_async_omni_from_stage_config(
             saved = os.environ.get("CUDA_VISIBLE_DEVICES")
             os.environ["CUDA_VISIBLE_DEVICES"] = ""
             try:
-                AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+                AutoConfig.from_pretrained(
+                    args.model,
+                    trust_remote_code=True,
+                    revision=getattr(args, "revision", None),
+                )
             finally:
                 if saved is not None:
                     os.environ["CUDA_VISIBLE_DEVICES"] = saved

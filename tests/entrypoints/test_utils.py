@@ -286,11 +286,16 @@ class TestResolveModelConfigPath:
 
     def test_glm_image_diffusers_format_resolution(self, mocker: MockerFixture):
         """Test GlmImagePipeline diffusers class resolves to glm_image config."""
-        mocker.patch(
+        revision = "8bda5e623d0f48cd6da3b387b10ca35d15cf1c4e"
+        get_config = mocker.patch(
+            "vllm_omni.entrypoints.utils.get_config",
+            side_effect=ValueError("diffusers model has no root transformers config"),
+        )
+        file_exists = mocker.patch(
             "vllm_omni.entrypoints.utils.file_or_path_exists",
             return_value=True,
         )
-        mocker.patch(
+        get_class_name = mocker.patch(
             "vllm_omni.entrypoints.utils._try_get_class_name_from_diffusers_config",
             return_value="GlmImagePipeline",
         )
@@ -308,10 +313,24 @@ class TestResolveModelConfigPath:
 
         mocker.patch("os.path.exists", side_effect=mock_exists)
 
-        result = resolve_model_config_path("zai-org/GLM-Image")
+        result = resolve_model_config_path("zai-org/GLM-Image", revision=revision)
 
         assert result is not None
         assert "glm_image.yaml" in result
+        get_config.assert_called_once_with(
+            "zai-org/GLM-Image",
+            trust_remote_code=True,
+            revision=revision,
+        )
+        file_exists.assert_called_once_with(
+            "zai-org/GLM-Image",
+            "model_index.json",
+            revision=revision,
+        )
+        get_class_name.assert_called_once_with(
+            "zai-org/GLM-Image",
+            revision=revision,
+        )
 
 
 class TestLoadAndResolveStageConfigs:
@@ -367,6 +386,7 @@ class TestLoadAndResolveStageConfigs:
             "dummy-model",
             trust_remote_code=True,
             base_engine_args={},
+            revision=None,
             deploy_config_path=str(deploy_path),
             stage_overrides=None,
             strategy_config_path=None,
@@ -375,6 +395,34 @@ class TestLoadAndResolveStageConfigs:
         assert len(stage_configs) == 2
         assert stage_configs[1].runtime.num_replicas == 3
         assert stage_configs[1].runtime.devices == "1,2,3"
+
+    def test_revision_reaches_config_path_and_stage_factory(self, mocker: MockerFixture):
+        revision = "8bda5e623d0f48cd6da3b387b10ca35d15cf1c4e"
+        resolve_config_path = mocker.patch(
+            "vllm_omni.entrypoints.utils.resolve_model_config_path",
+            return_value=None,
+        )
+        load_stage_configs = mocker.patch(
+            "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
+            return_value=([], None),
+        )
+
+        load_and_resolve_stage_configs(
+            model="fake/model",
+            stage_configs_path=None,
+            kwargs={"revision": revision},
+            trust_remote_code=False,
+        )
+
+        resolve_config_path.assert_called_once_with("fake/model", revision=revision)
+        load_stage_configs.assert_called_once_with(
+            "fake/model",
+            trust_remote_code=False,
+            base_engine_args={"revision": revision},
+            revision=revision,
+            stage_overrides=None,
+            strategy_config_path=None,
+        )
 
     def test_filter_stages_selects_mode_stages_without_mutating_stage_config(self, tmp_path):
         config_path = tmp_path / "deploy.yaml"

@@ -675,6 +675,72 @@ class TestPipelineConfigNew:
 
 
 class TestPipelineRegistration:
+    def test_hf_config_revision_is_forwarded_and_cached_separately(self):
+        revisions = []
+
+        class FakeConfig(PretrainedConfig):
+            model_type = "revision_test"
+
+        def load_config(model, *, trust_remote_code, revision):
+            revisions.append((model, trust_remote_code, revision))
+            return FakeConfig()
+
+        with patch("vllm_omni.config.config_factory.get_config", side_effect=load_config):
+            first = StageConfigFactory.get_hf_config(
+                "fake/model",
+                trust_remote_code=False,
+                revision="revision-a",
+            )
+            first_cached = StageConfigFactory.get_hf_config(
+                "fake/model",
+                trust_remote_code=False,
+                revision="revision-a",
+            )
+            second = StageConfigFactory.get_hf_config(
+                "fake/model",
+                trust_remote_code=False,
+                revision="revision-b",
+            )
+            default = StageConfigFactory.get_hf_config(
+                "fake/model",
+                trust_remote_code=False,
+                revision=None,
+            )
+
+        assert first is first_cached
+        assert all(config is not None for config in (first, second, default))
+        assert revisions == [
+            ("fake/model", False, "revision-a"),
+            ("fake/model", False, "revision-b"),
+            ("fake/model", False, None),
+        ]
+
+    def test_fallback_config_probes_use_pinned_revision(self, clean_pipeline_registry):
+        revision = "8bda5e623d0f48cd6da3b387b10ca35d15cf1c4e"
+        calls = []
+
+        def get_model_file(filename, model, revision=None):
+            calls.append((filename, model, revision))
+            if filename == "model_index.json":
+                return {"_class_name": "WanPipeline"}
+            return None
+
+        with (
+            patch("vllm_omni.config.config_factory.get_config", side_effect=ValueError("no root config")),
+            patch("vllm_omni.config.config_factory.get_hf_file_to_dict", side_effect=get_model_file),
+        ):
+            pipeline = StageConfigFactory.get_pipeline_config(
+                "fake/model",
+                trust_remote_code=False,
+                revision=revision,
+            )
+
+        assert pipeline is not None
+        assert calls == [
+            ("config.json", "fake/model", revision),
+            ("model_index.json", "fake/model", revision),
+        ]
+
     def test_resolve_pipeline_prefers_deploy_pipeline_key(self, clean_pipeline_registry, tmp_path):
         deploy_key = "deploy_selected_pipeline"
         model_type_key = "hf_model_type_pipeline"
@@ -978,7 +1044,11 @@ class TestPipelineRegistration:
                 "trust_remote_code": True,
                 "model": "fake/model",
             }
-            mock_get_config.assert_called_once_with("fake/model", trust_remote_code=True)
+            mock_get_config.assert_called_once_with(
+                "fake/model",
+                trust_remote_code=True,
+                revision=None,
+            )
 
         with patch.object(StageConfigFactory, "_create_legacy_from_registry", return_value=([], None)) as mock_legacy:
             StageConfigFactory.create_legacy_stage_configs_from_model(

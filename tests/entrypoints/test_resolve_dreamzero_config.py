@@ -10,11 +10,11 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def test_dreamzero_vla_resolves_to_dreamzero_config(monkeypatch):
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils.get_config",
-        lambda _model, trust_remote_code=True: type("Cfg", (), {"model_type": "vla"})(),
+        lambda _model, trust_remote_code=True, revision=None: type("Cfg", (), {"model_type": "vla"})(),
     )
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils._looks_like_dreamzero",
-        lambda _model: True,
+        lambda _model, revision=None: True,
     )
     result = resolve_model_config_path("GEAR-Dreams/DreamZero-DROID")
 
@@ -25,15 +25,15 @@ def test_dreamzero_vla_resolves_to_dreamzero_config(monkeypatch):
 def test_dreamzero_config_sets_model_class_and_policy_config(monkeypatch):
     monkeypatch.setattr(
         "vllm_omni.config.config_factory.StageConfigFactory._try_infer_model_type",
-        classmethod(lambda _cls, model, trust_remote_code=True: "vla"),
+        classmethod(lambda _cls, model, trust_remote_code=True, revision=None: "vla"),
     )
     monkeypatch.setattr(
         "vllm_omni.config.config_factory.StageConfigFactory.get_hf_config",
-        classmethod(lambda _cls, model, trust_remote_code=True: None),
+        classmethod(lambda _cls, model, trust_remote_code=True, revision=None: None),
     )
     monkeypatch.setattr(
         "vllm_omni.config.config_factory._looks_like_dreamzero",
-        lambda _model: True,
+        lambda _model, revision=None: True,
     )
 
     stage_configs, _ = load_stage_configs_from_model(
