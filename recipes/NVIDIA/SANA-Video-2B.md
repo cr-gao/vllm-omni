@@ -1,7 +1,7 @@
 # SANA-Video 2B
 
 > Native text-to-video and image-to-video generation at 480p and 720p,
-> plus a Diffusers-adapter compatibility path
+> plus a validated Diffusers-adapter compatibility path
 
 ## Summary
 
@@ -14,10 +14,19 @@
 
 ## When to use this recipe
 
-Use the native `SanaVideoPipeline` for vLLM-Omni model loading and request
-handling. Use `--diffusion-load-format diffusers` as a compatibility baseline.
-The 480p model uses a 16-channel Wan VAE; the 720p model uses a 128-channel
-LTX2 Video VAE.
+Use the native `SanaVideoPipeline` for T2V and
+`SanaImageToVideoPipeline` for I2V. Both native pipelines support the 480p
+and 720p checkpoints. Use `--diffusion-load-format diffusers` when you need
+the black-box Diffusers compatibility baseline; adapter T2V is validated at
+both resolutions, while adapter I2V is currently validated only at 480p.
+
+The native pipeline loads the 480p checkpoint through
+`DistributedAutoencoderKLWan` and the 720p checkpoint through
+`DistributedAutoencoderKLLTX2Video`. These are vLLM-Omni distributed wrappers
+around the corresponding Diffusers autoencoders, not independent VAE
+implementations. The denoising loop also intentionally loads Diffusers'
+`DPMSolverMultistepScheduler` from the checkpoint to preserve its scheduler
+configuration and numerical behavior.
 
 ## References
 
@@ -91,7 +100,7 @@ MODEL=Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
   bash examples/online_serving/image_to_video/run_server_sana_video.sh
 
 INPUT_IMAGE=input.jpg OUTPUT_PATH=sana_video_i2v.mp4 \
-  bash examples/online_serving/image_to_video/run_curl_image_to_video.sh
+  bash examples/online_serving/image_to_video/run_curl_sana_video.sh
 ```
 
 #### Online serving
@@ -103,11 +112,24 @@ MODEL=Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
 bash examples/online_serving/text_to_video/run_curl_sana_video.sh
 ```
 
-To run the black-box compatibility backend, replace the server script with
-`run_server_sana_video_diffusers.sh`. The same `/v1/videos` request works;
-`num_frames` is adapted to Diffusers' `frames` argument. The script selects
-`TORCH_SDPA` because SANA-Video uses an attention mask that the AITER-backed
-Diffusers attention path does not accept.
+To run the black-box compatibility backend for T2V, replace the server script
+with `run_server_sana_video_diffusers.sh`. The same `/v1/videos` request
+works; `num_frames` is adapted to Diffusers' `frames` argument. The script
+selects `TORCH_SDPA` because SANA-Video uses an attention mask that the
+AITER-backed Diffusers attention path does not accept.
+
+The equivalent validated 480p I2V adapter command is:
+
+```bash
+MODEL=Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
+  bash examples/online_serving/image_to_video/run_server_sana_video_diffusers.sh
+
+INPUT_IMAGE=input.jpg OUTPUT_PATH=sana_video_i2v_adapter.mp4 \
+  bash examples/online_serving/image_to_video/run_curl_sana_video.sh
+```
+
+Do not use this adapter command as evidence of 720p I2V support: that
+combination has not yet completed the end-to-end serving validation.
 
 #### Validation boundary
 
@@ -117,7 +139,7 @@ pipeline registry:
 | Backend | 480p T2V | 720p T2V | 480p I2V | 720p I2V |
 |---|---|---|---|---|
 | Native vLLM-Omni | Validated | Validated | Validated | Validated |
-| Diffusers adapter | Validated | Not yet validated | Not yet validated | Not yet validated |
+| Diffusers adapter | Validated | Validated | Validated | Not yet validated; not claimed |
 
 Use the native `SanaVideoPipeline` and `SanaImageToVideoPipeline` for the
 supported SANA execution paths. The Diffusers adapter is retained as a
@@ -130,3 +152,7 @@ validation coverage and must not be read as a broader adapter support claim.
   not validated for the native pipeline.
 - The Diffusers backend is a compatibility path and does not provide native
   vLLM-Omni parallelism or continuous batching.
+- The native pipeline still uses the checkpoint-compatible Diffusers
+  scheduler and Diffusers-based VAE modules inside vLLM-Omni distributed VAE
+  wrappers; "native" describes pipeline and Transformer ownership, not a
+  zero-Diffusers dependency guarantee.

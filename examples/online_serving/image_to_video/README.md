@@ -26,6 +26,40 @@ The script allows overriding:
 - `CACHE_BACKEND` (default: `none`)
 - `ENABLE_CACHE_DIT_SUMMARY` (default: `0`)
 
+### SANA-Video-2B
+
+The native SANA I2V pipeline supports both released checkpoints:
+
+```bash
+# 480p
+MODEL=Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
+  bash run_server_sana_video.sh
+
+INPUT_IMAGE=/path/to/input.jpg \
+  bash run_curl_sana_video.sh
+```
+
+For native 720p I2V, start the server with
+`Efficient-Large-Model/SANA-Video_2B_720p_diffusers` and call the client with
+`WIDTH=1280 HEIGHT=704` in addition to `INPUT_IMAGE`.
+
+For the validated 480p Diffusers-adapter compatibility path:
+
+```bash
+MODEL=Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
+  bash run_server_sana_video_diffusers.sh
+
+INPUT_IMAGE=/path/to/input.jpg OUTPUT_PATH=sana_video_i2v_adapter.mp4 \
+  bash run_curl_sana_video.sh
+```
+
+The adapter's 720p I2V combination has not completed end-to-end validation
+and is not claimed here. Native 480p uses the
+`DistributedAutoencoderKLWan` wrapper; native 720p uses
+`DistributedAutoencoderKLLTX2Video`. These wrappers retain the corresponding
+Diffusers autoencoder implementations, and the native SANA denoising loop
+intentionally retains Diffusers' `DPMSolverMultistepScheduler`.
+
 ### Ascend / Local LightX2V Example
 
 For a local Wan2.2-LightX2V Diffusers directory on Ascend/NPU, you can start the server like this:

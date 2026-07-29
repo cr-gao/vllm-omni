@@ -95,13 +95,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Generate a video from one or more images "
-            "(Wan2.2, LTX2/LTX-2.3, HunyuanVideo-1.5, Cosmos3, or Wan2.1 VACE)."
+            "(Wan2.2, LTX2/LTX-2.3, HunyuanVideo-1.5, SANA-Video, Cosmos3, or Wan2.1 VACE)."
         )
     )
     parser.add_argument(
         "--model",
         default="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-        help="Diffusers I2V model ID or local path (Wan2.2, LTX2/LTX-2.3, HunyuanVideo-1.5, Cosmos3, or Wan2.1 VACE).",
+        help=(
+            "Diffusers I2V model ID or local path "
+            "(Wan2.2, LTX2/LTX-2.3, HunyuanVideo-1.5, SANA-Video, Cosmos3, or Wan2.1 VACE)."
+        ),
     )
     parser.add_argument(
         "--model-class-name",

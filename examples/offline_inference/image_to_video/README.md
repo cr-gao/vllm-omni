@@ -238,6 +238,17 @@ Use the 720p checkpoint with `--height 704 --width 1280`. In this example,
 checkpoint request. It does not enable the separate LongSANA/LongLive
 minute-scale autoregressive workflow.
 
+The native `SanaImageToVideoPipeline` supports both checkpoint variants. The
+480p path uses vLLM-Omni's `DistributedAutoencoderKLWan` wrapper and the 720p
+path uses `DistributedAutoencoderKLLTX2Video`; both wrap their corresponding
+Diffusers VAE implementations. The native denoising loop intentionally keeps
+Diffusers' checkpoint-compatible `DPMSolverMultistepScheduler`.
+
+For the Diffusers adapter, 480p I2V has completed end-to-end serving
+validation. Adapter 720p I2V has not yet been validated and is not claimed as
+a supported combination. Adapter T2V has separate 480p and 720p validation;
+see the recipe for the exact backend matrix.
+
 See the [SANA-Video recipe](../../../recipes/NVIDIA/SANA-Video-2B.md) for
 online serving, native/adapter validation boundaries, and hardware notes.
 
