@@ -18,8 +18,6 @@ from collections.abc import Iterable
 from dataclasses import dataclass, fields
 
 import torch
-from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
-from diffusers.models.normalization import AdaLayerNormSingle
 from torch import nn
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
@@ -109,6 +107,243 @@ class SanaRMSNorm(nn.Module):
             hidden_states = hidden_states.to(input_dtype)
 
         return hidden_states
+
+
+def _get_timestep_embedding(
+    timesteps: torch.Tensor,
+    embedding_dim: int,
+    flip_sin_to_cos: bool = False,
+    downscale_freq_shift: float = 1,
+    scale: float = 1,
+    max_period: int = 10000,
+) -> torch.Tensor:
+    """Create the sinusoidal timestep embeddings used by SANA checkpoints."""
+    if timesteps.ndim != 1:
+        raise ValueError(f"Timesteps must be a 1D tensor, got shape {tuple(timesteps.shape)}")
+
+    half_dim = embedding_dim // 2
+    exponent = -math.log(max_period) * torch.arange(
+        start=0,
+        end=half_dim,
+        dtype=torch.float32,
+        device=timesteps.device,
+    )
+    exponent = exponent / (half_dim - downscale_freq_shift)
+    embeddings = timesteps[:, None].float() * torch.exp(exponent)[None, :]
+    embeddings = scale * embeddings
+    embeddings = torch.cat([torch.sin(embeddings), torch.cos(embeddings)], dim=-1)
+
+    if flip_sin_to_cos:
+        embeddings = torch.cat([embeddings[:, half_dim:], embeddings[:, :half_dim]], dim=-1)
+    if embedding_dim % 2 == 1:
+        embeddings = torch.nn.functional.pad(embeddings, (0, 1, 0, 0))
+
+    return embeddings
+
+
+class SanaTimesteps(nn.Module):
+    """Parameter-free timestep projection compatible with Diffusers Timesteps."""
+
+    def __init__(
+        self,
+        num_channels: int,
+        flip_sin_to_cos: bool,
+        downscale_freq_shift: float,
+        scale: int = 1,
+    ) -> None:
+        super().__init__()
+        self.num_channels = num_channels
+        self.flip_sin_to_cos = flip_sin_to_cos
+        self.downscale_freq_shift = downscale_freq_shift
+        self.scale = scale
+
+    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
+        return _get_timestep_embedding(
+            timesteps,
+            self.num_channels,
+            flip_sin_to_cos=self.flip_sin_to_cos,
+            downscale_freq_shift=self.downscale_freq_shift,
+            scale=self.scale,
+        )
+
+
+class SanaTimestepEmbedding(nn.Module):
+    """Two-layer timestep MLP with Diffusers-compatible parameter names."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        time_embed_dim: int,
+        act_fn: str = "silu",
+        out_dim: int | None = None,
+        post_act_fn: str | None = None,
+        cond_proj_dim: int | None = None,
+        sample_proj_bias: bool = True,
+    ) -> None:
+        super().__init__()
+        if act_fn != "silu":
+            raise ValueError(f"SANA timestep embeddings only support act_fn='silu', got {act_fn!r}")
+        if post_act_fn not in (None, "silu"):
+            raise ValueError(f"SANA timestep embeddings only support post_act_fn=None or 'silu', got {post_act_fn!r}")
+
+        self.linear_1 = nn.Linear(in_channels, time_embed_dim, bias=sample_proj_bias)
+        self.cond_proj = nn.Linear(cond_proj_dim, in_channels, bias=False) if cond_proj_dim is not None else None
+        self.act = nn.SiLU()
+        self.linear_2 = nn.Linear(
+            time_embed_dim,
+            out_dim if out_dim is not None else time_embed_dim,
+            bias=sample_proj_bias,
+        )
+        self.post_act = nn.SiLU() if post_act_fn == "silu" else None
+
+    def forward(
+        self,
+        sample: torch.Tensor,
+        condition: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if condition is not None:
+            if self.cond_proj is None:
+                raise ValueError("condition was provided but cond_proj_dim was not configured")
+            sample = sample + self.cond_proj(condition)
+        sample = self.linear_1(sample)
+        sample = self.act(sample)
+        sample = self.linear_2(sample)
+        if self.post_act is not None:
+            sample = self.post_act(sample)
+        return sample
+
+
+class SanaCombinedTimestepSizeEmbeddings(nn.Module):
+    """PixArt timestep/size conditioning used by SANA's adaLN-single."""
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        size_emb_dim: int,
+        use_additional_conditions: bool = False,
+    ) -> None:
+        super().__init__()
+        self.outdim = size_emb_dim
+        self.time_proj = SanaTimesteps(
+            num_channels=256,
+            flip_sin_to_cos=True,
+            downscale_freq_shift=0,
+        )
+        self.timestep_embedder = SanaTimestepEmbedding(
+            in_channels=256,
+            time_embed_dim=embedding_dim,
+        )
+
+        self.use_additional_conditions = use_additional_conditions
+        if use_additional_conditions:
+            self.additional_condition_proj = SanaTimesteps(
+                num_channels=256,
+                flip_sin_to_cos=True,
+                downscale_freq_shift=0,
+            )
+            self.resolution_embedder = SanaTimestepEmbedding(
+                in_channels=256,
+                time_embed_dim=size_emb_dim,
+            )
+            self.aspect_ratio_embedder = SanaTimestepEmbedding(
+                in_channels=256,
+                time_embed_dim=size_emb_dim,
+            )
+
+    def forward(
+        self,
+        timestep: torch.Tensor,
+        resolution: torch.Tensor | None,
+        aspect_ratio: torch.Tensor | None,
+        batch_size: int | None,
+        hidden_dtype: torch.dtype | None,
+    ) -> torch.Tensor:
+        timesteps_proj = self.time_proj(timestep)
+        timesteps_emb = self.timestep_embedder(timesteps_proj.to(dtype=hidden_dtype))
+
+        if not self.use_additional_conditions:
+            return timesteps_emb
+        if resolution is None or aspect_ratio is None or batch_size is None:
+            raise ValueError(
+                "resolution, aspect_ratio, and batch_size are required when use_additional_conditions=True"
+            )
+
+        resolution_emb = self.additional_condition_proj(resolution.flatten()).to(hidden_dtype)
+        resolution_emb = self.resolution_embedder(resolution_emb).reshape(batch_size, -1)
+        aspect_ratio_emb = self.additional_condition_proj(aspect_ratio.flatten()).to(hidden_dtype)
+        aspect_ratio_emb = self.aspect_ratio_embedder(aspect_ratio_emb).reshape(batch_size, -1)
+        return timesteps_emb + torch.cat([resolution_emb, aspect_ratio_emb], dim=1)
+
+
+class SanaAdaLayerNormSingle(nn.Module):
+    """SANA's checkpoint-compatible adaLN-single conditioning module."""
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        use_additional_conditions: bool = False,
+    ) -> None:
+        super().__init__()
+        self.emb = SanaCombinedTimestepSizeEmbeddings(
+            embedding_dim,
+            size_emb_dim=embedding_dim // 3,
+            use_additional_conditions=use_additional_conditions,
+        )
+        self.silu = nn.SiLU()
+        self.linear = nn.Linear(embedding_dim, 6 * embedding_dim, bias=True)
+
+    def forward(
+        self,
+        timestep: torch.Tensor,
+        added_cond_kwargs: dict[str, torch.Tensor] | None = None,
+        batch_size: int | None = None,
+        hidden_dtype: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        added_cond_kwargs = added_cond_kwargs or {
+            "resolution": None,
+            "aspect_ratio": None,
+        }
+        embedded_timestep = self.emb(
+            timestep,
+            **added_cond_kwargs,
+            batch_size=batch_size,
+            hidden_dtype=hidden_dtype,
+        )
+        return self.linear(self.silu(embedded_timestep)), embedded_timestep
+
+
+class _SanaFP32SiLU(nn.Module):
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.silu(inputs.float(), inplace=False).to(inputs.dtype)
+
+
+class SanaPixArtAlphaTextProjection(nn.Module):
+    """Caption projection with Diffusers-compatible parameters and activations."""
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden_size: int,
+        out_features: int | None = None,
+        act_fn: str = "gelu_tanh",
+    ) -> None:
+        super().__init__()
+        out_features = hidden_size if out_features is None else out_features
+        self.linear_1 = nn.Linear(in_features, hidden_size, bias=True)
+        if act_fn == "gelu_tanh":
+            self.act_1 = nn.GELU(approximate="tanh")
+        elif act_fn == "silu":
+            self.act_1 = nn.SiLU()
+        elif act_fn == "silu_fp32":
+            self.act_1 = _SanaFP32SiLU()
+        else:
+            raise ValueError(f"Unknown activation function: {act_fn}")
+        self.linear_2 = nn.Linear(hidden_size, out_features, bias=True)
+
+    def forward(self, caption: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.linear_1(caption)
+        hidden_states = self.act_1(hidden_states)
+        return self.linear_2(hidden_states)
 
 
 def _get_1d_rotary_pos_embed(
@@ -352,11 +587,15 @@ class SanaModulatedNorm(nn.Module):
 class SanaCombinedTimestepGuidanceEmbeddings(nn.Module):
     def __init__(self, embedding_dim):
         super().__init__()
-        self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
-        self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
+        self.time_proj = SanaTimesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
+        self.timestep_embedder = SanaTimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
 
-        self.guidance_condition_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
-        self.guidance_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
+        self.guidance_condition_proj = SanaTimesteps(
+            num_channels=256,
+            flip_sin_to_cos=True,
+            downscale_freq_shift=0,
+        )
+        self.guidance_embedder = SanaTimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
 
         self.silu = nn.SiLU()
         self.linear = nn.Linear(embedding_dim, 6 * embedding_dim, bias=True)
@@ -656,9 +895,12 @@ class SanaVideoTransformer3DModel(nn.Module):
         if guidance_embeds:
             self.time_embed = SanaCombinedTimestepGuidanceEmbeddings(inner_dim)
         else:
-            self.time_embed = AdaLayerNormSingle(inner_dim)
+            self.time_embed = SanaAdaLayerNormSingle(inner_dim)
 
-        self.caption_projection = PixArtAlphaTextProjection(in_features=caption_channels, hidden_size=inner_dim)
+        self.caption_projection = SanaPixArtAlphaTextProjection(
+            in_features=caption_channels,
+            hidden_size=inner_dim,
+        )
         self.caption_norm = SanaRMSNorm(inner_dim, eps=1e-5, elementwise_affine=True)
 
         # 3. Transformer blocks

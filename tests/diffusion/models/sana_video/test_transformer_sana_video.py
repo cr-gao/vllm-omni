@@ -104,6 +104,194 @@ def test_sana_rms_norm_matches_diffusers(
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize(
+    ("num_channels", "flip_sin_to_cos", "downscale_freq_shift", "scale"),
+    [
+        (256, True, 0, 1),
+        (7, False, 1, 0.5),
+        (12, True, 0.5, 2),
+    ],
+)
+@pytest.mark.parametrize("timestep_dtype", [torch.int64, torch.float32, torch.float64])
+def test_sana_timesteps_matches_diffusers(
+    num_channels,
+    flip_sin_to_cos,
+    downscale_freq_shift,
+    scale,
+    timestep_dtype,
+):
+    from diffusers.models.embeddings import Timesteps
+
+    from vllm_omni.diffusion.models.sana_video.transformer_sana_video import SanaTimesteps
+
+    reference = Timesteps(
+        num_channels=num_channels,
+        flip_sin_to_cos=flip_sin_to_cos,
+        downscale_freq_shift=downscale_freq_shift,
+        scale=scale,
+    )
+    actual = SanaTimesteps(
+        num_channels=num_channels,
+        flip_sin_to_cos=flip_sin_to_cos,
+        downscale_freq_shift=downscale_freq_shift,
+        scale=scale,
+    )
+    timesteps = torch.tensor([0, 1, 500, 999], dtype=timestep_dtype)
+
+    assert actual.state_dict() == reference.state_dict() == {}
+    assert actual.num_channels == reference.num_channels
+    assert actual.flip_sin_to_cos == reference.flip_sin_to_cos
+    assert actual.downscale_freq_shift == reference.downscale_freq_shift
+    assert actual.scale == reference.scale
+    torch.testing.assert_close(actual(timesteps), reference(timesteps), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "sample_shape", "condition_shape"),
+    [
+        ({}, (2, 256), None),
+        (
+            {
+                "out_dim": 12,
+                "post_act_fn": "silu",
+                "cond_proj_dim": 6,
+                "sample_proj_bias": False,
+            },
+            (2, 256),
+            (2, 6),
+        ),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_sana_timestep_embedding_matches_diffusers(
+    kwargs,
+    sample_shape,
+    condition_shape,
+    dtype,
+):
+    from diffusers.models.embeddings import TimestepEmbedding
+
+    from vllm_omni.diffusion.models.sana_video.transformer_sana_video import (
+        SanaTimestepEmbedding,
+    )
+
+    torch.manual_seed(17)
+    reference = TimestepEmbedding(256, 24, **kwargs).to(dtype=dtype)
+    actual = SanaTimestepEmbedding(256, 24, **kwargs).to(dtype=dtype)
+    assert set(actual.state_dict()) == set(reference.state_dict())
+    actual.load_state_dict(reference.state_dict())
+
+    sample = torch.randn(sample_shape, dtype=dtype)
+    condition = torch.randn(condition_shape, dtype=dtype) if condition_shape else None
+    expected = reference(sample, condition)
+    result = actual(sample, condition)
+
+    assert result.shape == expected.shape
+    assert result.dtype == expected.dtype
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+def test_sana_timestep_embedding_rejects_unsupported_activation():
+    from vllm_omni.diffusion.models.sana_video.transformer_sana_video import (
+        SanaTimestepEmbedding,
+    )
+
+    with pytest.raises(ValueError, match="act_fn='silu'"):
+        SanaTimestepEmbedding(8, 16, act_fn="gelu")
+    with pytest.raises(ValueError, match="post_act_fn"):
+        SanaTimestepEmbedding(8, 16, post_act_fn="gelu")
+
+    module = SanaTimestepEmbedding(8, 16)
+    with pytest.raises(ValueError, match="cond_proj_dim"):
+        module(torch.randn(1, 8), torch.randn(1, 4))
+
+
+@pytest.mark.parametrize("use_additional_conditions", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_sana_ada_layer_norm_single_matches_diffusers(
+    use_additional_conditions,
+    dtype,
+):
+    from diffusers.models.normalization import AdaLayerNormSingle
+
+    from vllm_omni.diffusion.models.sana_video.transformer_sana_video import (
+        SanaAdaLayerNormSingle,
+    )
+
+    torch.manual_seed(19)
+    reference = AdaLayerNormSingle(
+        24,
+        use_additional_conditions=use_additional_conditions,
+    ).to(dtype=dtype)
+    actual = SanaAdaLayerNormSingle(
+        24,
+        use_additional_conditions=use_additional_conditions,
+    ).to(dtype=dtype)
+    assert set(actual.state_dict()) == set(reference.state_dict())
+    actual.load_state_dict(reference.state_dict())
+
+    timestep = torch.tensor([10, 500])
+    added_cond_kwargs = None
+    if use_additional_conditions:
+        added_cond_kwargs = {
+            "resolution": torch.tensor([[480, 832], [704, 1280]]),
+            "aspect_ratio": torch.tensor([[832 / 480], [1280 / 704]]),
+        }
+
+    expected = reference(
+        timestep,
+        added_cond_kwargs=added_cond_kwargs,
+        batch_size=2,
+        hidden_dtype=dtype,
+    )
+    result = actual(
+        timestep,
+        added_cond_kwargs=added_cond_kwargs,
+        batch_size=2,
+        hidden_dtype=dtype,
+    )
+
+    assert len(result) == len(expected) == 2
+    for actual_tensor, expected_tensor in zip(result, expected):
+        assert actual_tensor.shape == expected_tensor.shape
+        assert actual_tensor.dtype == expected_tensor.dtype
+        torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("act_fn", ["gelu_tanh", "silu", "silu_fp32"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_sana_pixart_text_projection_matches_diffusers(act_fn, dtype):
+    from diffusers.models.embeddings import PixArtAlphaTextProjection
+
+    from vllm_omni.diffusion.models.sana_video.transformer_sana_video import (
+        SanaPixArtAlphaTextProjection,
+    )
+
+    torch.manual_seed(23)
+    reference = PixArtAlphaTextProjection(
+        in_features=8,
+        hidden_size=24,
+        out_features=12,
+        act_fn=act_fn,
+    ).to(dtype=dtype)
+    actual = SanaPixArtAlphaTextProjection(
+        in_features=8,
+        hidden_size=24,
+        out_features=12,
+        act_fn=act_fn,
+    ).to(dtype=dtype)
+    assert set(actual.state_dict()) == set(reference.state_dict())
+    actual.load_state_dict(reference.state_dict())
+
+    caption = torch.randn(2, 5, 8, dtype=dtype)
+    expected = reference(caption)
+    result = actual(caption)
+
+    assert result.shape == expected.shape
+    assert result.dtype == expected.dtype
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("freqs_dtype", [torch.float32, torch.float64])
 @pytest.mark.parametrize(("dim", "max_seq_len", "theta"), [(4, 8, 10000.0), (12, 32, 256.0)])
 def test_native_rope_matches_diffusers(dim, max_seq_len, theta, freqs_dtype):
@@ -184,6 +372,56 @@ def test_tiny_transformer_matches_diffusers_and_frozen_output():
     assert isinstance(actual_output, SanaVideoTransformerOutput)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     torch.testing.assert_close(actual.flatten()[: len(_GOLDEN_PREFIX)], _GOLDEN_PREFIX, rtol=1e-5, atol=1e-5)
+
+
+def test_guidance_transformer_matches_diffusers_and_tuple_output():
+    from diffusers import SanaVideoTransformer3DModel as DiffusersTransformer
+
+    from vllm_omni.diffusion.models.sana_video import SanaVideoTransformer3DModel
+    from vllm_omni.diffusion.models.sana_video.transformer_sana_video import (
+        SanaTimestepEmbedding,
+        SanaTimesteps,
+    )
+
+    config = _TINY_CONFIG | {"guidance_embeds": True}
+    torch.manual_seed(29)
+    reference = DiffusersTransformer(**config).eval()
+    model = SanaVideoTransformer3DModel(**config).eval()
+    assert set(model.state_dict()) == set(reference.state_dict())
+    model.load_state_dict(reference.state_dict())
+    assert isinstance(model.time_embed.time_proj, SanaTimesteps)
+    assert isinstance(model.time_embed.timestep_embedder, SanaTimestepEmbedding)
+    assert isinstance(model.time_embed.guidance_condition_proj, SanaTimesteps)
+    assert isinstance(model.time_embed.guidance_embedder, SanaTimestepEmbedding)
+
+    torch.manual_seed(31)
+    hidden_states = torch.randn(1, 4, 3, 4, 4)
+    encoder_hidden_states = torch.randn(1, 5, 8)
+    encoder_attention_mask = torch.tensor([[1, 1, 1, 1, 0]])
+    timestep = torch.tensor([500.0])
+    guidance = torch.tensor([6.0])
+
+    with torch.no_grad():
+        expected = reference(
+            hidden_states,
+            encoder_hidden_states,
+            timestep,
+            guidance=guidance,
+            encoder_attention_mask=encoder_attention_mask,
+            return_dict=False,
+        )
+        actual = model(
+            hidden_states,
+            encoder_hidden_states,
+            timestep,
+            guidance=guidance,
+            encoder_attention_mask=encoder_attention_mask,
+            return_dict=False,
+        )
+
+    assert isinstance(actual, tuple)
+    assert len(actual) == len(expected) == 1
+    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
 
 
 def test_native_transformer_config_filters_diffusers_metadata():
