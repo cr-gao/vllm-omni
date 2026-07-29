@@ -173,10 +173,7 @@ class FakeAsyncOmniEngine:
 
 def _patch_engine(monkeypatch: pytest.MonkeyPatch, engine: FakeAsyncOmniEngine) -> None:
     monkeypatch.setattr("vllm_omni.entrypoints.omni_base.AsyncOmniEngine", lambda *args, **kwargs: engine)
-    monkeypatch.setattr(
-        "vllm_omni.entrypoints.omni_base.omni_snapshot_download",
-        lambda model, revision=None: model,
-    )
+    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.omni_snapshot_download", lambda model: model)
     # Don't add random UUIDs to requests calling .generate since we usually
     # just want to check for present requests anyway, and would need to just
     # strip the UUID. Explicit checks against the mapping are in tests for
@@ -194,31 +191,6 @@ def _make_base():
     obj.engine = MagicMock()
     obj.request_states = {}
     return obj
-
-
-def test_omni_base_propagates_revision_to_predownload_and_engine(monkeypatch: pytest.MonkeyPatch):
-    revision = "8bda5e623d0f48cd6da3b387b10ca35d15cf1c4e"
-    engine = FakeAsyncOmniEngine(stage_metadata=DIFFUSION_ONLY_META)
-    download_calls = []
-    engine_calls = []
-
-    def download(model, revision=None):
-        download_calls.append((model, revision))
-        return model
-
-    def build_engine(*args, **kwargs):
-        engine_calls.append((args, kwargs))
-        return engine
-
-    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.omni_snapshot_download", download)
-    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.AsyncOmniEngine", build_engine)
-
-    app = AsyncOmni(model="dummy-model", revision=revision)
-    try:
-        assert download_calls == [("dummy-model", revision)]
-        assert engine_calls[0][1]["revision"] == revision
-    finally:
-        app.shutdown()
 
 
 def _stage_spec(

@@ -266,7 +266,6 @@ def prefetch_subfolders(
     *,
     local_files_only: bool | None = None,
     include_root_metadata: bool = True,
-    revision: str | None = None,
 ) -> None:
     """Materialise ``model``'s ``subfolders`` in the HF cache before loading.
 
@@ -282,8 +281,6 @@ def prefetch_subfolders(
         include_root_metadata: When True, also pull ``*.json`` at the repo
             root so ``model_index.json`` / ``config.json`` resolution during
             ``from_pretrained`` also hits a warm cache.
-        revision: Optional Hub revision whose component snapshot should be
-            prefetched. Local paths ignore this value.
     """
     if local_files_only is None:
         local_files_only = os.path.isdir(model)
@@ -338,7 +335,6 @@ def prefetch_subfolders(
                 snapshot_download(
                     repo_id=model,
                     allow_patterns=allow_patterns,
-                    revision=revision,
                 )
             logger.info("Prefetch complete for %s", model)
             return
@@ -485,12 +481,7 @@ def from_pretrained_with_prefetch(
             # Force a fresh, verified snapshot of every component this pipeline
             # needs - not just ``subfolder`` - so a sibling component that was
             # also half-written gets repaired in the same pass.
-            prefetch_subfolders(
-                model,
-                prefetch_list,
-                local_files_only=False,
-                revision=from_pretrained_kwargs.get("revision"),
-            )
+            prefetch_subfolders(model, prefetch_list, local_files_only=False)
 
     assert last_exc is not None  # loop only exits via return or a caught exc
     raise last_exc

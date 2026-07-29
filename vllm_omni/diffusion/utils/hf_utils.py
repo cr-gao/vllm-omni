@@ -28,14 +28,10 @@ def _looks_like_bagel(model_name: str) -> bool:
         return False
 
 
-def _looks_like_dreamzero(
-    model_name: str,
-    revision: str | None = None,
-) -> bool:
+def _looks_like_dreamzero(model_name: str) -> bool:
     """Best-effort detection for DreamZero-style VLA diffusion checkpoints."""
     try:
-        load_kwargs = {"revision": revision} if revision is not None else {}
-        cfg = get_hf_file_to_dict("config.json", model_name, **load_kwargs)
+        cfg = get_hf_file_to_dict("config.json", model_name)
         if cfg.get("model_type") != "vla":
             return False
         action_head_cfg = cfg.get("action_head_cfg") or {}
