@@ -268,31 +268,25 @@ def retrieve_timesteps(
 
 
 def _validate_cache_offload_parallelism(od_config: OmniDiffusionConfig) -> None:
-    cache_backend = getattr(od_config, "cache_backend", None)
-    if cache_backend not in (None, "", "none", "cache_dit"):
+    cache_backend = od_config.cache_backend
+    if cache_backend not in ("none", "cache_dit"):
         raise NotImplementedError(
             f"Cache backend {cache_backend!r} is not supported by the native SANA-Video pipeline; "
             "use 'cache_dit' or 'none'."
         )
-    if getattr(od_config, "enable_distributed_layerwise_offload", False):
+    if od_config.enable_distributed_layerwise_offload:
         raise NotImplementedError("SANA-Video does not support distributed layerwise offload.")
 
     cache_enabled = cache_backend == "cache_dit"
-    offload_enabled = any(
-        getattr(od_config, flag, False)
-        for flag in (
-            "enable_cpu_offload",
-            "enable_layerwise_offload",
-        )
-    )
+    offload_enabled = od_config.enable_cpu_offload or od_config.enable_layerwise_offload
     if not (cache_enabled or offload_enabled):
         return
 
     parallel_config = od_config.parallel_config
     unsupported = {
-        "tensor_parallel_size": getattr(parallel_config, "tensor_parallel_size", 1),
-        "cfg_parallel_size": getattr(parallel_config, "cfg_parallel_size", 1),
-        "sequence_parallel_size": getattr(parallel_config, "sequence_parallel_size", 1) or 1,
+        "tensor_parallel_size": parallel_config.tensor_parallel_size,
+        "cfg_parallel_size": parallel_config.cfg_parallel_size,
+        "sequence_parallel_size": parallel_config.sequence_parallel_size or 1,
     }
     enabled_parallelism = {name: size for name, size in unsupported.items() if size > 1}
     if enabled_parallelism:

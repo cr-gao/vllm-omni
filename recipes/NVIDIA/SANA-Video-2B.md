@@ -186,13 +186,13 @@ the SANA transformer's `transformer_blocks` metadata. Layerwise mode keeps
 non-block transformer modules, the text encoder, and the VAE resident on the
 runtime device while prefetching DiT blocks in order.
 
-| Cache-DiT | Model CPU offload | Layerwise offload | Single-rank behavior |
+| Cache-DiT | Model CPU offload | Layerwise offload | Draft status |
 |---|---:|---:|---|
-| on | off | off | Supported |
-| off | on | off | Supported |
-| off | off | on | Supported |
-| on | on | off | Supported |
-| on | off | on | Supported |
+| on | off | off | Implemented; real-weight GPU validation pending |
+| off | on | off | Implemented; real-weight GPU validation pending |
+| off | off | on | Implemented; real-weight GPU validation pending |
+| on | on | off | Implemented; real-weight GPU validation pending |
+| on | off | on | Implemented; real-weight GPU validation pending |
 
 Add one of the following flag sets to either native offline command above:
 
@@ -224,11 +224,9 @@ checkpoint components are loaded. Other cache backends, including TeaCache,
 are not enabled for the native SANA pipelines by this integration. Distributed
 layerwise offload is unsupported and always raises before component loading.
 
-The checked-in tests cover metadata, a two-layer tiny transformer, cache
-refresh, component load-device selection, and offload hook lifecycle on CPU.
 Real 480p/720p golden similarity, peak GPU/host memory, transfer cost, and
-same-GPU Cache-DiT speedup remain hardware validation items; no performance or
-memory reduction should be inferred from the CPU tests.
+same-GPU Cache-DiT speedup have not been validated. This draft makes no
+performance or memory-reduction claim.
 
 #### Notes
 
