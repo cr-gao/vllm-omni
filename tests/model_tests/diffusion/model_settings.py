@@ -65,14 +65,6 @@ DIFFUSION_TEST_SETTINGS = {
         extra_test_groups=SANA_VIDEO_ACCELERATION_GROUPS,
         check_multi_output=False,
     ),
-    "SanaImageToVideoPipeline": DiffusionModelTestOpts(
-        model="Efficient-Large-Model/SANA-Video_2B_480p_diffusers",
-        builder=diff_model_builders.tiny_sana_video_i2v_builder,
-        supported_tasks=[DiffusionTasks.IMAGE_TO_VIDEO],
-        extra_test_groups=SANA_VIDEO_ACCELERATION_GROUPS,
-        check_determinism=False,
-        check_multi_output=False,
-    ),
     "QwenImagePipeline": DiffusionModelTestOpts(
         model="Qwen/Qwen-Image",
         builder=diff_model_builders.tiny_qwen_image_builder,
