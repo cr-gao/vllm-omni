@@ -188,11 +188,13 @@ runtime device while prefetching DiT blocks in order.
 
 | Cache-DiT | Model CPU offload | Layerwise offload | Draft status |
 |---|---:|---:|---|
-| on | off | off | Implemented; real-weight GPU validation pending |
-| off | on | off | Implemented; real-weight GPU validation pending |
-| off | off | on | Implemented; real-weight GPU validation pending |
-| on | on | off | Implemented; real-weight GPU validation pending |
-| on | off | on | Implemented; real-weight GPU validation pending |
+| on | off | off | Implemented |
+| off | on | off | Implemented |
+| off | off | on | Implemented |
+| on | on | off | Implemented |
+| on | off | on | Implemented |
+
+All five combinations still require real-weight GPU validation.
 
 Add one of the following flag sets to either native offline command above:
 
