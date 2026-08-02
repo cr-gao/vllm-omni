@@ -178,6 +178,57 @@ Use the native `SanaVideoPipeline` and `SanaImageToVideoPipeline` for the
 primary SANA execution paths. The Diffusers adapter is retained as a
 validated compatibility/reference backend.
 
+#### Native Cache-DiT and CPU offload
+
+The native T2V and I2V pipelines expose Cache-DiT, model-level CPU offload,
+and layerwise CPU offload through the common diffusion flags. These paths use
+the SANA transformer's `transformer_blocks` metadata; the layerwise mode keeps
+non-block transformer modules, the text encoder, and the VAE resident on the
+runtime device while prefetching the two-or-more DiT blocks in order.
+
+| Cache-DiT | Model CPU offload | Layerwise offload | Single-rank behavior |
+|---|---:|---:|---|
+| on | off | off | Supported |
+| off | on | off | Supported |
+| off | off | on | Supported |
+| on | on | off | Supported |
+| on | off | on | Supported |
+
+Add one of the following flag sets to either native offline command above:
+
+```bash
+# Cache-DiT
+--cache-backend cache_dit
+
+# Model-level CPU offload
+--enable-cpu-offload
+
+# Layerwise CPU offload
+--enable-layerwise-offload
+
+# Cache-DiT plus model-level offload
+--cache-backend cache_dit --enable-cpu-offload
+
+# Cache-DiT plus layerwise offload
+--cache-backend cache_dit --enable-layerwise-offload
+```
+
+If both CPU offload flags are supplied, the common offloader keeps its existing
+layerwise precedence. Cache-DiT refreshes each request from the explicit
+`num_inference_steps`; when that field is omitted, both native SANA pipelines
+use their immutable 50-step default.
+
+These combinations are intentionally limited to TP1, CFG1, and SP1. Combining
+Cache-DiT or CPU offload with tensor, CFG, or sequence parallelism raises before
+checkpoint components are loaded. Other cache backends, including TeaCache,
+are not enabled for the native SANA pipelines by this integration.
+
+The checked-in tests cover metadata, a two-layer tiny transformer, cache
+refresh, component load-device selection, and offload hook lifecycle on CPU.
+Real 480p/720p golden similarity, peak GPU/host memory, transfer cost, and
+same-GPU Cache-DiT speedup remain hardware validation items; no performance or
+memory reduction should be inferred from the CPU tests.
+
 #### Notes
 
 - Key flags: select I2V explicitly with `--model-class-name
@@ -194,8 +245,9 @@ validated compatibility/reference backend.
   The denoising loop intentionally retains the checkpoint-compatible
   Diffusers `DPMSolverMultistepScheduler`.
 - Known limitations:
-    - Sequence/tensor/CFG parallelism, Cache-DiT, TeaCache, and step execution
-    are not validated for the native pipeline.
+    - Cache-DiT and CPU offload are limited to TP1/CFG1/SP1. Distributed
+    combinations, sequence/tensor/CFG parallelism, TeaCache, and step
+    execution are not supported by the native pipeline.
     - The Diffusers backend is a compatibility path and does not provide native
     vLLM-Omni parallelism or continuous batching.
     - Native describes pipeline and Transformer ownership, not a zero-Diffusers
