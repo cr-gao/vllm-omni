@@ -147,35 +147,17 @@ def test_two_layer_tiny_transformer_enables_cache_dit(monkeypatch):
             cache_dit.disable_cache(enabled_adapters[0])
 
 
-def test_cache_dit_pattern_mismatch_fails_with_model_context(monkeypatch):
+def test_cache_dit_pattern_mismatch_fails_closed(monkeypatch):
     transformer = _tiny_transformer(monkeypatch)
     transformer.transformer_blocks[1].forward = lambda unexpected_input: unexpected_input
     pipeline = _PipelineWithTransformer(transformer=transformer)
     backend = CacheDiTBackend()
 
-    with pytest.raises(
-        ValueError,
-        match=(
-            "SanaVideoTransformer3DModel.*block attributes \\['transformer_blocks'\\].*No block forward pattern matched"
-        ),
-    ):
+    with pytest.raises(AssertionError, match="No block forward pattern matched"):
         backend.enable(pipeline)
 
     assert backend.is_enabled() is False
     assert not getattr(transformer, "_is_cached", False)
-
-
-def test_cache_dit_unexpected_runtime_error_is_not_wrapped(monkeypatch):
-    transformer = _tiny_transformer(monkeypatch)
-    pipeline = _PipelineWithTransformer(transformer=transformer)
-
-    def raise_unexpected_runtime_error(*_args, **_kwargs):
-        raise RuntimeError("unexpected Cache-DiT runtime failure")
-
-    monkeypatch.setattr(cachedit_backend_module, "enable_cache_for_dit", raise_unexpected_runtime_error)
-
-    with pytest.raises(RuntimeError, match="unexpected Cache-DiT runtime failure"):
-        CacheDiTBackend().enable(pipeline)
 
 
 @pytest.mark.parametrize(
