@@ -28,6 +28,15 @@ from tests.model_tests.diffusion.config_types import (
 #
 # $ pytest test_common_offline.py -k test_pipeline_on_supported_tasks[Flux2KleinPipeline
 #   ^ Runs all test groups for Flux2KleinPipeline only
+SANA_VIDEO_ACCELERATION_GROUPS = [
+    [DiffusionAccs.CACHE_DIT],
+    [DiffusionAccs.CPU_OFFLOAD],
+    [DiffusionAccs.LAYERWISE_OFFLOAD],
+    [DiffusionAccs.CACHE_DIT, DiffusionAccs.CPU_OFFLOAD],
+    [DiffusionAccs.CACHE_DIT, DiffusionAccs.LAYERWISE_OFFLOAD],
+]
+
+
 DIFFUSION_TEST_SETTINGS = {
     "Flux2KleinPipeline": DiffusionModelTestOpts(
         model="black-forest-labs/FLUX.2-klein-4B",
@@ -53,13 +62,15 @@ DIFFUSION_TEST_SETTINGS = {
         model="Efficient-Large-Model/SANA-Video_2B_480p_diffusers",
         builder=diff_model_builders.tiny_sana_video_builder,
         supported_tasks=[DiffusionTasks.TEXT_TO_VIDEO],
-        extra_test_groups=[
-            [DiffusionAccs.CACHE_DIT],
-            [DiffusionAccs.CPU_OFFLOAD],
-            [DiffusionAccs.LAYERWISE_OFFLOAD],
-            [DiffusionAccs.CACHE_DIT, DiffusionAccs.CPU_OFFLOAD],
-            [DiffusionAccs.CACHE_DIT, DiffusionAccs.LAYERWISE_OFFLOAD],
-        ],
+        extra_test_groups=SANA_VIDEO_ACCELERATION_GROUPS,
+        check_multi_output=False,
+    ),
+    "SanaImageToVideoPipeline": DiffusionModelTestOpts(
+        model="Efficient-Large-Model/SANA-Video_2B_480p_diffusers",
+        builder=diff_model_builders.tiny_sana_video_i2v_builder,
+        supported_tasks=[DiffusionTasks.IMAGE_TO_VIDEO],
+        extra_test_groups=SANA_VIDEO_ACCELERATION_GROUPS,
+        check_determinism=False,
         check_multi_output=False,
     ),
     "QwenImagePipeline": DiffusionModelTestOpts(

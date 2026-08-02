@@ -18,12 +18,13 @@ from collections.abc import Iterable
 from dataclasses import dataclass, fields
 
 import torch
+from cache_dit import ForwardPattern
 from torch import nn
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as OmniAttention
-from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig, ForwardPattern
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 
 
 @dataclass

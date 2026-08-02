@@ -7,13 +7,14 @@ from dataclasses import dataclass, field
 import cache_dit
 import pytest
 import torch
+from cache_dit import ForwardPattern
 from torch import nn
 
 import vllm_omni.diffusion.cache.cachedit.backend as cachedit_backend_module
 import vllm_omni.diffusion.offloader.layerwise_backend as layerwise_backend_module
 from vllm_omni.diffusion.attention import selector as attention_selector
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
-from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend, ForwardPattern
+from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend
 from vllm_omni.diffusion.models.sana_video import pipeline_sana_video as pipeline_module
 from vllm_omni.diffusion.models.sana_video.pipeline_sana_video import (
     SanaVideoPipeline,
@@ -32,6 +33,7 @@ class _ParallelConfig:
     tensor_parallel_size: int = 1
     cfg_parallel_size: int = 1
     sequence_parallel_size: int = 1
+    data_parallel_size: int = 1
 
 
 @dataclass
@@ -82,6 +84,7 @@ def _parallel_config(**overrides):
         "tensor_parallel_size": 1,
         "cfg_parallel_size": 1,
         "sequence_parallel_size": 1,
+        "data_parallel_size": 1,
     }
     values.update(overrides)
     return _ParallelConfig(**values)
@@ -97,6 +100,18 @@ def _od_config(**overrides):
     }
     values.update(overrides)
     return _ODConfig(**values)
+
+
+def _record_cache_adapters(monkeypatch):
+    enabled_adapters = []
+    original_enable_cache = cachedit_backend_module.cache_dit.enable_cache
+
+    def record_enable_cache(block_adapter, **kwargs):
+        enabled_adapters.append(block_adapter)
+        return original_enable_cache(block_adapter, **kwargs)
+
+    monkeypatch.setattr(cachedit_backend_module.cache_dit, "enable_cache", record_enable_cache)
+    return enabled_adapters
 
 
 def test_sana_video_declares_cache_and_layerwise_metadata():
@@ -115,14 +130,7 @@ def test_sana_video_declares_cache_and_layerwise_metadata():
 def test_two_layer_tiny_transformer_enables_cache_dit(monkeypatch):
     transformer = _tiny_transformer(monkeypatch)
     pipeline = _PipelineWithTransformer(transformer=transformer)
-    enable_calls = []
-    original_enable_cache = cachedit_backend_module.cache_dit.enable_cache
-
-    def record_enable_cache(block_adapter, **kwargs):
-        enable_calls.append(block_adapter)
-        return original_enable_cache(block_adapter, **kwargs)
-
-    monkeypatch.setattr(cachedit_backend_module.cache_dit, "enable_cache", record_enable_cache)
+    enabled_adapters = _record_cache_adapters(monkeypatch)
     backend = CacheDiTBackend()
 
     try:
@@ -130,13 +138,13 @@ def test_two_layer_tiny_transformer_enables_cache_dit(monkeypatch):
 
         assert backend.is_enabled()
         assert transformer._is_cached is True
-        assert len(enable_calls) == 1
-        selected_blocks = cache_dit.BlockAdapter.flatten(enable_calls[0].blocks)
+        assert len(enabled_adapters) == 1
+        selected_blocks = cache_dit.BlockAdapter.flatten(enabled_adapters[0].blocks)
         assert selected_blocks == [transformer.transformer_blocks]
         assert len(selected_blocks[0]) == 2
     finally:
-        if getattr(transformer, "_is_cached", False):
-            cache_dit.disable_cache(transformer)
+        if enabled_adapters:
+            cache_dit.disable_cache(enabled_adapters[0])
 
 
 def test_cache_dit_pattern_mismatch_fails_with_model_context(monkeypatch):
@@ -155,6 +163,19 @@ def test_cache_dit_pattern_mismatch_fails_with_model_context(monkeypatch):
 
     assert backend.is_enabled() is False
     assert not getattr(transformer, "_is_cached", False)
+
+
+def test_cache_dit_unexpected_runtime_error_is_not_wrapped(monkeypatch):
+    transformer = _tiny_transformer(monkeypatch)
+    pipeline = _PipelineWithTransformer(transformer=transformer)
+
+    def raise_unexpected_runtime_error(*_args, **_kwargs):
+        raise RuntimeError("unexpected Cache-DiT runtime failure")
+
+    monkeypatch.setattr(cachedit_backend_module, "enable_cache_for_dit", raise_unexpected_runtime_error)
+
+    with pytest.raises(RuntimeError, match="unexpected Cache-DiT runtime failure"):
+        CacheDiTBackend().enable(pipeline)
 
 
 @pytest.mark.parametrize(
@@ -206,6 +227,26 @@ def test_parallel_validation_runs_before_component_loading(monkeypatch):
 
     with pytest.raises(NotImplementedError, match="tensor_parallel_size"):
         SanaVideoPipeline(od_config=config)
+
+    assert load_calls == []
+
+
+def test_distributed_layerwise_offload_fails_before_component_loading(monkeypatch):
+    load_calls = []
+    monkeypatch.setattr(pipeline_module, "get_local_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(
+        SanaVideoPipeline,
+        "_load_components",
+        lambda *args, **kwargs: load_calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(NotImplementedError, match="does not support distributed layerwise offload"):
+        SanaVideoPipeline(
+            od_config=_od_config(
+                enable_distributed_layerwise_offload=True,
+                parallel_config=_parallel_config(data_parallel_size=2),
+            )
+        )
 
     assert load_calls == []
 
@@ -297,7 +338,7 @@ def _dummy_stream(_stream):
     yield None
 
 
-def test_two_layer_offload_recovers_from_cached_block_skip_and_cleans_up(monkeypatch):
+def _patch_layerwise_platform(monkeypatch) -> None:
     monkeypatch.setattr(layerwise_backend_module.current_omni_platform, "Stream", _DummyStream)
     monkeypatch.setattr(layerwise_backend_module.current_omni_platform, "Event", _DummyEvent)
     monkeypatch.setattr(
@@ -307,22 +348,34 @@ def test_two_layer_offload_recovers_from_cached_block_skip_and_cleans_up(monkeyp
     )
     monkeypatch.setattr(layerwise_backend_module.current_omni_platform, "stream", _dummy_stream)
 
+
+def _tiny_pipeline(monkeypatch) -> SanaVideoPipeline:
     pipeline = object.__new__(SanaVideoPipeline)
     nn.Module.__init__(pipeline)
     pipeline.transformer = _tiny_transformer(monkeypatch)
     pipeline.text_encoder = nn.Linear(2, 2)
     pipeline.vae = nn.Linear(2, 2)
+    return pipeline
+
+
+def _enable_layerwise_offload(pipeline: SanaVideoPipeline) -> LayerWiseOffloadBackend:
+    backend = LayerWiseOffloadBackend(
+        OffloadConfig(strategy=OffloadStrategy.LAYER_WISE, pin_cpu_memory=False),
+        device=torch.device("cpu"),
+    )
+    backend.enable(pipeline)
+    return backend
+
+
+def test_two_layer_offload_recovers_from_cached_block_skip_and_cleans_up(monkeypatch):
+    _patch_layerwise_platform(monkeypatch)
+    pipeline = _tiny_pipeline(monkeypatch)
     discovered = ModuleDiscovery.discover(pipeline)
     assert discovered.dits == [pipeline.transformer]
     assert discovered.encoders == [pipeline.text_encoder]
     assert discovered.vaes == [pipeline.vae]
 
-    config = OffloadConfig(
-        strategy=OffloadStrategy.LAYER_WISE,
-        pin_cpu_memory=False,
-    )
-    backend = LayerWiseOffloadBackend(config, device=torch.device("cpu"))
-    backend.enable(pipeline)
+    backend = _enable_layerwise_offload(pipeline)
     blocks = list(pipeline.transformer.transformer_blocks)
     assert backend.is_enabled()
     assert len(blocks) == 2
@@ -331,8 +384,7 @@ def test_two_layer_offload_recovers_from_cached_block_skip_and_cleans_up(monkeyp
     assert block_1_hook is not None
     assert block_1_hook.is_materialized is False
 
-    # Simulate Cache-DiT skipping block 0: block 1 must synchronously ask the
-    # previous hook to materialize its parameters before it executes.
+    # Cache-DiT may skip block 0, leaving block 1 without the normal prefetch.
     block_1_hook.pre_forward(blocks[1])
     assert block_1_hook.is_materialized is True
     block_1_hook.post_forward(blocks[1], None)
@@ -341,5 +393,35 @@ def test_two_layer_offload_recovers_from_cached_block_skip_and_cleans_up(monkeyp
     backend.disable()
     assert backend.is_enabled() is False
     assert backend._blocks == []
+    for block in blocks:
+        assert block._hook_registry.get_hook(LayerwiseOffloadHook._HOOK_NAME) is None
+
+
+def test_layerwise_offload_then_cache_dit_install_and_cleanup(monkeypatch):
+    _patch_layerwise_platform(monkeypatch)
+    pipeline = _tiny_pipeline(monkeypatch)
+    offload_backend = _enable_layerwise_offload(pipeline)
+    enabled_adapters = _record_cache_adapters(monkeypatch)
+    cache_backend = CacheDiTBackend()
+    blocks = list(pipeline.transformer.transformer_blocks)
+
+    try:
+        cache_backend.enable(pipeline)
+
+        assert offload_backend.is_enabled()
+        assert cache_backend.is_enabled()
+        assert pipeline.transformer._is_cached is True
+        assert enabled_adapters[0].check_forward_pattern is True
+        for block in blocks:
+            assert block._hook_registry.get_hook(LayerwiseOffloadHook._HOOK_NAME) is not None
+    finally:
+        if enabled_adapters:
+            cache_dit.disable_cache(enabled_adapters[0])
+        offload_backend.disable()
+
+    assert not getattr(pipeline.transformer, "_is_cached", False)
+    assert not getattr(enabled_adapters[0].pipe, "_is_cached", False)
+    assert not hasattr(enabled_adapters[0].pipe, "_context_manager")
+    assert offload_backend.is_enabled() is False
     for block in blocks:
         assert block._hook_registry.get_hook(LayerwiseOffloadHook._HOOK_NAME) is None

@@ -5,6 +5,7 @@ import torch
 from diffusers import (
     AutoencoderKLWan,
     DPMSolverMultistepScheduler,
+    SanaImageToVideoPipeline,
     SanaVideoPipeline,
     SanaVideoTransformer3DModel,
 )
@@ -49,7 +50,10 @@ def tiny_ltx2_builder() -> str:
     return build_tiny_from_configs("LTX2Pipeline", "Lightricks/LTX-2", TINY_CONFIGS_DIR / "LTX2Pipeline")
 
 
-def tiny_sana_video_builder() -> str:
+def _tiny_sana_video_builder(
+    pipeline_cls: type[SanaVideoPipeline] | type[SanaImageToVideoPipeline],
+    pipeline_name: str,
+) -> str:
     """Build a tiny 480p SANA-Video model without downloading model weights.
 
     The tokenizer is the only component loaded from the upstream repository.
@@ -57,7 +61,7 @@ def tiny_sana_video_builder() -> str:
     configs, and the scheduler is constructed from its weight-free config.
     """
     model_id = "Efficient-Large-Model/SANA-Video_2B_480p_diffusers"
-    model_dir = _get_tiny_model_path("SanaVideoPipeline")
+    model_dir = _get_tiny_model_path(pipeline_name)
 
     tokenizer = GemmaTokenizerFast.from_pretrained(model_id, subfolder="tokenizer")
     scheduler = DPMSolverMultistepScheduler(
@@ -104,7 +108,7 @@ def tiny_sana_video_builder() -> str:
         latents_mean=[0.0] * 16,
         latents_std=[1.0] * 16,
     )
-    pipeline = SanaVideoPipeline(
+    pipeline = pipeline_cls(
         tokenizer=tokenizer,
         text_encoder=text_encoder,
         vae=vae,
@@ -113,6 +117,14 @@ def tiny_sana_video_builder() -> str:
     )
     pipeline.to(dtype=torch.bfloat16).save_pretrained(model_dir)
     return model_dir
+
+
+def tiny_sana_video_builder() -> str:
+    return _tiny_sana_video_builder(SanaVideoPipeline, "SanaVideoPipeline")
+
+
+def tiny_sana_video_i2v_builder() -> str:
+    return _tiny_sana_video_builder(SanaImageToVideoPipeline, "SanaImageToVideoPipeline")
 
 
 def _shrink_flux_clip_text_encoder(config: dict) -> dict:

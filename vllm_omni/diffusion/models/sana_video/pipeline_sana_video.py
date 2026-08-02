@@ -274,13 +274,15 @@ def _validate_cache_offload_parallelism(od_config: OmniDiffusionConfig) -> None:
             f"Cache backend {cache_backend!r} is not supported by the native SANA-Video pipeline; "
             "use 'cache_dit' or 'none'."
         )
+    if getattr(od_config, "enable_distributed_layerwise_offload", False):
+        raise NotImplementedError("SANA-Video does not support distributed layerwise offload.")
+
     cache_enabled = cache_backend == "cache_dit"
     offload_enabled = any(
         getattr(od_config, flag, False)
         for flag in (
             "enable_cpu_offload",
             "enable_layerwise_offload",
-            "enable_distributed_layerwise_offload",
         )
     )
     if not (cache_enabled or offload_enabled):

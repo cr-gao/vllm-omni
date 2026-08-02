@@ -182,9 +182,9 @@ validated compatibility/reference backend.
 
 The native T2V and I2V pipelines expose Cache-DiT, model-level CPU offload,
 and layerwise CPU offload through the common diffusion flags. These paths use
-the SANA transformer's `transformer_blocks` metadata; the layerwise mode keeps
+the SANA transformer's `transformer_blocks` metadata. Layerwise mode keeps
 non-block transformer modules, the text encoder, and the VAE resident on the
-runtime device while prefetching the two-or-more DiT blocks in order.
+runtime device while prefetching DiT blocks in order.
 
 | Cache-DiT | Model CPU offload | Layerwise offload | Single-rank behavior |
 |---|---:|---:|---|
@@ -216,12 +216,13 @@ Add one of the following flag sets to either native offline command above:
 If both CPU offload flags are supplied, the common offloader keeps its existing
 layerwise precedence. Cache-DiT refreshes each request from the explicit
 `num_inference_steps`; when that field is omitted, both native SANA pipelines
-use their immutable 50-step default.
+default to 50 inference steps.
 
 These combinations are intentionally limited to TP1, CFG1, and SP1. Combining
 Cache-DiT or CPU offload with tensor, CFG, or sequence parallelism raises before
 checkpoint components are loaded. Other cache backends, including TeaCache,
-are not enabled for the native SANA pipelines by this integration.
+are not enabled for the native SANA pipelines by this integration. Distributed
+layerwise offload is unsupported and always raises before component loading.
 
 The checked-in tests cover metadata, a two-layer tiny transformer, cache
 refresh, component load-device selection, and offload hook lifecycle on CPU.
@@ -246,7 +247,7 @@ memory reduction should be inferred from the CPU tests.
   Diffusers `DPMSolverMultistepScheduler`.
 - Known limitations:
     - Cache-DiT and CPU offload are limited to TP1/CFG1/SP1. Distributed
-    combinations, sequence/tensor/CFG parallelism, TeaCache, and step
+    layerwise offload, other distributed combinations, TeaCache, and step
     execution are not supported by the native pipeline.
     - The Diffusers backend is a compatibility path and does not provide native
     vLLM-Omni parallelism or continuous batching.
