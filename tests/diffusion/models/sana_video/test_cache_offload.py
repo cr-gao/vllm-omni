@@ -79,29 +79,6 @@ def _tiny_transformer(monkeypatch) -> SanaVideoTransformer3DModel:
     )
 
 
-def _parallel_config(**overrides):
-    values = {
-        "tensor_parallel_size": 1,
-        "cfg_parallel_size": 1,
-        "sequence_parallel_size": 1,
-        "data_parallel_size": 1,
-    }
-    values.update(overrides)
-    return _ParallelConfig(**values)
-
-
-def _od_config(**overrides):
-    values = {
-        "cache_backend": "none",
-        "enable_cpu_offload": False,
-        "enable_layerwise_offload": False,
-        "enable_distributed_layerwise_offload": False,
-        "parallel_config": _parallel_config(),
-    }
-    values.update(overrides)
-    return _ODConfig(**values)
-
-
 def _record_cache_adapters(monkeypatch):
     enabled_adapters = []
     original_enable_cache = cachedit_backend_module.cache_dit.enable_cache
@@ -180,9 +157,9 @@ def test_cache_offload_distributed_combinations_fail_closed(feature, parallel_fi
         "model_offload": {"enable_cpu_offload": True},
         "layerwise_offload": {"enable_layerwise_offload": True},
     }
-    config = _od_config(
+    config = _ODConfig(
         **feature_flags[feature],
-        parallel_config=_parallel_config(**{parallel_field: 2}),
+        parallel_config=_ParallelConfig(**{parallel_field: 2}),
     )
 
     with pytest.raises(NotImplementedError, match="supported only with TP1, CFG1, and SP1"):
@@ -192,7 +169,7 @@ def test_cache_offload_distributed_combinations_fail_closed(feature, parallel_fi
 @pytest.mark.parametrize("cache_backend", [None, "", "tea_cache"])
 def test_sana_video_rejects_unvalidated_cache_backends(cache_backend):
     with pytest.raises(NotImplementedError, match="Cache backend .* is not supported"):
-        _validate_cache_offload_parallelism(_od_config(cache_backend=cache_backend))
+        _validate_cache_offload_parallelism(_ODConfig(cache_backend=cache_backend))
 
 
 def test_parallel_validation_runs_before_component_loading(monkeypatch):
@@ -203,9 +180,9 @@ def test_parallel_validation_runs_before_component_loading(monkeypatch):
         "_load_components",
         lambda *args, **kwargs: load_calls.append((args, kwargs)),
     )
-    config = _od_config(
+    config = _ODConfig(
         cache_backend="cache_dit",
-        parallel_config=_parallel_config(tensor_parallel_size=2),
+        parallel_config=_ParallelConfig(tensor_parallel_size=2),
     )
 
     with pytest.raises(NotImplementedError, match="tensor_parallel_size"):
@@ -225,9 +202,9 @@ def test_distributed_layerwise_offload_fails_before_component_loading(monkeypatc
 
     with pytest.raises(NotImplementedError, match="does not support distributed layerwise offload"):
         SanaVideoPipeline(
-            od_config=_od_config(
+            od_config=_ODConfig(
                 enable_distributed_layerwise_offload=True,
-                parallel_config=_parallel_config(data_parallel_size=2),
+                parallel_config=_ParallelConfig(data_parallel_size=2),
             )
         )
 
