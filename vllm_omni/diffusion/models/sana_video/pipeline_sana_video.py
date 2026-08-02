@@ -267,6 +267,44 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
+def _validate_cache_offload_parallelism(od_config: OmniDiffusionConfig) -> None:
+    cache_backend = getattr(od_config, "cache_backend", None)
+    if cache_backend not in (None, "", "none", "cache_dit"):
+        raise NotImplementedError(
+            f"Cache backend {cache_backend!r} is not supported by the native SANA-Video pipeline; "
+            "use 'cache_dit' or 'none'."
+        )
+    cache_enabled = cache_backend == "cache_dit"
+    offload_enabled = any(
+        getattr(od_config, flag, False)
+        for flag in (
+            "enable_cpu_offload",
+            "enable_layerwise_offload",
+            "enable_distributed_layerwise_offload",
+        )
+    )
+    if not (cache_enabled or offload_enabled):
+        return
+
+    parallel_config = od_config.parallel_config
+    unsupported = {
+        "tensor_parallel_size": getattr(parallel_config, "tensor_parallel_size", 1),
+        "cfg_parallel_size": getattr(parallel_config, "cfg_parallel_size", 1),
+        "sequence_parallel_size": getattr(parallel_config, "sequence_parallel_size", 1) or 1,
+    }
+    enabled_parallelism = {name: size for name, size in unsupported.items() if size > 1}
+    if enabled_parallelism:
+        features = []
+        if cache_enabled:
+            features.append(f"cache_backend={od_config.cache_backend!r}")
+        if offload_enabled:
+            features.append("CPU offload")
+        raise NotImplementedError(
+            "SANA-Video cache/offload is currently supported only with TP1, CFG1, and SP1; "
+            f"requested {', '.join(features)} with {enabled_parallelism}."
+        )
+
+
 class SanaVideoPipeline(
     nn.Module,
     ProgressBarMixin,
@@ -294,6 +332,7 @@ class SanaVideoPipeline(
     _encoder_modules = ["text_encoder"]
     _vae_modules = ["vae"]
     supports_step_execution = False
+    default_num_inference_steps = 50
 
     def __init__(
         self,
@@ -312,6 +351,7 @@ class SanaVideoPipeline(
         self.device = get_local_device()
         self.weights_sources: list[DiffusersPipelineLoader.ComponentSource] = []
         if od_config is not None:
+            _validate_cache_offload_parallelism(od_config)
             tokenizer, text_encoder, vae, transformer, scheduler = self._load_components(od_config, prefix)
 
         if tokenizer is None or text_encoder is None or vae is None or transformer is None or scheduler is None:
@@ -359,7 +399,7 @@ class SanaVideoPipeline(
         model = od_config.model
         local_files_only = os.path.exists(model)
         dtype = getattr(od_config, "dtype", torch.bfloat16)
-        device = self.device
+        component_load_device = torch.get_default_device()
         # Transformer weights are streamed by DiffusersPipelineLoader below.
         # Prefetch only components loaded through from_pretrained here.
         component_subfolders = ["tokenizer", "text_encoder", "vae", "scheduler"]
@@ -377,7 +417,7 @@ class SanaVideoPipeline(
             prefetch_list=component_subfolders,
             local_files_only=local_files_only,
             torch_dtype=dtype,
-        ).to(device)
+        ).to(component_load_device)
 
         model_index = _load_json(model, "model_index.json", local_files_only)
         vae_class_name = model_index.get("vae", [None, "AutoencoderKLWan"])[1]
@@ -392,10 +432,13 @@ class SanaVideoPipeline(
             prefetch_list=component_subfolders,
             local_files_only=local_files_only,
             torch_dtype=vae_dtype,
-        ).to(device)
+        ).to(component_load_device)
 
         transformer_config = _load_json(model, "transformer/config.json", local_files_only)
-        transformer = SanaVideoTransformer3DModel.from_config(transformer_config).to(dtype=dtype, device=device)
+        transformer = SanaVideoTransformer3DModel.from_config(transformer_config).to(
+            dtype=dtype,
+            device=component_load_device,
+        )
         scheduler = DPMSolverMultistepScheduler.from_pretrained(
             model,
             subfolder="scheduler",
@@ -751,7 +794,11 @@ class SanaVideoPipeline(
             default_num_frames=81,
             is_dummy_run=req.is_dummy_run(),
         )
-        num_steps = sampling.num_inference_steps if sampling.num_inference_steps is not None else 50
+        num_steps = (
+            sampling.num_inference_steps
+            if sampling.num_inference_steps is not None
+            else self.default_num_inference_steps
+        )
         guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 6.0
         generator = sampling.generator
         if generator is None and sampling.seed is not None:

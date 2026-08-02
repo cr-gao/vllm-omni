@@ -85,7 +85,7 @@ def tiny_sana_video_builder() -> str:
         out_channels=16,
         num_attention_heads=2,
         attention_head_dim=16,
-        num_layers=1,
+        num_layers=2,
         num_cross_attention_heads=2,
         cross_attention_head_dim=16,
         cross_attention_dim=32,
