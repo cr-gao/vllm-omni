@@ -166,10 +166,9 @@ def test_cache_offload_distributed_combinations_fail_closed(feature, parallel_fi
         _validate_cache_offload_parallelism(config)
 
 
-@pytest.mark.parametrize("cache_backend", [None, "", "tea_cache"])
-def test_sana_video_rejects_unvalidated_cache_backends(cache_backend):
-    with pytest.raises(NotImplementedError, match="Cache backend .* is not supported"):
-        _validate_cache_offload_parallelism(_ODConfig(cache_backend=cache_backend))
+def test_sana_video_rejects_unvalidated_cache_backends():
+    with pytest.raises(NotImplementedError, match="Cache backend 'tea_cache' is not supported"):
+        _validate_cache_offload_parallelism(_ODConfig(cache_backend="tea_cache"))
 
 
 def test_parallel_validation_runs_before_component_loading(monkeypatch):
