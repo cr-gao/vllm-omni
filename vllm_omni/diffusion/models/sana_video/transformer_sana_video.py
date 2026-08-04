@@ -19,7 +19,14 @@ from dataclasses import dataclass, fields
 
 import torch
 from torch import nn
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
+from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as OmniAttention
@@ -107,6 +114,115 @@ class SanaRMSNorm(nn.Module):
             hidden_states = hidden_states.to(input_dtype)
 
         return hidden_states
+
+
+class SanaDistributedRMSNorm(nn.Module):
+    """RMSNorm that computes global RMS across tensor parallel ranks."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        set_weight_attrs(self.weight, {"weight_loader": self.weight_loader})
+
+    def weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        if param.shape == loaded_weight.shape:
+            param.data.copy_(loaded_weight)
+            return
+
+        tp_size = get_tensor_model_parallel_world_size()
+        if loaded_weight.shape[0] % tp_size != 0:
+            raise ValueError(
+                f"Cannot shard RMSNorm weight of shape {tuple(loaded_weight.shape)} across tp_size={tp_size}."
+            )
+
+        shard_size = loaded_weight.shape[0] // tp_size
+        start_idx = get_tensor_model_parallel_rank() * shard_size
+        shard = loaded_weight.narrow(0, start_idx, shard_size)
+        if param.shape != shard.shape:
+            raise ValueError(f"RMSNorm shard shape mismatch: param={tuple(param.shape)}, shard={tuple(shard.shape)}.")
+        param.data.copy_(shard)
+
+    def _local_sum_sq(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Per-rank float32 activation, local sum-of-squares, and local width."""
+        x_float = x.float()
+        local_sum_sq = x_float.pow(2).sum(dim=-1, keepdim=True)
+        return x_float, local_sum_sq, x.shape[-1]
+
+    def _scale(
+        self,
+        x_float: torch.Tensor,
+        global_sum_sq: torch.Tensor,
+        global_count: int,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the (already reduced) RMS and the per-rank weight shard."""
+        mean_sq = global_sum_sq / global_count
+        hidden_states = x_float * torch.rsqrt(mean_sq + self.eps)
+        # Only cast to the weight dtype for fp16/bf16 weights; keep fp32 otherwise.
+        if self.weight.dtype in (torch.float16, torch.bfloat16):
+            hidden_states = hidden_states.to(self.weight.dtype)
+        return hidden_states * self.weight
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        tp_size = get_tensor_model_parallel_world_size()
+        x_float, local_sum_sq, local_count = self._local_sum_sq(x)
+
+        if tp_size > 1:
+            # Use vLLM's collective (custom all-reduce / symmetric-mem fast path
+            # for small tensors) instead of raw torch.distributed.all_reduce, and
+            # take the return value so the custom-AR path (which may return a new
+            # buffer) is handled correctly. No .clone() needed.
+            global_sum_sq = tensor_model_parallel_all_reduce(local_sum_sq)
+            global_count = local_count * tp_size
+        else:
+            global_sum_sq = local_sum_sq
+            global_count = local_count
+
+        return self._scale(x_float, global_sum_sq, global_count, x)
+
+
+def fused_qk_rms_norm(
+    norm_q: nn.Module,
+    norm_k: nn.Module,
+    q: torch.Tensor,
+    k: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply q/k :class:`SanaDistributedRMSNorm` with a SINGLE fused TP all-reduce.
+
+    WHY: self-attention norms q and k every step; on TP each norm issues its own
+    tiny all-reduce of the per-token sum-of-squares, and these latency-bound
+    micro-collectives add up, so we pack both sum-of-squares into one tensor and
+    reduce once (2 collectives → 1).
+
+    NUMERICALLY IDENTICAL to ``norm_q(q), norm_k(k)``: all-reduce is elementwise,
+    so packing along the last dim reduces each slice independently with the same
+    fp32 accumulation. Requires q and k to share the same shape (true for
+    self-attention — both come from the same hidden states). Falls back to
+    independent application when either norm is not a SanaDistributedRMSNorm
+    (e.g. nn.Identity when qk_norm=False).
+    """
+    if not (isinstance(norm_q, SanaDistributedRMSNorm) and isinstance(norm_k, SanaDistributedRMSNorm)):
+        return norm_q(q), norm_k(k)
+
+    # The fused path reduces one packed sum-of-squares and reuses q's token width
+    # as the RMS count for BOTH q and k, so q and k must share the same shape.
+    # (Self-attention guarantees this: q and k are projected from the same x.)
+    assert q.shape == k.shape, "fused_qk_rms_norm requires q and k to have the same shape."
+
+    tp_size = get_tensor_model_parallel_world_size()
+    q_float, q_sum_sq, count = norm_q._local_sum_sq(q)
+    k_float, k_sum_sq, _ = norm_k._local_sum_sq(k)
+
+    if tp_size > 1:
+        packed = torch.cat([q_sum_sq, k_sum_sq], dim=-1)
+        packed = tensor_model_parallel_all_reduce(packed)
+        q_sum_sq, k_sum_sq = packed[..., 0:1], packed[..., 1:2]
+        count = count * tp_size
+
+    q_out = norm_q._scale(q_float, q_sum_sq, count, q)
+    k_out = norm_k._scale(k_float, k_sum_sq, count, k)
+    return q_out, k_out
 
 
 def _get_timestep_embedding(
@@ -440,13 +556,20 @@ class SanaLinearAttention(nn.Module):
     ) -> None:
         super().__init__()
         inner_dim = num_heads * head_dim
-        self.heads = num_heads
-        self.to_q = nn.Linear(dim, inner_dim, bias=bias)
-        self.to_k = nn.Linear(dim, inner_dim, bias=bias)
-        self.to_v = nn.Linear(dim, inner_dim, bias=bias)
-        self.norm_q = SanaRMSNorm(inner_dim, eps=1e-5, elementwise_affine=True) if qk_norm is not None else None
-        self.norm_k = SanaRMSNorm(inner_dim, eps=1e-5, elementwise_affine=True) if qk_norm is not None else None
-        self.to_out = nn.ModuleList([nn.Linear(inner_dim, dim, bias=True), nn.Dropout(dropout)])
+        tp_size = get_tensor_model_parallel_world_size()
+        self.heads = num_heads // tp_size
+        local_inner_dim = inner_dim // tp_size
+        self.to_q = ColumnParallelLinear(dim, inner_dim, bias=bias, gather_output=False, return_bias=False)
+        self.to_k = ColumnParallelLinear(dim, inner_dim, bias=bias, gather_output=False, return_bias=False)
+        self.to_v = ColumnParallelLinear(dim, inner_dim, bias=bias, gather_output=False, return_bias=False)
+        self.norm_q = SanaDistributedRMSNorm(local_inner_dim, eps=1e-5) if qk_norm is not None else None
+        self.norm_k = SanaDistributedRMSNorm(local_inner_dim, eps=1e-5) if qk_norm is not None else None
+        self.to_out = nn.ModuleList(
+            [
+                RowParallelLinear(inner_dim, dim, bias=True, input_is_parallel=True, return_bias=False),
+                nn.Dropout(dropout),
+            ]
+        )
 
     def forward(
         self,
@@ -462,9 +585,7 @@ class SanaLinearAttention(nn.Module):
         value = self.to_v(hidden_states)
 
         if self.norm_q is not None:
-            query = self.norm_q(query)
-        if self.norm_k is not None:
-            key = self.norm_k(key)
+            query, key = fused_qk_rms_norm(self.norm_q, self.norm_k, query, key)
 
         query = query.unflatten(2, (self.heads, -1))
         key = key.unflatten(2, (self.heads, -1))
@@ -632,18 +753,25 @@ class SanaCrossAttention(nn.Module):
     ) -> None:
         super().__init__()
         inner_dim = num_heads * head_dim
-        self.heads = num_heads
+        tp_size = get_tensor_model_parallel_world_size()
+        self.heads = num_heads // tp_size
         self.head_dim = head_dim
-        self.to_q = nn.Linear(dim, inner_dim, bias=bias)
-        self.to_k = nn.Linear(cross_attention_dim, inner_dim, bias=bias)
-        self.to_v = nn.Linear(cross_attention_dim, inner_dim, bias=bias)
-        self.norm_q = SanaRMSNorm(inner_dim, eps=1e-5, elementwise_affine=True) if qk_norm is not None else None
-        self.norm_k = SanaRMSNorm(inner_dim, eps=1e-5, elementwise_affine=True) if qk_norm is not None else None
-        self.to_out = nn.ModuleList([nn.Linear(inner_dim, dim, bias=out_bias), nn.Dropout(dropout)])
+        local_inner_dim = inner_dim // tp_size
+        self.to_q = ColumnParallelLinear(dim, inner_dim, bias=bias, gather_output=False, return_bias=False)
+        self.to_k = ColumnParallelLinear(cross_attention_dim, inner_dim, bias=bias, gather_output=False, return_bias=False)
+        self.to_v = ColumnParallelLinear(cross_attention_dim, inner_dim, bias=bias, gather_output=False, return_bias=False)
+        self.norm_q = SanaDistributedRMSNorm(local_inner_dim, eps=1e-5) if qk_norm is not None else None
+        self.norm_k = SanaDistributedRMSNorm(local_inner_dim, eps=1e-5) if qk_norm is not None else None
+        self.to_out = nn.ModuleList(
+            [
+                RowParallelLinear(inner_dim, dim, bias=out_bias, input_is_parallel=True, return_bias=False),
+                nn.Dropout(dropout),
+            ]
+        )
         self.attn = OmniAttention(
-            num_heads=num_heads,
+            num_heads=self.heads,
             head_size=head_dim,
-            num_kv_heads=num_heads,
+            num_kv_heads=self.heads,
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
             role="cross",
