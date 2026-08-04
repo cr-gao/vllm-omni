@@ -55,6 +55,7 @@ DIFFUSION_TEST_SETTINGS = {
         supported_tasks=[DiffusionTasks.TEXT_TO_VIDEO],
         check_determinism=False,
         check_multi_output=False,
+    ),
     "QwenImagePipeline": DiffusionModelTestOpts(
         model="Qwen/Qwen-Image",
         builder=diff_model_builders.tiny_qwen_image_builder,
