@@ -11,6 +11,8 @@ from tests.helpers.mark import hardware_marks
 from tests.helpers.media import generate_synthetic_image
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
 
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 MODEL_480P = os.environ.get(
@@ -55,8 +57,6 @@ def _t2v_backend_cases():
     return cases
 
 
-@pytest.mark.core_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _t2v_backend_cases(), indirect=True)
 def test_sana_video_t2v_backends(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
     request_config = {
@@ -106,8 +106,6 @@ def _i2v_cases():
     return cases
 
 
-@pytest.mark.core_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _i2v_cases(), indirect=True)
 def test_sana_video_i2v_variants(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
     request_config = {

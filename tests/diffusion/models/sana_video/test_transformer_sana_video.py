@@ -374,6 +374,80 @@ def test_tiny_transformer_matches_diffusers_and_frozen_output():
     torch.testing.assert_close(actual.flatten()[: len(_GOLDEN_PREFIX)], _GOLDEN_PREFIX, rtol=1e-5, atol=1e-5)
 
 
+def test_linear_attention_requires_rotary_embeddings():
+    from vllm_omni.diffusion.models.sana_video.transformer_sana_video import SanaLinearAttention
+
+    attention = SanaLinearAttention(
+        dim=24,
+        num_heads=2,
+        head_dim=12,
+        dropout=0.0,
+        bias=True,
+        qk_norm="rms_norm_across_heads",
+    )
+
+    with pytest.raises(ValueError, match="requires rotary_emb"):
+        attention(torch.randn(1, 4, 24))
+
+
+def test_linear_attention_bfloat16_matches_diffusers_mixed_precision():
+    from diffusers.models.attention_processor import Attention as DiffusersAttention
+    from diffusers.models.transformers.transformer_sana_video import SanaLinearAttnProcessor3_0
+
+    from vllm_omni.diffusion.models.sana_video.transformer_sana_video import SanaLinearAttention
+
+    torch.manual_seed(17)
+    reference = DiffusersAttention(
+        query_dim=24,
+        heads=2,
+        dim_head=12,
+        kv_heads=2,
+        qk_norm="rms_norm_across_heads",
+        dropout=0.0,
+        bias=True,
+        cross_attention_dim=None,
+        processor=SanaLinearAttnProcessor3_0(),
+    ).to(dtype=torch.bfloat16)
+    actual = SanaLinearAttention(
+        dim=24,
+        num_heads=2,
+        head_dim=12,
+        dropout=0.0,
+        bias=True,
+        qk_norm="rms_norm_across_heads",
+    ).to(dtype=torch.bfloat16)
+    actual.load_state_dict(reference.state_dict())
+
+    hidden_states = torch.randn(1, 5, 24, dtype=torch.bfloat16)
+    rotary_emb = (
+        torch.randn(1, 5, 1, 12, dtype=torch.bfloat16),
+        torch.randn(1, 5, 1, 12, dtype=torch.bfloat16),
+    )
+
+    with torch.no_grad():
+        expected = reference(hidden_states, rotary_emb=rotary_emb)
+        result = actual(hidden_states, rotary_emb=rotary_emb)
+
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+def test_transformer_block_without_cross_attention_keeps_feed_forward_norm():
+    from vllm_omni.diffusion.models.sana_video.transformer_sana_video import SanaVideoTransformerBlock
+
+    block = SanaVideoTransformerBlock(
+        dim=24,
+        num_attention_heads=2,
+        attention_head_dim=12,
+        num_cross_attention_heads=2,
+        cross_attention_head_dim=12,
+        cross_attention_dim=None,
+        mlp_ratio=2.0,
+    )
+
+    assert block.attn2 is None
+    assert isinstance(block.norm2, torch.nn.LayerNorm)
+
+
 def test_guidance_transformer_matches_diffusers_and_tuple_output():
     from diffusers import SanaVideoTransformer3DModel as DiffusersTransformer
 

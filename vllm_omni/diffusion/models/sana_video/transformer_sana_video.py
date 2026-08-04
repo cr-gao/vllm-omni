@@ -453,6 +453,9 @@ class SanaLinearAttention(nn.Module):
         hidden_states: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        if rotary_emb is None:
+            raise ValueError("SanaLinearAttention requires rotary_emb.")
+
         original_dtype = hidden_states.dtype
         query = self.to_q(hidden_states)
         key = self.to_k(hidden_states)
@@ -471,23 +474,21 @@ class SanaLinearAttention(nn.Module):
         query = torch.relu(query)
         key = torch.relu(key)
 
-        if rotary_emb is not None:
+        def apply_rotary_emb(
+            hidden_states: torch.Tensor,
+            freqs_cos: torch.Tensor,
+            freqs_sin: torch.Tensor,
+        ):
+            x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
+            cos = freqs_cos[..., 0::2]
+            sin = freqs_sin[..., 1::2]
+            out = torch.empty_like(hidden_states)
+            out[..., 0::2] = x1 * cos - x2 * sin
+            out[..., 1::2] = x1 * sin + x2 * cos
+            return out.type_as(hidden_states)
 
-            def apply_rotary_emb(
-                hidden_states: torch.Tensor,
-                freqs_cos: torch.Tensor,
-                freqs_sin: torch.Tensor,
-            ):
-                x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
-                cos = freqs_cos[..., 0::2]
-                sin = freqs_sin[..., 1::2]
-                out = torch.empty_like(hidden_states)
-                out[..., 0::2] = x1 * cos - x2 * sin
-                out[..., 1::2] = x1 * sin + x2 * cos
-                return out.type_as(hidden_states)
-
-            query_rotate = apply_rotary_emb(query, *rotary_emb)
-            key_rotate = apply_rotary_emb(key, *rotary_emb)
+        query_rotate = apply_rotary_emb(query, *rotary_emb)
+        key_rotate = apply_rotary_emb(key, *rotary_emb)
 
         # B,H,C,N
         query = query.permute(0, 2, 3, 1)
@@ -498,6 +499,9 @@ class SanaLinearAttention(nn.Module):
 
         query_rotate, key_rotate, value = query_rotate.float(), key_rotate.float(), value.float()
 
+        # Keep the unrotated denominator contraction in the input dtype. This
+        # intentionally matches Diffusers 0.38.0's SanaLinearAttnProcessor3_0;
+        # only the rotated numerator path is accumulated in FP32.
         z = 1 / (key.sum(dim=-1, keepdim=True).transpose(-2, -1) @ query + 1e-15)
 
         scores = torch.matmul(value, key_rotate.transpose(-1, -2))
@@ -721,9 +725,9 @@ class SanaVideoTransformerBlock(nn.Module):
         )
 
         # 2. Cross Attention
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine, eps=norm_eps)
         self.attn2 = None
         if cross_attention_dim is not None:
-            self.norm2 = nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine, eps=norm_eps)
             self.attn2 = SanaCrossAttention(
                 dim=dim,
                 cross_attention_dim=cross_attention_dim,

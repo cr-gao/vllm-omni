@@ -113,6 +113,18 @@ ASPECT_RATIO_720_BIN = {
 }
 
 
+SANA_VIDEO_COMPLEX_HUMAN_INSTRUCTION = (
+    "Given a user prompt, generate an 'Enhanced prompt' that provides detailed visual descriptions suitable for video generation. Evaluate the level of detail in the user prompt:",
+    "- If the prompt is simple, focus on adding specifics about colors, shapes, sizes, textures, motion, and temporal relationships to create vivid and dynamic scenes.",
+    "- If the prompt is already detailed, refine and enhance the existing details slightly without overcomplicating.",
+    "Here are examples of how to transform or refine prompts:",
+    "- User Prompt: A cat sleeping -> Enhanced: A small, fluffy white cat slowly settling into a curled position, peacefully falling asleep on a warm sunny windowsill, with gentle sunlight filtering through surrounding pots of blooming red flowers.",
+    "- User Prompt: A busy city street -> Enhanced: A bustling city street scene at dusk, featuring glowing street lamps gradually lighting up, a diverse crowd of people in colorful clothing walking past, and a double-decker bus smoothly passing by towering glass skyscrapers.",
+    "Please generate only the enhanced description for the prompt below and avoid including any additional commentary or evaluations:",
+    "User Prompt: ",
+)
+
+
 def get_sana_video_default_resolution(sample_size: int) -> tuple[int, int]:
     if sample_size == 30:
         return 480, 832
@@ -791,16 +803,7 @@ class SanaVideoPipeline(
         clean_caption: bool = False,
         use_resolution_binning: bool = True,
         max_sequence_length: int = 300,
-        complex_human_instruction: list[str] = [
-            "Given a user prompt, generate an 'Enhanced prompt' that provides detailed visual descriptions suitable for video generation. Evaluate the level of detail in the user prompt:",
-            "- If the prompt is simple, focus on adding specifics about colors, shapes, sizes, textures, motion, and temporal relationships to create vivid and dynamic scenes.",
-            "- If the prompt is already detailed, refine and enhance the existing details slightly without overcomplicating.",
-            "Here are examples of how to transform or refine prompts:",
-            "- User Prompt: A cat sleeping -> Enhanced: A small, fluffy white cat slowly settling into a curled position, peacefully falling asleep on a warm sunny windowsill, with gentle sunlight filtering through surrounding pots of blooming red flowers.",
-            "- User Prompt: A busy city street -> Enhanced: A bustling city street scene at dusk, featuring glowing street lamps gradually lighting up, a diverse crowd of people in colorful clothing walking past, and a double-decker bus smoothly passing by towering glass skyscrapers.",
-            "Please generate only the enhanced description for the prompt below and avoid including any additional commentary or evaluations:",
-            "User Prompt: ",
-        ],
+        complex_human_instruction: list[str] | None = None,
     ) -> SanaVideoPipelineOutput | tuple:
         """
         Function invoked when calling the pipeline for generation.
@@ -881,6 +884,8 @@ class SanaVideoPipeline(
                 If `return_dict` is `True`, [`~pipelines.sana_video.pipeline_output.SanaVideoPipelineOutput`] is
                 returned, otherwise a `tuple` is returned where the first element is a list with the generated videos
         """
+        if complex_human_instruction is None:
+            complex_human_instruction = list(SANA_VIDEO_COMPLEX_HUMAN_INSTRUCTION)
 
         # 1. Check inputs. Raise error if not correct
         if use_resolution_binning:

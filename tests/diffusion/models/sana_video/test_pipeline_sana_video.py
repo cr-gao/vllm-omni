@@ -285,6 +285,19 @@ def test_sana_video_i2v_uses_diffusers_complex_instruction_default():
     assert captured["complex_human_instruction"] == reference_default
 
 
+def test_sana_video_t2v_complex_instruction_has_no_mutable_default():
+    import inspect
+
+    from vllm_omni.diffusion.models.sana_video.pipeline_sana_video import (
+        SANA_VIDEO_COMPLEX_HUMAN_INSTRUCTION,
+        SanaVideoPipeline,
+    )
+
+    parameter = inspect.signature(SanaVideoPipeline._generate).parameters["complex_human_instruction"]
+    assert parameter.default is None
+    assert isinstance(SANA_VIDEO_COMPLEX_HUMAN_INSTRUCTION, tuple)
+
+
 def test_diffusers_adapter_maps_num_frames_to_frames():
     from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
     from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import SanaVideoPipelineUtils
