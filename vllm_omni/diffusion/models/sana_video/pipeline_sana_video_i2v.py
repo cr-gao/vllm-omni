@@ -242,6 +242,7 @@ class SanaImageToVideoPipeline(SanaVideoPipeline, SupportImageInput):
     ) -> torch.Tensor:
         do_true_cfg = self.do_classifier_free_guidance
         cfg_parallel = get_classifier_free_guidance_world_size() > 1
+        self.check_cfg_parallel_validity(guidance_scale, negative_prompt_embeds is not None)
 
         if do_true_cfg and not cfg_parallel:
             # Concatenate neg/pos and the mask for a single batch-2 forward.

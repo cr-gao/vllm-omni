@@ -51,7 +51,7 @@ from vllm_omni.diffusion.request import resolve_video_num_frames
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from .pipeline_output import SanaVideoPipelineOutput
-from .transformer_sana_video import SanaVideoTransformer3DModel
+from .transformer_sana_video import SanaVideoTransformer3DModel, validate_sana_video_parallel_config
 
 
 def _resolve_vae_class_and_dtype(
@@ -310,6 +310,9 @@ class SanaVideoPipeline(
         prefix: str = "",
     ):
         super().__init__()
+
+        if od_config is not None:
+            validate_sana_video_parallel_config(od_config.parallel_config)
 
         self.od_config = od_config
         self.device = get_local_device()
@@ -763,6 +766,7 @@ class SanaVideoPipeline(
     ) -> torch.Tensor:
         do_true_cfg = self.do_classifier_free_guidance
         cfg_parallel = get_classifier_free_guidance_world_size() > 1
+        self.check_cfg_parallel_validity(guidance_scale, negative_prompt_embeds is not None)
 
         if do_true_cfg and not cfg_parallel:
             # Concatenate neg/pos for a single batch-2 forward.

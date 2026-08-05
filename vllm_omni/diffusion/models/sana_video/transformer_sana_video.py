@@ -32,6 +32,33 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as OmniAttention
 
 
+def validate_sana_video_parallel_config(parallel_config) -> None:
+    """Reject unsupported SANA-Video parallel topologies before weights load."""
+    tp_size = parallel_config.tensor_parallel_size
+    if tp_size not in (1, 2):
+        raise NotImplementedError(
+            f"SANA-Video supports tensor_parallel_size 1 or 2, got {tp_size}. "
+            "Set --tensor-parallel-size to 1 or 2."
+        )
+    cfg_size = parallel_config.cfg_parallel_size
+    if cfg_size not in (1, 2):
+        raise NotImplementedError(
+            f"SANA-Video supports cfg_parallel_size 1 or 2, got {cfg_size}. "
+            "Set --cfg-parallel-size to 1 or 2."
+        )
+    sp_size = parallel_config.sequence_parallel_size
+    if sp_size is not None and sp_size > 1:
+        raise NotImplementedError(
+            "Sequence parallel is not supported for SANA-Video: its linear attention and "
+            "GLUMB temporal conv have no SANA-specific SP implementation. Use tensor and/or "
+            "CFG parallel instead."
+        )
+    if parallel_config.text_encoder_tp_size > 1:
+        raise NotImplementedError(
+            "SANA-Video does not support text encoder tensor parallel. Set text_encoder_tp_size to 1."
+        )
+
+
 @dataclass
 class SanaVideoTransformerConfig:
     in_channels: int = 16

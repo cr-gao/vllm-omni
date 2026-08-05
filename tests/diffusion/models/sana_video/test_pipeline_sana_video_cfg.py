@@ -66,11 +66,13 @@ def _set_cfg_world_size(monkeypatch, n):
     """Pipelines always run inside an initialized CFG group; unit tests stub its
     world size instead of spinning up torch.distributed. Patch both pipeline
     modules since each resolves the symbol in its own namespace."""
+    import vllm_omni.diffusion.distributed.cfg_parallel as cfg
     import vllm_omni.diffusion.models.sana_video.pipeline_sana_video as t2v
     import vllm_omni.diffusion.models.sana_video.pipeline_sana_video_i2v as i2v
 
     monkeypatch.setattr(t2v, "get_classifier_free_guidance_world_size", lambda: n, raising=False)
     monkeypatch.setattr(i2v, "get_classifier_free_guidance_world_size", lambda: n, raising=False)
+    monkeypatch.setattr(cfg, "get_classifier_free_guidance_world_size", lambda: n, raising=False)
 
 
 def _bare_t2v_pipeline(transformer, guidance_scale):
@@ -386,6 +388,68 @@ def test_i2v_cfg2_dispatch_builds_masked_branch_kwargs(monkeypatch):
     assert torch.equal(pos["encoder_hidden_states"], prompt_embeds)
     assert torch.equal(neg["encoder_hidden_states"], negative_embeds)
     assert torch.equal(out[:, :, :1], latents0[:, :, :1]), "first frame must be preserved"
+
+
+def test_diffuse_runs_cfg_parallel_validity_check(monkeypatch, mocker):
+    """diffuse must run the CFG-parallel validity check so a scale<=1 or missing
+    negative prompt warns the user instead of silently wasting a rank."""
+    _set_cfg_world_size(monkeypatch, 1)
+
+    class _SpyTransformer:
+        dtype = torch.float32
+
+        def __call__(self, hidden_states, **kwargs):
+            return (torch.zeros_like(hidden_states),)
+
+    b = 1
+    pipe = _bare_t2v_pipeline(_SpyTransformer(), guidance_scale=6.0)
+    check = mocker.patch.object(SanaVideoPipeline, "check_cfg_parallel_validity", return_value=True)
+
+    pipe.diffuse(
+        latents=torch.randn(b, 4, 2, 4, 4),
+        timesteps=torch.tensor([1000.0]),
+        prompt_embeds=torch.randn(b, 3, 8),
+        prompt_attention_mask=torch.ones(b, 3),
+        negative_prompt_embeds=torch.randn(b, 3, 8),
+        negative_prompt_attention_mask=torch.ones(b, 3),
+        guidance_scale=6.0,
+        extra_step_kwargs={},
+        dtype=torch.float32,
+        output_slice=None,
+    )
+
+    check.assert_called_once_with(6.0, True)
+
+
+def test_i2v_diffuse_runs_cfg_parallel_validity_check(monkeypatch, mocker):
+    """I2V has its own diffuse; it must also run the CFG-parallel validity check."""
+    _set_cfg_world_size(monkeypatch, 1)
+    b, c, frames = 1, 4, 3
+
+    class _SpyTransformer:
+        dtype = torch.float32
+        out_channels = 2 * c
+
+        def __call__(self, hidden_states, **kwargs):
+            return (torch.zeros(hidden_states.shape[0], 2 * c, frames, 4, 4),)
+
+    pipe = _bare_i2v_pipeline(_SpyTransformer(), _I2VSpyScheduler(), guidance_scale=6.0)
+    check = mocker.patch.object(SanaVideoPipeline, "check_cfg_parallel_validity", return_value=True)
+
+    pipe.diffuse(
+        latents=torch.randn(b, c, frames, 4, 4),
+        timesteps=torch.tensor([1000.0]),
+        prompt_embeds=torch.randn(b, 3, 8),
+        prompt_attention_mask=torch.ones(b, 3),
+        negative_prompt_embeds=torch.randn(b, 3, 8),
+        negative_prompt_attention_mask=torch.ones(b, 3),
+        guidance_scale=6.0,
+        conditioning_mask=_conditioning_mask(b, frames),
+        dtype=torch.float32,
+        output_slice=c,
+    )
+
+    check.assert_called_once_with(6.0, True)
 
 
 def test_t2v_forwards_eta_and_generator_into_scheduler(monkeypatch):
