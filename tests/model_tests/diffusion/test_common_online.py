@@ -31,7 +31,7 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.xdist]
 
 
 @pytest.mark.parametrize(
-    "model_name,accelerations,supported_tasks,check_multioutput,check_determinism",
+    "model_name,accelerations,supported_tasks,check_multioutput,check_determinism,check_i2v_t2v_divergence",
     get_parametrized_options(DIFFUSION_TEST_SETTINGS, online=True),
 )
 def test_online_on_supported_tasks(
@@ -40,6 +40,7 @@ def test_online_on_supported_tasks(
     supported_tasks: list[DiffusionTasks],
     check_multioutput: bool,
     check_determinism: bool,
+    check_i2v_t2v_divergence: bool,
     tiny_model_paths: dict[str, str],
     run_level: str,
     subtests,
