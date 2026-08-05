@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""TP unit tests for SANA-Video: distributed RMSNorm and sharded attention.
+"""TP unit tests for SANA-Video: distributed RMSNorm, sharded attention and
+sharded GLUMB temporal conv.
 
 CPU-only. The TP world size and the collective are mocked so a single process
 simulates the shard/reduce logic a real multi-rank run depends on.
@@ -13,6 +14,7 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.models.sana_video.transformer_sana_video import (
+    GLUMBTempConv,
     SanaCrossAttention,
     SanaDistributedRMSNorm,
     SanaLinearAttention,
@@ -357,3 +359,135 @@ def test_tp2_load_weights_shards_full_checkpoint_without_missing(mocker) -> None
     loaded = model.load_weights(list(reference.state_dict().items()))
 
     assert loaded == set(model.state_dict())
+
+
+# ── GLUMB temporal conv TP ──
+
+# hidden_channels = expand_ratio * in_channels = 8, so conv_inverted emits 2h = 16.
+_GLUMB_IN, _GLUMB_OUT, _GLUMB_RATIO = 4, 4, 2.0
+
+_GLUMB_GOLDEN = torch.tensor(
+    [
+        51.4757385,
+        -10.9912930,
+        -4.1482553,
+        -26.1580830,
+        -19.7727261,
+        17.9901562,
+        -1.6007471,
+        13.3993073,
+        -8.6459389,
+        -10.4008112,
+        -7.4962354,
+        1.5446399,
+    ]
+)
+
+
+def _glumb_inputs() -> torch.Tensor:
+    torch.manual_seed(1)
+    return torch.randn(1, 2, 3, 3, _GLUMB_IN)  # [B, F, H, W, C]
+
+
+def test_glumb_tp1_matches_golden_and_keeps_param_names(tp1_group) -> None:
+    """TP1 GLUMB stays bit-identical to the PR1 conv output and preserves keys."""
+    glumb = GLUMBTempConv(_GLUMB_IN, _GLUMB_OUT, _GLUMB_RATIO, norm_type=None, residual_connection=False)
+    glumb.eval()
+    _fill_by_name(glumb)
+    x = _glumb_inputs()
+
+    with torch.no_grad():
+        out = glumb(x)
+
+    assert {name for name, _ in glumb.named_parameters()} == {
+        "conv_inverted.weight",
+        "conv_inverted.bias",
+        "conv_depth.weight",
+        "conv_depth.bias",
+        "conv_point.weight",
+        "conv_temp.weight",
+    }
+    torch.testing.assert_close(out.flatten()[:12], _GLUMB_GOLDEN, rtol=1e-5, atol=1e-5)
+
+
+def _random_glumb_checkpoint(hidden_channels: int) -> dict[str, torch.Tensor]:
+    """Checkpoint-format (nn.Conv2d) GLUMB weights with per-segment asymmetry.
+
+    conv_inverted / conv_depth carry two h-channel segments (value then gate).
+    Filling the gate half from a different distribution than the value half is
+    what exposes a naive contiguous dim-0 split: that bug would place the whole
+    value segment on rank 0 and the whole gate segment on rank 1, so each rank's
+    local chunk(2) would slice value-vs-value instead of value-vs-gate.
+    """
+    torch.manual_seed(0)
+    h = hidden_channels
+    value_w = torch.randn(h, _GLUMB_IN, 1, 1)
+    gate_w = torch.randn(h, _GLUMB_IN, 1, 1) * 3.0 + 5.0
+    value_b = torch.randn(h)
+    gate_b = torch.randn(h) * 3.0 + 5.0
+    value_dw = torch.randn(h, 1, 3, 3)
+    gate_dw = torch.randn(h, 1, 3, 3) * 3.0 + 5.0
+    value_db = torch.randn(h)
+    gate_db = torch.randn(h) * 3.0 + 5.0
+    return {
+        "conv_inverted.weight": torch.cat([value_w, gate_w], dim=0),
+        "conv_inverted.bias": torch.cat([value_b, gate_b], dim=0),
+        "conv_depth.weight": torch.cat([value_dw, gate_dw], dim=0),
+        "conv_depth.bias": torch.cat([value_db, gate_db], dim=0),
+        "conv_point.weight": torch.randn(_GLUMB_OUT, h, 1, 1),
+        "conv_temp.weight": torch.randn(_GLUMB_OUT, _GLUMB_OUT, 3, 1),
+    }
+
+
+def _mock_glumb_tp(mocker, world_size: int, rank: int) -> None:
+    """Mock a TP group of ``world_size`` at ``rank`` with an identity all-reduce,
+    so a single process can build and run one rank's shard in isolation."""
+    mocker.patch(f"{_MODULE}.get_tensor_model_parallel_world_size", return_value=world_size)
+    mocker.patch(f"{_MODULE}.get_tensor_model_parallel_rank", return_value=rank)
+    # Identity conv_point all-reduce returns each rank's local partial for the
+    # test to sum.
+    mocker.patch(f"{_MODULE}.tensor_model_parallel_all_reduce", side_effect=lambda t: t)
+
+
+def _load_glumb_checkpoint(glumb: GLUMBTempConv, checkpoint: dict[str, torch.Tensor]) -> None:
+    """Load like AutoWeightsLoader: custom weight_loader when present (the sharded
+    convs), plain copy for replicated params (conv_temp)."""
+    params = dict(glumb.named_parameters())
+    for name, tensor in checkpoint.items():
+        param = params[name]
+        loader = getattr(param, "weight_loader", None)
+        if loader is None:
+            param.data.copy_(tensor)
+        else:
+            loader(param, tensor)
+
+
+def test_glumb_tp2_shards_aggregate_to_dense(mocker) -> None:
+    """The merged value/gate two-segment shard must aggregate to the dense conv.
+
+    Everything after conv_point (temporal conv + residual) is linear and
+    bias-free, so summing each rank's full forward (with the conv_point
+    all-reduce mocked to identity) reproduces the replicated dense output.
+    """
+    hidden_channels = int(_GLUMB_RATIO * _GLUMB_IN)
+    checkpoint = _random_glumb_checkpoint(hidden_channels)
+    x = _glumb_inputs()
+
+    _mock_glumb_tp(mocker, world_size=1, rank=0)
+    dense = GLUMBTempConv(_GLUMB_IN, _GLUMB_OUT, _GLUMB_RATIO, norm_type=None, residual_connection=False)
+    dense.eval()
+    _load_glumb_checkpoint(dense, checkpoint)
+    with torch.no_grad():
+        ref = dense(x)
+
+    partials = []
+    for rank in (0, 1):
+        _mock_glumb_tp(mocker, world_size=2, rank=rank)
+        shard = GLUMBTempConv(_GLUMB_IN, _GLUMB_OUT, _GLUMB_RATIO, norm_type=None, residual_connection=False)
+        shard.eval()
+        _load_glumb_checkpoint(shard, checkpoint)
+        with torch.no_grad():
+            partials.append(shard(x))
+
+    aggregated = partials[0] + partials[1]
+    torch.testing.assert_close(aggregated, ref, rtol=1e-5, atol=1e-5)

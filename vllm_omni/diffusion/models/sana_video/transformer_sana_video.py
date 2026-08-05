@@ -494,17 +494,41 @@ class GLUMBTempConv(nn.Module):
         hidden_channels = int(expand_ratio * in_channels)
         self.norm_type = norm_type
         self.residual_connection = residual_connection
+        self.hidden_channels = hidden_channels
+
+        tp_size = get_tensor_model_parallel_world_size()
+        local_hidden_channels = hidden_channels // tp_size
 
         self.nonlinearity = nn.SiLU()
-        self.conv_inverted = nn.Conv2d(in_channels, hidden_channels * 2, 1, 1, 0)
-        self.conv_depth = nn.Conv2d(hidden_channels * 2, hidden_channels * 2, 3, 1, 1, groups=hidden_channels * 2)
-        self.conv_point = nn.Conv2d(hidden_channels, out_channels, 1, 1, 0, bias=False)
+        self.conv_inverted = nn.Conv2d(in_channels, 2 * local_hidden_channels, 1, 1, 0)
+        self.conv_depth = nn.Conv2d(
+            2 * local_hidden_channels, 2 * local_hidden_channels, 3, 1, 1, groups=2 * local_hidden_channels
+        )
+        self.conv_point = nn.Conv2d(local_hidden_channels, out_channels, 1, 1, 0, bias=False)
+        # conv_inverted/conv_depth carry [value(h), gate(h)]; each rank must hold a
+        # slice of both segments so the local chunk(2) still splits value from gate.
+        for param in (self.conv_inverted.weight, self.conv_inverted.bias, self.conv_depth.weight, self.conv_depth.bias):
+            set_weight_attrs(param, {"weight_loader": self._segment_weight_loader})
+        set_weight_attrs(self.conv_point.weight, {"weight_loader": self._point_weight_loader})
 
         self.norm = None
         if norm_type == "rms_norm":
             self.norm = SanaRMSNorm(out_channels, eps=1e-5, elementwise_affine=True, bias=True)
 
         self.conv_temp = nn.Conv2d(out_channels, out_channels, kernel_size=(3, 1), stride=1, padding=(1, 0), bias=False)
+
+    def _segment_weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        h = self.hidden_channels
+        local = h // get_tensor_model_parallel_world_size()
+        start = get_tensor_model_parallel_rank() * local
+        value = loaded_weight.narrow(0, start, local)
+        gate = loaded_weight.narrow(0, h + start, local)
+        param.data.copy_(torch.cat([value, gate], dim=0))
+
+    def _point_weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        local = self.hidden_channels // get_tensor_model_parallel_world_size()
+        start = get_tensor_model_parallel_rank() * local
+        param.data.copy_(loaded_weight.narrow(1, start, local))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.residual_connection:
@@ -520,6 +544,8 @@ class GLUMBTempConv(nn.Module):
         hidden_states = hidden_states * self.nonlinearity(gate)
 
         hidden_states = self.conv_point(hidden_states)
+        if get_tensor_model_parallel_world_size() > 1:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
         # Temporal aggregation
         hidden_states_temporal = hidden_states.view(batch_size, num_frames, num_channels, height * width).permute(
