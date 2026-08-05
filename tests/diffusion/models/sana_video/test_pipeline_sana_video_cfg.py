@@ -227,6 +227,22 @@ def test_combine_cfg_noise_upcasts_to_fp32_before_combine():
     assert torch.equal(out, expected)
 
 
+def test_combine_cfg_noise_accepts_tuple_predictions_from_gather():
+    """The CFG-parallel gather path hands combine_cfg_noise single-element
+    tuples, not bare tensors; the override must upcast and combine them."""
+    pipe = SanaVideoPipeline.__new__(SanaVideoPipeline)
+    torch.manual_seed(0)
+    pos = torch.randn(1, 4, 2, 4, 4).bfloat16()
+    neg = torch.randn(1, 4, 2, 4, 4).bfloat16()
+    scale = 6.0
+
+    out = pipe.combine_cfg_noise((pos,), (neg,), scale, cfg_normalize=False)
+
+    expected = neg.float() + scale * (pos.float() - neg.float())
+    assert out.dtype == torch.float32
+    assert torch.equal(out, expected)
+
+
 def test_cfg2_dispatch_builds_independent_branch_kwargs(monkeypatch):
     """In CFG world size 2, diffuse must build separate batch-B positive/negative
     kwargs (no pre-cat), and call the mixin with cfg_normalize=False and the

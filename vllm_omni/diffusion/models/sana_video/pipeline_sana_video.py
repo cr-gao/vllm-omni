@@ -37,7 +37,7 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import (
     DistributedAutoencoderKLLTX2Video,
 )
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
-from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin, _wrap
 from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -744,8 +744,8 @@ class SanaVideoPipeline(
     ):
         # fp32 combine so the bf16 all-gather path matches CFG1 bit-for-bit.
         return super().combine_cfg_noise(
-            positive_noise_pred.float(),
-            negative_noise_pred.float(),
+            tuple(p.float() for p in _wrap(positive_noise_pred)),
+            tuple(n.float() for n in _wrap(negative_noise_pred)),
             true_cfg_scale,
             cfg_normalize,
             kwargs,
