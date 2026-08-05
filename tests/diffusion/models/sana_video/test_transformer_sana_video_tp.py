@@ -8,7 +8,6 @@ simulates the shard/reduce logic a real multi-rank run depends on.
 """
 
 import os
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -55,7 +54,7 @@ def force_default_gemm(monkeypatch):
     )
 
 
-def test_distributed_rms_norm_tp1_matches_sana_rms_norm() -> None:
+def test_distributed_rms_norm_tp1_matches_sana_rms_norm(mocker) -> None:
     """TP1 distributed norm must be bit-identical to the checkpoint SanaRMSNorm."""
     dim = 24
     torch.manual_seed(0)
@@ -67,14 +66,14 @@ def test_distributed_rms_norm_tp1_matches_sana_rms_norm() -> None:
     dist.weight.data.copy_(dense.weight.data)
 
     x = torch.randn(2, 5, dim)
-    with patch(f"{_MODULE}.get_tensor_model_parallel_world_size", return_value=1):
-        out = dist(x)
+    mocker.patch(f"{_MODULE}.get_tensor_model_parallel_world_size", return_value=1)
+    out = dist(x)
     ref = dense(x)
 
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
 
 
-def test_distributed_rms_norm_tp1_bf16_weight_matches_sana_rms_norm() -> None:
+def test_distributed_rms_norm_tp1_bf16_weight_matches_sana_rms_norm(mocker) -> None:
     """bf16 weight must follow SanaRMSNorm's cast-to-weight-dtype branch.
 
     An unconditional cast back to the input dtype would diverge here; this pins
@@ -91,15 +90,15 @@ def test_distributed_rms_norm_tp1_bf16_weight_matches_sana_rms_norm() -> None:
     dist.weight.data = dense.weight.data.clone()
 
     x = torch.randn(2, 5, dim, dtype=torch.bfloat16)
-    with patch(f"{_MODULE}.get_tensor_model_parallel_world_size", return_value=1):
-        out = dist(x)
+    mocker.patch(f"{_MODULE}.get_tensor_model_parallel_world_size", return_value=1)
+    out = dist(x)
     ref = dense(x)
 
     assert out.dtype == torch.bfloat16
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
 
 
-def test_distributed_rms_norm_tp2_shards_aggregate_to_dense() -> None:
+def test_distributed_rms_norm_tp2_shards_aggregate_to_dense(mocker) -> None:
     """Two TP2 shards must reproduce dense SanaRMSNorm.
 
     The RMS must use the full (unsharded) hidden size: each rank reduces its
@@ -126,12 +125,10 @@ def test_distributed_rms_norm_tp2_shards_aggregate_to_dense() -> None:
     def fake_all_reduce(tensor: torch.Tensor) -> torch.Tensor:
         return global_sum_sq
 
-    with (
-        patch(f"{_MODULE}.get_tensor_model_parallel_world_size", return_value=tp_size),
-        patch(f"{_MODULE}.tensor_model_parallel_all_reduce", side_effect=fake_all_reduce),
-    ):
-        out0 = dist0(x0)
-        out1 = dist1(x1)
+    mocker.patch(f"{_MODULE}.get_tensor_model_parallel_world_size", return_value=tp_size)
+    mocker.patch(f"{_MODULE}.tensor_model_parallel_all_reduce", side_effect=fake_all_reduce)
+    out0 = dist0(x0)
+    out1 = dist1(x1)
 
     out = torch.cat([out0, out1], dim=-1)
     ref = dense(x)
@@ -153,44 +150,40 @@ def _make_qk_norms(dim: int) -> tuple[SanaDistributedRMSNorm, SanaDistributedRMS
     return norm_q, norm_k
 
 
-def test_fused_qk_matches_separate_norms() -> None:
+def test_fused_qk_matches_separate_norms(mocker) -> None:
     dim = 24
     norm_q, norm_k = _make_qk_norms(dim)
     q = torch.randn(2, 5, dim)
     k = torch.randn(2, 5, dim)
 
-    with (
-        patch(f"{_MODULE}.get_tensor_model_parallel_world_size", return_value=2),
-        patch(f"{_MODULE}.tensor_model_parallel_all_reduce", side_effect=_identity_all_reduce),
-    ):
-        ref_q, ref_k = norm_q(q), norm_k(k)
-        fused_q, fused_k = fused_qk_rms_norm(norm_q, norm_k, q, k)
+    mocker.patch(f"{_MODULE}.get_tensor_model_parallel_world_size", return_value=2)
+    mocker.patch(f"{_MODULE}.tensor_model_parallel_all_reduce", side_effect=_identity_all_reduce)
+    ref_q, ref_k = norm_q(q), norm_k(k)
+    fused_q, fused_k = fused_qk_rms_norm(norm_q, norm_k, q, k)
 
     torch.testing.assert_close(fused_q, ref_q, rtol=0, atol=0)
     torch.testing.assert_close(fused_k, ref_k, rtol=0, atol=0)
 
 
-def test_fused_qk_issues_single_all_reduce_over_packed_pair() -> None:
+def test_fused_qk_issues_single_all_reduce_over_packed_pair(mocker) -> None:
     dim = 24
     norm_q, norm_k = _make_qk_norms(dim)
     q = torch.randn(2, 5, dim)
     k = torch.randn(2, 5, dim)
 
-    with (
-        patch(f"{_MODULE}.get_tensor_model_parallel_world_size", return_value=2),
-        patch(
-            f"{_MODULE}.tensor_model_parallel_all_reduce",
-            side_effect=_identity_all_reduce,
-        ) as mock_ar,
-    ):
-        fused_qk_rms_norm(norm_q, norm_k, q, k)
+    mocker.patch(f"{_MODULE}.get_tensor_model_parallel_world_size", return_value=2)
+    mock_ar = mocker.patch(
+        f"{_MODULE}.tensor_model_parallel_all_reduce",
+        side_effect=_identity_all_reduce,
+    )
+    fused_qk_rms_norm(norm_q, norm_k, q, k)
 
     assert mock_ar.call_count == 1
     packed = mock_ar.call_args[0][0]
     assert packed.shape[-1] == 2
 
 
-def test_distributed_rms_norm_weight_loader_shards_dim0() -> None:
+def test_distributed_rms_norm_weight_loader_shards_dim0(mocker) -> None:
     """Each rank loads its own dim-0 slice of the global affine weight."""
     full_dim, tp_size, rank = 24, 2, 1
     half = full_dim // tp_size
@@ -198,11 +191,9 @@ def test_distributed_rms_norm_weight_loader_shards_dim0() -> None:
     norm = SanaDistributedRMSNorm(half, eps=1e-5)
     full_weight = torch.randn(full_dim)
 
-    with (
-        patch(f"{_MODULE}.get_tensor_model_parallel_world_size", return_value=tp_size),
-        patch(f"{_MODULE}.get_tensor_model_parallel_rank", return_value=rank),
-    ):
-        norm.weight.weight_loader(norm.weight, full_weight)
+    mocker.patch(f"{_MODULE}.get_tensor_model_parallel_world_size", return_value=tp_size)
+    mocker.patch(f"{_MODULE}.get_tensor_model_parallel_rank", return_value=rank)
+    norm.weight.weight_loader(norm.weight, full_weight)
 
     torch.testing.assert_close(norm.weight.data, full_weight[rank * half : (rank + 1) * half])
 

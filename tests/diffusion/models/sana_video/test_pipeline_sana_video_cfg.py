@@ -8,6 +8,7 @@ and the fp32 combine semantics on CPU / mocked distributed. The real all-gather
 path is covered by the multi-process suite, not here.
 """
 
+import pytest
 import torch
 
 from vllm_omni.diffusion.models.sana_video.pipeline_sana_video import SanaVideoPipeline
@@ -15,6 +16,8 @@ from vllm_omni.diffusion.models.sana_video.pipeline_sana_video_i2v import SanaIm
 from vllm_omni.diffusion.models.sana_video.transformer_sana_video import (
     SanaVideoTransformerOutput,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
 def test_predict_noise_calls_transformer_with_return_dict_false():
