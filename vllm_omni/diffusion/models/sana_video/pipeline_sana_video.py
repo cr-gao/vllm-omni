@@ -277,28 +277,19 @@ def _validate_cache_offload_parallelism(od_config: OmniDiffusionConfig) -> None:
     if od_config.enable_distributed_layerwise_offload:
         raise NotImplementedError("SANA-Video does not support distributed layerwise offload.")
 
-    cache_enabled = cache_backend == "cache_dit"
-    offload_enabled = od_config.enable_cpu_offload or od_config.enable_layerwise_offload
-    if not (cache_enabled or offload_enabled):
+    if cache_backend == "none" and not (od_config.enable_cpu_offload or od_config.enable_layerwise_offload):
         return
 
     parallel_config = od_config.parallel_config
-    unsupported = {
-        "tensor_parallel_size": parallel_config.tensor_parallel_size,
-        "cfg_parallel_size": parallel_config.cfg_parallel_size,
-        "sequence_parallel_size": parallel_config.sequence_parallel_size or 1,
-    }
-    enabled_parallelism = {name: size for name, size in unsupported.items() if size > 1}
-    if enabled_parallelism:
-        features = []
-        if cache_enabled:
-            features.append(f"cache_backend={od_config.cache_backend!r}")
-        if offload_enabled:
-            features.append("CPU offload")
-        raise NotImplementedError(
-            "SANA-Video cache/offload is currently supported only with TP1, CFG1, and SP1; "
-            f"requested {', '.join(features)} with {enabled_parallelism}."
-        )
+    for name, size in (
+        ("tensor_parallel_size", parallel_config.tensor_parallel_size),
+        ("cfg_parallel_size", parallel_config.cfg_parallel_size),
+        ("sequence_parallel_size", parallel_config.sequence_parallel_size),
+    ):
+        if size > 1:
+            raise NotImplementedError(
+                f"SANA-Video cache/offload is currently supported only with TP1, CFG1, and SP1; got {name}={size}."
+            )
 
 
 class SanaVideoPipeline(
@@ -395,6 +386,8 @@ class SanaVideoPipeline(
         model = od_config.model
         local_files_only = os.path.exists(model)
         dtype = getattr(od_config, "dtype", torch.bfloat16)
+        # The loader loads components under a default-device context that is CPU
+        # when offload is enabled; runtime placement stays with the offloader.
         component_load_device = torch.get_default_device()
         # Transformer weights are streamed by DiffusersPipelineLoader below.
         # Prefetch only components loaded through from_pretrained here.

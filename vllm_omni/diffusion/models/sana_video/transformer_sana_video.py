@@ -840,8 +840,6 @@ class SanaVideoTransformer3DModel(nn.Module):
         block_forward_patterns={
             "transformer_blocks": ForwardPattern.Pattern_3,
         },
-        has_separate_cfg=False,
-        check_forward_pattern=True,
     )
     _layerwise_offload_blocks_attrs = ["transformer_blocks"]
 
