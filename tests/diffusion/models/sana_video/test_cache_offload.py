@@ -109,6 +109,7 @@ def test_cache_dit_pattern_mismatch_fails_closed(monkeypatch):
         {"cache_backend": "cache_dit"},
         {"enable_cpu_offload": True},
         {"enable_layerwise_offload": True},
+        {"enable_distributed_layerwise_offload": True},
     ],
 )
 @pytest.mark.parametrize(
@@ -131,6 +132,17 @@ def test_sana_video_rejects_unvalidated_cache_backends():
         _validate_cache_offload_parallelism(OmniDiffusionConfig(cache_backend="tea_cache"))
 
 
+def test_sana_video_rejects_cache_dit_with_distributed_layerwise_offload():
+    config = OmniDiffusionConfig(cache_backend="cache_dit", enable_distributed_layerwise_offload=True)
+
+    with pytest.raises(NotImplementedError, match="Cache-DiT with distributed layerwise offload"):
+        _validate_cache_offload_parallelism(config)
+
+
+def test_sana_video_accepts_distributed_layerwise_offload():
+    _validate_cache_offload_parallelism(OmniDiffusionConfig(enable_distributed_layerwise_offload=True))
+
+
 @pytest.mark.parametrize(
     ("od_config", "match"),
     [
@@ -142,8 +154,8 @@ def test_sana_video_rejects_unvalidated_cache_backends():
             "tensor_parallel_size",
         ),
         (
-            OmniDiffusionConfig(enable_distributed_layerwise_offload=True),
-            "does not support distributed layerwise offload",
+            OmniDiffusionConfig(cache_backend="cache_dit", enable_distributed_layerwise_offload=True),
+            "Cache-DiT with distributed layerwise offload",
         ),
     ],
 )

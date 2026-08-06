@@ -202,6 +202,9 @@ Add one of the following flag sets to either native offline command above:
 
 # Cache-DiT plus layerwise offload
 --cache-backend cache_dit --enable-layerwise-offload
+
+# Distributed layerwise offload (weights sharded across the DP group)
+--enable-distributed-layerwise-offload
 ```
 
 If both CPU offload flags are supplied, the common offloader keeps its existing
@@ -211,8 +214,9 @@ default to 50 inference steps.
 
 Cache-DiT and CPU offload require TP1, CFG1, and SP1. Combining them with
 tensor, CFG, or sequence parallelism raises before checkpoint components are
-loaded, as do other cache backends such as TeaCache and distributed layerwise
-offload.
+loaded, as do other cache backends such as TeaCache. Cache-DiT cannot be
+combined with distributed layerwise offload: per-rank cache skips would
+desynchronize the weight AllGather.
 
 #### Notes
 
@@ -230,9 +234,9 @@ offload.
   The denoising loop intentionally retains the checkpoint-compatible
   Diffusers `DPMSolverMultistepScheduler`.
 - Known limitations:
-    - Cache-DiT and CPU offload are limited to TP1/CFG1/SP1. Distributed
-    layerwise offload, other distributed combinations, TeaCache, and step
-    execution are not supported by the native pipeline.
+    - Cache-DiT and CPU offload are limited to TP1/CFG1/SP1. Cache-DiT with
+    distributed layerwise offload, TeaCache, and step execution are not
+    supported by the native pipeline.
     - Cache-DiT and CPU offload are not yet validated with real weights; no
     speedup or memory-reduction claim is made.
     - The Diffusers backend is a compatibility path and does not provide native
