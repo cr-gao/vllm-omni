@@ -180,21 +180,10 @@ validated compatibility/reference backend.
 
 #### Native Cache-DiT and CPU offload
 
-The native T2V and I2V pipelines expose Cache-DiT, model-level CPU offload,
-and layerwise CPU offload through the common diffusion flags. These paths use
-the SANA transformer's `transformer_blocks` metadata. Layerwise mode keeps
-non-block transformer modules, the text encoder, and the VAE resident on the
+The native T2V and I2V pipelines support Cache-DiT, model-level CPU offload,
+and layerwise CPU offload through the common diffusion flags. Layerwise mode
+keeps non-block transformer modules, the text encoder, and the VAE on the
 runtime device while prefetching DiT blocks in order.
-
-| Cache-DiT | Model CPU offload | Layerwise offload | Draft status |
-|---|---:|---:|---|
-| on | off | off | Implemented |
-| off | on | off | Implemented |
-| off | off | on | Implemented |
-| on | on | off | Implemented |
-| on | off | on | Implemented |
-
-All five combinations still require real-weight GPU validation.
 
 Add one of the following flag sets to either native offline command above:
 
@@ -220,15 +209,10 @@ layerwise precedence. Cache-DiT refreshes each request from the explicit
 `num_inference_steps`; when that field is omitted, both native SANA pipelines
 default to 50 inference steps.
 
-These combinations are intentionally limited to TP1, CFG1, and SP1. Combining
-Cache-DiT or CPU offload with tensor, CFG, or sequence parallelism raises before
-checkpoint components are loaded. Other cache backends, including TeaCache,
-are not enabled for the native SANA pipelines by this integration. Distributed
-layerwise offload is unsupported and always raises before component loading.
-
-Real 480p/720p golden similarity, peak GPU/host memory, transfer cost, and
-same-GPU Cache-DiT speedup have not been validated. This draft makes no
-performance or memory-reduction claim.
+Cache-DiT and CPU offload require TP1, CFG1, and SP1. Combining them with
+tensor, CFG, or sequence parallelism raises before checkpoint components are
+loaded, as do other cache backends such as TeaCache and distributed layerwise
+offload.
 
 #### Notes
 
@@ -249,6 +233,8 @@ performance or memory-reduction claim.
     - Cache-DiT and CPU offload are limited to TP1/CFG1/SP1. Distributed
     layerwise offload, other distributed combinations, TeaCache, and step
     execution are not supported by the native pipeline.
+    - Cache-DiT and CPU offload are not yet validated with real weights; no
+    speedup or memory-reduction claim is made.
     - The Diffusers backend is a compatibility path and does not provide native
     vLLM-Omni parallelism or continuous batching.
     - Native describes pipeline and Transformer ownership, not a zero-Diffusers
