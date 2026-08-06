@@ -152,6 +152,7 @@ class FlashAttentionImpl(AttentionImpl):
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
         from vllm_omni.diffusion.attention.backends.utils.fa import (
+            _index_first_axis,
             _pad_input,
             _unpad_input,
             _upad_input,
@@ -159,10 +160,21 @@ class FlashAttentionImpl(AttentionImpl):
         )
 
         assert attention_mask.ndim == 2, "attention_mask must be 2D, (batch_size, seq_len)"
-        query_length = query.size(1)
-        q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_input(
-            query, key, value, attention_mask, query_length, _unpad_input
-        )
+        batch_size, query_length = query.shape[:2]
+        if query_length == key.size(1):
+            q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_input(
+                query, key, value, attention_mask, query_length, _unpad_input
+            )
+        else:
+            # Cross-attention: the mask covers keys only, so keep every query row.
+            k, indices_k, cu_seq_lens_k, max_length_k, _ = _unpad_input(key, attention_mask)
+            v = _index_first_axis(value, indices_k)
+            q = query.flatten(0, 1)
+            cu_seq_lens_q = torch.arange(
+                0, (batch_size + 1) * query_length, query_length, dtype=torch.int32, device=query.device
+            )
+            max_length_q = query_length
+            indices_q = None
 
         out_unpad = flash_attn_varlen_func(
             q,
@@ -178,7 +190,9 @@ class FlashAttentionImpl(AttentionImpl):
             },
         )
         out_unpad = self._unwrap_flash_output(out_unpad)
-        return _pad_input(out_unpad, indices_q, query.size(0), query_length)
+        if indices_q is None:
+            return out_unpad.reshape(batch_size, query_length, *out_unpad.shape[1:])
+        return _pad_input(out_unpad, indices_q, batch_size, query_length)
 
     def _forward_varlen_packed(
         self,
