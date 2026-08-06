@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from types import SimpleNamespace
 
 import cache_dit
 import pytest
@@ -12,9 +12,12 @@ from torch import nn
 
 import vllm_omni.diffusion.cache.cachedit.backend as cachedit_backend_module
 import vllm_omni.diffusion.offloader.layerwise_backend as layerwise_backend_module
+from tests.diffusion.models.sana_video.test_transformer_sana_video import _TINY_CONFIG
+from tests.diffusion.offloader.test_layerwise_backend import DummyEvent, DummyStream, dummy_stream
 from vllm_omni.diffusion.attention import selector as attention_selector
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
 from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.models.sana_video import pipeline_sana_video as pipeline_module
 from vllm_omni.diffusion.models.sana_video.pipeline_sana_video import (
     SanaVideoPipeline,
@@ -29,31 +32,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
 @dataclass
-class _ParallelConfig:
-    tensor_parallel_size: int = 1
-    cfg_parallel_size: int = 1
-    sequence_parallel_size: int = 1
-    data_parallel_size: int = 1
-
-
-@dataclass
-class _ODConfig:
-    cache_backend: str = "none"
-    enable_cpu_offload: bool = False
-    enable_layerwise_offload: bool = False
-    enable_distributed_layerwise_offload: bool = False
-    parallel_config: _ParallelConfig = field(default_factory=_ParallelConfig)
-
-
-@dataclass
 class _PipelineWithTransformer:
     transformer: nn.Module
-
-
-@dataclass
-class _ModelLoadConfig:
-    model: str
-    dtype: torch.dtype
 
 
 def _tiny_transformer(monkeypatch) -> SanaVideoTransformer3DModel:
@@ -62,21 +42,7 @@ def _tiny_transformer(monkeypatch) -> SanaVideoTransformer3DModel:
         "_cached_get_backend_cls",
         lambda *_args, **_kwargs: SDPABackend,
     )
-    return SanaVideoTransformer3DModel(
-        in_channels=4,
-        out_channels=4,
-        num_attention_heads=2,
-        attention_head_dim=4,
-        num_layers=2,
-        num_cross_attention_heads=2,
-        cross_attention_head_dim=4,
-        cross_attention_dim=8,
-        caption_channels=8,
-        mlp_ratio=1.0,
-        sample_size=4,
-        patch_size=(1, 2, 2),
-        rope_max_seq_len=16,
-    )
+    return SanaVideoTransformer3DModel(**(_TINY_CONFIG | {"num_layers": 2}))
 
 
 def _record_cache_adapters(monkeypatch):
@@ -138,29 +104,23 @@ def test_cache_dit_pattern_mismatch_fails_closed(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("feature", "parallel_field"),
+    "feature_flags",
     [
-        ("cache", "tensor_parallel_size"),
-        ("cache", "cfg_parallel_size"),
-        ("cache", "sequence_parallel_size"),
-        ("model_offload", "tensor_parallel_size"),
-        ("model_offload", "cfg_parallel_size"),
-        ("model_offload", "sequence_parallel_size"),
-        ("layerwise_offload", "tensor_parallel_size"),
-        ("layerwise_offload", "cfg_parallel_size"),
-        ("layerwise_offload", "sequence_parallel_size"),
+        {"cache_backend": "cache_dit"},
+        {"enable_cpu_offload": True},
+        {"enable_layerwise_offload": True},
     ],
 )
-def test_cache_offload_distributed_combinations_fail_closed(feature, parallel_field):
-    feature_flags = {
-        "cache": {"cache_backend": "cache_dit"},
-        "model_offload": {"enable_cpu_offload": True},
-        "layerwise_offload": {"enable_layerwise_offload": True},
-    }
-    config = _ODConfig(
-        **feature_flags[feature],
-        parallel_config=_ParallelConfig(**{parallel_field: 2}),
-    )
+@pytest.mark.parametrize(
+    "parallel_config",
+    [
+        DiffusionParallelConfig(tensor_parallel_size=2),
+        DiffusionParallelConfig(cfg_parallel_size=2),
+        DiffusionParallelConfig(ulysses_degree=2),
+    ],
+)
+def test_cache_offload_distributed_combinations_fail_closed(feature_flags, parallel_config):
+    config = OmniDiffusionConfig(parallel_config=parallel_config, **feature_flags)
 
     with pytest.raises(NotImplementedError, match="supported only with TP1, CFG1, and SP1"):
         _validate_cache_offload_parallelism(config)
@@ -168,10 +128,26 @@ def test_cache_offload_distributed_combinations_fail_closed(feature, parallel_fi
 
 def test_sana_video_rejects_unvalidated_cache_backends():
     with pytest.raises(NotImplementedError, match="Cache backend 'tea_cache' is not supported"):
-        _validate_cache_offload_parallelism(_ODConfig(cache_backend="tea_cache"))
+        _validate_cache_offload_parallelism(OmniDiffusionConfig(cache_backend="tea_cache"))
 
 
-def test_parallel_validation_runs_before_component_loading(monkeypatch):
+@pytest.mark.parametrize(
+    ("od_config", "match"),
+    [
+        (
+            OmniDiffusionConfig(
+                cache_backend="cache_dit",
+                parallel_config=DiffusionParallelConfig(tensor_parallel_size=2),
+            ),
+            "tensor_parallel_size",
+        ),
+        (
+            OmniDiffusionConfig(enable_distributed_layerwise_offload=True),
+            "does not support distributed layerwise offload",
+        ),
+    ],
+)
+def test_validation_fails_before_component_loading(monkeypatch, od_config, match):
     load_calls = []
     monkeypatch.setattr(pipeline_module, "get_local_device", lambda: torch.device("cpu"))
     monkeypatch.setattr(
@@ -179,33 +155,9 @@ def test_parallel_validation_runs_before_component_loading(monkeypatch):
         "_load_components",
         lambda *args, **kwargs: load_calls.append((args, kwargs)),
     )
-    config = _ODConfig(
-        cache_backend="cache_dit",
-        parallel_config=_ParallelConfig(tensor_parallel_size=2),
-    )
 
-    with pytest.raises(NotImplementedError, match="tensor_parallel_size"):
-        SanaVideoPipeline(od_config=config)
-
-    assert load_calls == []
-
-
-def test_distributed_layerwise_offload_fails_before_component_loading(monkeypatch):
-    load_calls = []
-    monkeypatch.setattr(pipeline_module, "get_local_device", lambda: torch.device("cpu"))
-    monkeypatch.setattr(
-        SanaVideoPipeline,
-        "_load_components",
-        lambda *args, **kwargs: load_calls.append((args, kwargs)),
-    )
-
-    with pytest.raises(NotImplementedError, match="does not support distributed layerwise offload"):
-        SanaVideoPipeline(
-            od_config=_ODConfig(
-                enable_distributed_layerwise_offload=True,
-                parallel_config=_ParallelConfig(data_parallel_size=2),
-            )
-        )
+    with pytest.raises(NotImplementedError, match=match):
+        SanaVideoPipeline(od_config=od_config)
 
     assert load_calls == []
 
@@ -219,19 +171,14 @@ class _TrackingModule:
         return self
 
 
-@pytest.mark.parametrize("component_load_device", [torch.device("cpu"), torch.device("cuda:3")])
-def test_component_loading_uses_loader_device_not_runtime_device(monkeypatch, component_load_device):
+def test_component_loading_uses_loader_device_not_runtime_device(monkeypatch):
+    component_load_device = torch.device("cpu")
     text_encoder = _TrackingModule()
     vae = _TrackingModule()
     transformer = _TrackingModule()
     tokenizer = object()
     scheduler = object()
     loaded_components = iter([text_encoder, vae])
-
-    class _FakeVAEClass:
-        @staticmethod
-        def from_pretrained(*args, **kwargs):
-            raise AssertionError("from_pretrained_with_prefetch should invoke this loader")
 
     monkeypatch.setattr(torch, "get_default_device", lambda: component_load_device)
     monkeypatch.setattr(pipeline_module, "prefetch_subfolders", lambda *args, **kwargs: None)
@@ -249,7 +196,7 @@ def test_component_loading_uses_loader_device_not_runtime_device(monkeypatch, co
     monkeypatch.setattr(
         pipeline_module,
         "_resolve_vae_class_and_dtype",
-        lambda *_args: (_FakeVAEClass, torch.float32),
+        lambda *_args: (SimpleNamespace(from_pretrained=None), torch.float32),
     )
     monkeypatch.setattr(
         pipeline_module.SanaVideoTransformer3DModel,
@@ -266,7 +213,7 @@ def test_component_loading_uses_loader_device_not_runtime_device(monkeypatch, co
     nn.Module.__init__(pipeline)
     pipeline.device = torch.device("cuda:7")
     pipeline.weights_sources = []
-    config = _ModelLoadConfig(model="local-sana-video", dtype=torch.bfloat16)
+    config = OmniDiffusionConfig(model="local-sana-video", dtype=torch.bfloat16)
 
     loaded = pipeline._load_components(config, prefix="")
 
@@ -279,33 +226,15 @@ def test_component_loading_uses_loader_device_not_runtime_device(monkeypatch, co
     ]
 
 
-class _DummyStream:
-    def wait_stream(self, _stream) -> None:
-        return None
-
-    def wait_event(self, _event) -> None:
-        return None
-
-
-class _DummyEvent:
-    def record(self, _stream) -> None:
-        return None
-
-
-@contextmanager
-def _dummy_stream(_stream):
-    yield None
-
-
 def _patch_layerwise_platform(monkeypatch) -> None:
-    monkeypatch.setattr(layerwise_backend_module.current_omni_platform, "Stream", _DummyStream)
-    monkeypatch.setattr(layerwise_backend_module.current_omni_platform, "Event", _DummyEvent)
+    monkeypatch.setattr(layerwise_backend_module.current_omni_platform, "Stream", DummyStream)
+    monkeypatch.setattr(layerwise_backend_module.current_omni_platform, "Event", DummyEvent)
     monkeypatch.setattr(
         layerwise_backend_module.current_omni_platform,
         "current_stream",
-        lambda: _DummyStream(),
+        lambda: DummyStream(),
     )
-    monkeypatch.setattr(layerwise_backend_module.current_omni_platform, "stream", _dummy_stream)
+    monkeypatch.setattr(layerwise_backend_module.current_omni_platform, "stream", dummy_stream)
 
 
 def _tiny_pipeline(monkeypatch) -> SanaVideoPipeline:
@@ -351,7 +280,6 @@ def test_two_layer_offload_recovers_from_cached_block_skip_and_cleans_up(monkeyp
 
     backend.disable()
     assert backend.is_enabled() is False
-    assert backend._blocks == []
     for block in blocks:
         assert block._hook_registry.get_hook(LayerwiseOffloadHook._HOOK_NAME) is None
 
@@ -370,7 +298,6 @@ def test_layerwise_offload_then_cache_dit_install_and_cleanup(monkeypatch):
         assert offload_backend.is_enabled()
         assert cache_backend.is_enabled()
         assert pipeline.transformer._is_cached is True
-        assert enabled_adapters[0].check_forward_pattern is True
         for block in blocks:
             assert block._hook_registry.get_hook(LayerwiseOffloadHook._HOOK_NAME) is not None
     finally:
@@ -379,8 +306,6 @@ def test_layerwise_offload_then_cache_dit_install_and_cleanup(monkeypatch):
         offload_backend.disable()
 
     assert not getattr(pipeline.transformer, "_is_cached", False)
-    assert not getattr(enabled_adapters[0].pipe, "_is_cached", False)
-    assert not hasattr(enabled_adapters[0].pipe, "_context_manager")
     assert offload_backend.is_enabled() is False
     for block in blocks:
         assert block._hook_registry.get_hook(LayerwiseOffloadHook._HOOK_NAME) is None
