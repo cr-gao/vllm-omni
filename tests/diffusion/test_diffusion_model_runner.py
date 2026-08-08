@@ -14,6 +14,7 @@ from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.diffusion]
 
@@ -133,12 +134,7 @@ class _CompileTrackingModel:
 
 
 def _make_request():
-    sampling_params = SimpleNamespace(
-        generator=None,
-        seed=None,
-        generator_device=None,
-        num_inference_steps=4,
-    )
+    sampling_params = OmniDiffusionSamplingParams(num_inference_steps=4)
     return SimpleNamespace(
         request_id="req-test",
         prompt="a prompt",
@@ -238,21 +234,29 @@ class _EnabledCacheBackend:
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_refresh_cache_uses_request_steps_before_pipeline_default():
+def test_refresh_cache_prefers_request_steps_then_schedule_then_pipeline_default():
     cache_backend = _EnabledCacheBackend()
     runner = _make_runner(cache_backend=cache_backend, cache_backend_name="cache_dit")
     runner.pipeline.default_num_inference_steps = 50
     req = _make_request()
 
-    for num_inference_steps in (20, None, 30):
+    custom_timesteps = torch.linspace(999.0, 0.0, 8)
+    custom_sigmas = [0.9, 0.5, 0.1]
+    cases = [
+        (20, None, None),
+        (30, custom_timesteps, custom_sigmas),
+        (None, custom_timesteps, None),
+        (None, custom_timesteps, custom_sigmas),
+        (None, None, custom_sigmas),
+        (None, None, None),
+    ]
+    for num_inference_steps, timesteps, sigmas in cases:
         req.sampling_params.num_inference_steps = num_inference_steps
+        req.sampling_params.timesteps = timesteps
+        req.sampling_params.sigmas = sigmas
         DiffusionModelRunner._refresh_cache_for_requests(runner, [req], od_config=runner.od_config)
 
-    assert cache_backend.refresh_calls == [
-        (runner.pipeline, 20, True),
-        (runner.pipeline, 50, True),
-        (runner.pipeline, 30, True),
-    ]
+    assert [steps for _, steps, _ in cache_backend.refresh_calls] == [20, 30, 8, 8, 3, 50]
 
 
 @pytest.mark.core_model
