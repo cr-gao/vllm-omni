@@ -464,3 +464,23 @@ def test_tiny_transformer_sp2_lockstep_matches_dense(tp1_group, force_default_ge
     # Reduction-reorder noise amplified by the unit-normal test weights; any
     # sharding misalignment is orders of magnitude above this.
     torch.testing.assert_close(outs[0], ref, rtol=1e-3, atol=1e-3)
+
+
+def test_transformer_declares_empty_sp_plan() -> None:
+    """Empty plan: the registry takes its normal SP enablement path with zero
+    hooks and no misleading 'no _sp_plan found' warning; sharding is manual."""
+    from vllm_omni.diffusion.models.sana_video import SanaVideoTransformer3DModel
+
+    assert SanaVideoTransformer3DModel._sp_plan == {}
+
+
+def test_dummy_run_num_frames_covers_max_sp_degree() -> None:
+    """Engine warmup must produce enough latent frames for every allowed SP
+    degree on both VAE variants (temporal /4 and /8); one pixel frame would
+    fail the per-rank frame check at startup."""
+    from vllm_omni.diffusion.models.sana_video import SanaImageToVideoPipeline, SanaVideoPipeline
+
+    for temporal_scale in (4, 8):
+        latent_frames = (SanaVideoPipeline.dummy_run_num_frames - 1) // temporal_scale + 1
+        assert latent_frames >= 4
+    assert SanaImageToVideoPipeline.dummy_run_num_frames == SanaVideoPipeline.dummy_run_num_frames

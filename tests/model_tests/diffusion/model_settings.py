@@ -57,6 +57,8 @@ DIFFUSION_TEST_SETTINGS = {
             [DiffusionAccs.TENSOR_PARALLEL],
             [DiffusionAccs.CFG_PARALLEL],
             [DiffusionAccs.TENSOR_PARALLEL, DiffusionAccs.CFG_PARALLEL],
+            [DiffusionAccs.SEQUENCE_PARALLEL],
+            [DiffusionAccs.SEQUENCE_PARALLEL, DiffusionAccs.CFG_PARALLEL],
         ],
         check_multi_output=False,
     ),
@@ -67,6 +69,8 @@ DIFFUSION_TEST_SETTINGS = {
         extra_test_groups=[
             [DiffusionAccs.CFG_PARALLEL],
             [DiffusionAccs.TENSOR_PARALLEL, DiffusionAccs.CFG_PARALLEL],
+            [DiffusionAccs.SEQUENCE_PARALLEL],
+            [DiffusionAccs.SEQUENCE_PARALLEL, DiffusionAccs.CFG_PARALLEL],
         ],
         check_i2v_t2v_divergence=False,
         check_multi_output=False,

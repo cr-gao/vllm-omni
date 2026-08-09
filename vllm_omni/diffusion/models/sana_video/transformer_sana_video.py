@@ -49,12 +49,22 @@ def validate_sana_video_parallel_config(parallel_config) -> None:
         raise NotImplementedError(
             f"SANA-Video supports cfg_parallel_size 1 or 2, got {cfg_size}. Set --cfg-parallel-size to 1 or 2."
         )
-    sp_size = parallel_config.sequence_parallel_size
-    if sp_size is not None and sp_size > 1:
+    sp_size = parallel_config.sequence_parallel_size or 1
+    if sp_size not in (1, 2, 4):
         raise NotImplementedError(
-            "Sequence parallel is not supported for SANA-Video: its linear attention and "
-            "GLUMB temporal conv have no SANA-specific SP implementation. Use tensor and/or "
-            "CFG parallel instead."
+            f"SANA-Video supports sequence_parallel_size 1, 2 or 4, got {sp_size}. Set --usp to 1, 2 or 4."
+        )
+    if parallel_config.ring_degree > 1:
+        raise NotImplementedError(
+            "SANA-Video does not support ring sequence parallel: its linear attention has no "
+            "log-sum-exp state to merge across ring stages. Use --usp for sequence parallel."
+        )
+    if parallel_config.allgather_degree > 1:
+        raise NotImplementedError("SANA-Video does not support AllGather-KV sequence parallel. Use --usp instead.")
+    if tp_size > 1 and sp_size > 1:
+        raise NotImplementedError(
+            "SANA-Video does not support combining tensor parallel with sequence parallel. "
+            "Use one of them, optionally with CFG parallel."
         )
     if parallel_config.pipeline_parallel_size > 1:
         raise NotImplementedError("SANA-Video does not support pipeline parallel. Set --pipeline-parallel-size to 1.")
@@ -1015,6 +1025,10 @@ class SanaVideoTransformer3DModel(nn.Module):
     """
 
     _no_split_modules = ["SanaVideoTransformerBlock", "SanaModulatedNorm"]
+
+    # SP is implemented manually in forward (frame-aligned uneven sharding);
+    # the empty plan enables the registry's SP path with zero generic hooks.
+    _sp_plan = {}
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return AutoWeightsLoader(self).load_weights(weights)
