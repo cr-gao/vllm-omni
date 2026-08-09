@@ -9,11 +9,15 @@ process simulates the shard/reduce logic a real multi-rank run depends on.
 """
 
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import torch
 
 from vllm_omni.diffusion.models.sana_video.transformer_sana_video import (
+    GLUMBTempConv,
+    SanaAdaLayerNormSingle,
     SanaLinearAttention,
     _sp_frame_split_sizes,
     _sp_gather_frames,
@@ -234,3 +238,229 @@ def test_gather_frames_roundtrips_uneven_shards(num_frames, world_size, mocker) 
         gathered = _sp_gather_frames(locals_[rank], sizes)
 
         torch.testing.assert_close(gathered, full, rtol=0, atol=0)
+
+
+# ── GLUMB conv_temp halo exchange ──
+
+
+class _ReplaySpGather:
+    """Two-pass stand-in for the SP all-gather: pass 1 records each rank's
+    boundary frames, pass 2 replays the full rank-ordered list."""
+
+    def __init__(self, world_size: int) -> None:
+        self.world_size = world_size
+        self.recorded: list[torch.Tensor] = []
+        self.replay = False
+
+    def all_gather(self, tensor: torch.Tensor, dim: int = 0, separate_tensors: bool = False):
+        assert separate_tensors, "halo exchange must request per-rank tensors"
+        if not self.replay:
+            self.recorded.append(tensor.clone())
+            return [tensor.clone() for _ in range(self.world_size)]
+        assert all(part.shape == tensor.shape for part in self.recorded), "all_gather requires equal shards"
+        return [part.clone() for part in self.recorded]
+
+
+def _make_glumb(mocker) -> GLUMBTempConv:
+    mocker.patch(f"{_MODULE}.get_tensor_model_parallel_world_size", return_value=1)
+    mocker.patch(f"{_MODULE}.get_tensor_model_parallel_rank", return_value=0)
+    torch.manual_seed(0)
+    glumb = GLUMBTempConv(4, 4, 2.0, norm_type=None, residual_connection=False)
+    glumb.eval()
+    for _, param in sorted(glumb.named_parameters()):
+        param.data.normal_()
+    return glumb
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_glumb_conv_temp_sp_halo_matches_dense(world_size, mocker) -> None:
+    """Frame shards with neighbour boundary frames exchanged must reproduce the
+    dense temporal conv, including zero padding at the global first/last frame."""
+    glumb = _make_glumb(mocker)
+    num_frames = 5
+    torch.manual_seed(1)
+    x = torch.randn(2, num_frames, 3, 3, 4)
+
+    with torch.no_grad():
+        ref = glumb(x)
+
+    sizes = _sp_frame_split_sizes(num_frames, world_size)
+    shards = [shard.contiguous() for shard in x.split(sizes, dim=1)]
+    fake_group = _ReplaySpGather(world_size)
+    mocker.patch(f"{_MODULE}.get_sequence_parallel_world_size", return_value=world_size)
+    mocker.patch(f"{_MODULE}.get_sp_group", return_value=fake_group)
+
+    def run_ranks() -> list[torch.Tensor]:
+        outs = []
+        for rank in range(world_size):
+            mocker.patch(f"{_MODULE}.get_sequence_parallel_rank", return_value=rank)
+            with torch.no_grad():
+                outs.append(glumb(shards[rank]))
+        return outs
+
+    run_ranks()
+    assert len(fake_group.recorded) == world_size
+    fake_group.replay = True
+    out = torch.cat(run_ranks(), dim=1)
+
+    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+
+
+# ── I2V per-token timestep frame slicing ──
+
+
+def test_i2v_timestep_frame_slice_matches_dense_token_region() -> None:
+    """Slicing the 5D timestep along its frame dim before the per-token
+    time-embed MLP must match the dense modulation for the same token region.
+
+    The sinusoidal projection is bitwise under slicing; the MLP is only equal
+    up to CPU GEMM blocking, which depends on the row count. A wrongly sliced
+    frame produces O(1) differences, far outside this tolerance."""
+    dim = 24
+    torch.manual_seed(0)
+    layer = SanaAdaLayerNormSingle(dim).eval()
+
+    batch, num_frames, height, width = 2, 5, 2, 3
+    timestep = torch.rand(batch, 1, num_frames, height, width) * 1000.0
+
+    with torch.no_grad():
+        dense_mod, dense_emb = layer(timestep.flatten(), batch_size=batch, hidden_dtype=torch.float32)
+    dense_mod = dense_mod.view(batch, -1, dense_mod.size(-1))
+    dense_emb = dense_emb.view(batch, -1, dense_emb.size(-1))
+
+    sizes = _sp_frame_split_sizes(num_frames, 2)
+    start = 0
+    for rank, size in enumerate(sizes):
+        local = timestep.split(sizes, dim=2)[rank]
+        with torch.no_grad():
+            local_mod, local_emb = layer(local.flatten(), batch_size=batch, hidden_dtype=torch.float32)
+        local_mod = local_mod.view(batch, -1, local_mod.size(-1))
+        local_emb = local_emb.view(batch, -1, local_emb.size(-1))
+
+        lo, hi = start * height * width, (start + size) * height * width
+        torch.testing.assert_close(local_mod, dense_mod[:, lo:hi], rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(local_emb, dense_emb[:, lo:hi], rtol=1e-5, atol=1e-6)
+        start += size
+
+
+# ── full-model lockstep parity ──
+
+
+_TINY_SP_CONFIG = {
+    "in_channels": 4,
+    "out_channels": 4,
+    "num_attention_heads": 2,
+    "attention_head_dim": 12,
+    "num_layers": 2,
+    "num_cross_attention_heads": 2,
+    "cross_attention_head_dim": 12,
+    "cross_attention_dim": 24,
+    "caption_channels": 8,
+    "mlp_ratio": 2.0,
+    "patch_size": (1, 2, 2),
+    "sample_size": 4,
+    "rope_max_seq_len": 64,
+}
+
+
+class _LockstepSpGroup:
+    """Barrier-synchronized collectives so rank threads run true lockstep SP in
+    one process; records per-call inputs so tests can prove ranks computed on
+    different shards."""
+
+    def __init__(self, world_size: int, tls: threading.local) -> None:
+        self.world_size = world_size
+        self.tls = tls
+        self.barrier = threading.Barrier(world_size)
+        self.slots: list[torch.Tensor | None] = [None] * world_size
+        self.reduce_inputs: list[list[torch.Tensor]] = []
+        self.gather_calls = 0
+        self.lock = threading.Lock()
+
+    def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
+        self.slots[self.tls.rank] = tensor
+        self.barrier.wait(timeout=60)
+        total = self.slots[0].clone()
+        for part in self.slots[1:]:
+            total = total + part
+        if self.tls.rank == 0:
+            self.reduce_inputs.append([part.clone() for part in self.slots])
+        self.barrier.wait(timeout=60)
+        return total
+
+    def all_gather(self, tensor: torch.Tensor, dim: int = 0, separate_tensors: bool = False):
+        assert separate_tensors
+        self.slots[self.tls.rank] = tensor
+        self.barrier.wait(timeout=60)
+        assert all(part.shape == tensor.shape for part in self.slots), "all_gather requires equal shards"
+        parts = [part.clone() for part in self.slots]
+        if self.tls.rank == 0:
+            with self.lock:
+                self.gather_calls += 1
+        self.barrier.wait(timeout=60)
+        return parts
+
+
+@pytest.mark.parametrize("task", ["t2v", "i2v"])
+def test_tiny_transformer_sp2_lockstep_matches_dense(tp1_group, force_default_gemm, mocker, task) -> None:
+    """Two lockstep rank threads over uneven frame shards must reproduce the
+    dense tiny-transformer output, and must actually have sharded the work."""
+    from vllm_omni.diffusion.models.sana_video import SanaVideoTransformer3DModel
+
+    torch.manual_seed(3)
+    model = SanaVideoTransformer3DModel(**_TINY_SP_CONFIG).eval()
+    for _, param in sorted(model.named_parameters()):
+        param.data.normal_()
+    batch, frames, height, width = 2, 5, 4, 4
+    torch.manual_seed(11)
+    latent = torch.randn(batch, 4, frames, height, width)
+    encoder_hidden_states = torch.randn(batch, 6, 8)
+    encoder_attention_mask = torch.tensor([[1, 1, 1, 1, 1, 0], [1, 1, 1, 1, 1, 1]])
+    if task == "t2v":
+        timestep = torch.tensor([500.0, 700.0])
+    else:
+        timestep = torch.rand(batch, 1, frames, height // 2, width // 2) * 1000.0
+
+    with torch.no_grad():
+        ref = model(
+            latent,
+            encoder_hidden_states,
+            timestep,
+            encoder_attention_mask=encoder_attention_mask,
+            return_dict=False,
+        )[0]
+
+    world_size = 2
+    tls = threading.local()
+    group = _LockstepSpGroup(world_size, tls)
+    mocker.patch(f"{_MODULE}.get_sequence_parallel_world_size", return_value=world_size)
+    mocker.patch(f"{_MODULE}.get_sequence_parallel_rank", side_effect=lambda: tls.rank)
+    mocker.patch(f"{_MODULE}.get_sp_group", return_value=group)
+
+    def run_rank(rank: int) -> torch.Tensor:
+        tls.rank = rank
+        with torch.no_grad():
+            return model(
+                latent,
+                encoder_hidden_states,
+                timestep,
+                encoder_attention_mask=encoder_attention_mask,
+                return_dict=False,
+            )[0]
+
+    with ThreadPoolExecutor(max_workers=world_size) as pool:
+        outs = list(pool.map(run_rank, range(world_size)))
+
+    num_layers = _TINY_SP_CONFIG["num_layers"]
+    # One attn1 state reduce per block, its inputs distinct per rank (the ranks
+    # really processed different frames), one halo gather per block plus the
+    # final frame gather.
+    assert len(group.reduce_inputs) == num_layers
+    for parts in group.reduce_inputs:
+        assert not torch.equal(parts[0], parts[1])
+    assert group.gather_calls == num_layers + 1
+
+    torch.testing.assert_close(outs[1], outs[0], rtol=0, atol=0)
+    # Reduction-reorder noise amplified by the unit-normal test weights; any
+    # sharding misalignment is orders of magnitude above this.
+    torch.testing.assert_close(outs[0], ref, rtol=1e-3, atol=1e-3)

@@ -550,7 +550,23 @@ class GLUMBTempConv(nn.Module):
         hidden_states_temporal = hidden_states.view(batch_size, num_frames, num_channels, height * width).permute(
             0, 2, 1, 3
         )
-        hidden_states = hidden_states_temporal + self.conv_temp(hidden_states_temporal)
+        if get_sequence_parallel_world_size() > 1:
+            # The temporal conv reads one frame across each shard boundary.
+            # Every rank contributes its (first, last) frame pair; the global
+            # first/last rank keeps the dense zero padding on its outer side.
+            x = hidden_states_temporal
+            boundary = torch.cat([x[:, :, :1], x[:, :, -1:]], dim=2)
+            parts = get_sp_group().all_gather(boundary, dim=0, separate_tensors=True)
+            rank = get_sequence_parallel_rank()
+            world_size = get_sequence_parallel_world_size()
+            zero = torch.zeros_like(boundary[:, :, :1])
+            left = parts[rank - 1][:, :, 1:2] if rank > 0 else zero
+            right = parts[rank + 1][:, :, 0:1] if rank < world_size - 1 else zero
+            padded = torch.cat([left, x, right], dim=2)
+            temporal_out = nn.functional.conv2d(padded, self.conv_temp.weight, padding=0)
+        else:
+            temporal_out = self.conv_temp(hidden_states_temporal)
+        hidden_states = hidden_states_temporal + temporal_out
         hidden_states = hidden_states.permute(0, 2, 3, 1).view(batch_size, num_frames, height, width, num_channels)
 
         if self.norm_type == "rms_norm":
@@ -1180,6 +1196,26 @@ class SanaVideoTransformer3DModel(nn.Module):
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
+        sp_world_size = get_sequence_parallel_world_size()
+        local_frames = post_patch_num_frames
+        if sp_world_size > 1:
+            # Frame-aligned sharding: every rank keeps full spatial extent, so
+            # the per-frame convs, the GLUMB unflatten and the per-token
+            # modulation stay local. The I2V per-token timestep is sliced
+            # before the time embed so its MLP also runs on local tokens only.
+            sp_sizes = _sp_frame_split_sizes(post_patch_num_frames, sp_world_size)
+            sp_rank = get_sequence_parallel_rank()
+            local_frames = sp_sizes[sp_rank]
+            hidden_states = (
+                hidden_states.unflatten(1, (post_patch_num_frames, -1)).split(sp_sizes, dim=1)[sp_rank].flatten(1, 2)
+            )
+            rotary_emb = tuple(
+                freqs.unflatten(1, (post_patch_num_frames, -1)).split(sp_sizes, dim=1)[sp_rank].flatten(1, 2)
+                for freqs in rotary_emb
+            )
+            if timestep.ndim == 5:
+                timestep = timestep.split(sp_sizes, dim=2)[sp_rank]
+
         if guidance is not None:
             timestep, embedded_timestep = self.time_embed(
                 timestep.flatten(), guidance=guidance, hidden_dtype=hidden_states.dtype
@@ -1205,7 +1241,7 @@ class SanaVideoTransformer3DModel(nn.Module):
                 encoder_hidden_states,
                 encoder_attention_mask,
                 timestep,
-                post_patch_num_frames,
+                local_frames,
                 post_patch_height,
                 post_patch_width,
                 rotary_emb,
@@ -1217,6 +1253,10 @@ class SanaVideoTransformer3DModel(nn.Module):
         hidden_states = self.norm_out(hidden_states, embedded_timestep, self.scale_shift_table)
 
         hidden_states = self.proj_out(hidden_states)
+
+        if sp_world_size > 1:
+            # Gather after proj_out where the channel width is smallest.
+            hidden_states = _sp_gather_frames(hidden_states, sp_sizes)
 
         # 5. Unpatchify
         hidden_states = hidden_states.reshape(
