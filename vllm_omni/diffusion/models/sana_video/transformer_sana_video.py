@@ -30,6 +30,11 @@ from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as OmniAttention
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_sequence_parallel_rank,
+    get_sequence_parallel_world_size,
+    get_sp_group,
+)
 
 
 def validate_sana_video_parallel_config(parallel_config) -> None:
@@ -59,6 +64,32 @@ def validate_sana_video_parallel_config(parallel_config) -> None:
         raise NotImplementedError(
             "SANA-Video does not support text encoder tensor parallel. Set text_encoder_tp_size to 1."
         )
+
+
+def _sp_frame_split_sizes(num_frames: int, world_size: int) -> list[int]:
+    """Balanced per-rank frame counts: the first ``num_frames % world_size``
+    ranks take one extra frame, so exactly ``world_size`` non-empty chunks."""
+    if num_frames < world_size:
+        raise ValueError(
+            f"SANA-Video sequence parallel needs at least one latent frame per rank, "
+            f"got {num_frames} frames for sequence parallel size {world_size}. "
+            "Lower the sequence parallel degree or increase num_frames."
+        )
+    base, rem = divmod(num_frames, world_size)
+    return [base + 1 if rank < rem else base for rank in range(world_size)]
+
+
+def _sp_gather_frames(hidden_states: torch.Tensor, sizes: list[int]) -> torch.Tensor:
+    """Gather per-rank frame shards of shape (B, sizes[rank]*hw, C) into the
+    full (B, sum(sizes)*hw, C) sequence. Shards are padded to the widest rank
+    only for the collective; pads are dropped before concatenation."""
+    rank = get_sequence_parallel_rank()
+    frames = hidden_states.unflatten(1, (sizes[rank], -1))
+    pad = max(sizes) - sizes[rank]
+    if pad:
+        frames = torch.cat([frames, frames.new_zeros((frames.shape[0], pad, *frames.shape[2:]))], dim=1)
+    parts = get_sp_group().all_gather(frames, dim=0, separate_tensors=True)
+    return torch.cat([part.narrow(1, 0, size) for part, size in zip(parts, sizes)], dim=1).flatten(1, 2)
 
 
 @dataclass
@@ -619,9 +650,15 @@ class SanaLinearAttention(nn.Module):
         # Keep the unrotated denominator contraction in the input dtype. This
         # intentionally matches Diffusers 0.38.0's SanaLinearAttnProcessor3_0;
         # only the rotated numerator path is accumulated in FP32.
-        z = 1 / (key.sum(dim=-1, keepdim=True).transpose(-2, -1) @ query + 1e-15)
-
+        k_sum = key.sum(dim=-1, keepdim=True)
         scores = torch.matmul(value, key_rotate.transpose(-1, -2))
+        if get_sequence_parallel_world_size() > 1:
+            # Token sums are the only sequence coupling; one packed all-reduce
+            # turns the per-rank partial state into the global one.
+            packed = torch.cat([scores, k_sum.float()], dim=-1)
+            packed = get_sp_group().all_reduce(packed)
+            scores, k_sum = packed[..., :-1], packed[..., -1:].to(key.dtype)
+        z = 1 / (k_sum.transpose(-2, -1) @ query + 1e-15)
         hidden_states = torch.matmul(scores, query_rotate)
 
         hidden_states = hidden_states * z
