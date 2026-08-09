@@ -121,8 +121,8 @@ bash examples/online_serving/text_to_video/run_curl_sana_video.sh
 
 ##### Parallel native serving
 
-The native pipelines support tensor parallelism (up to 2 GPUs) and CFG
-parallelism. Tensor parallelism on 2 GPUs:
+The native pipelines support tensor parallelism (up to 2 GPUs), sequence
+parallelism (2 or 4 GPUs) and CFG parallelism. Tensor parallelism on 2 GPUs:
 
 ```bash
 vllm serve Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
@@ -133,15 +133,30 @@ vllm serve Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
   --port 8091
 ```
 
-For CFG parallelism on 2 GPUs, replace `--tensor-parallel-size 2` with
-`--cfg-parallel-size 2`; it splits the guided and unguided branches across the
-two GPUs and only helps when `guidance_scale` is above 1. Passing both flags
-combines the two on 4 GPUs.
+Sequence parallelism on 2 GPUs (replace `--tensor-parallel-size 2` with):
 
-Whether tensor parallelism lowers latency depends on the interconnect. Each
-transformer block adds an all-reduce, so it speeds up generation only on fast
-GPU links such as NVLink and can be slower than a single GPU on PCIe-only
-systems. Measure on your hardware before enabling it.
+```bash
+  --usp 2
+```
+
+The `--usp` flag carries the sequence parallel degree. On SANA-Video the
+implementation is not Ulysses all-to-all: video frames are sharded across
+ranks and the linear-attention state is combined with one small all-reduce
+per block, which is far less communication than tensor parallelism needs.
+Ring and AllGather-KV sequence parallel do not apply to SANA's linear
+attention and are rejected.
+
+For CFG parallelism on 2 GPUs, use `--cfg-parallel-size 2` instead; it splits
+the guided and unguided branches across the two GPUs and only helps when
+`guidance_scale` is above 1. CFG parallelism combines with either tensor
+parallelism or sequence parallelism on 4 GPUs; combining tensor and sequence
+parallelism with each other is not supported.
+
+Whether these lower latency depends on the interconnect. Each transformer
+block adds an all-reduce under tensor parallelism, so it speeds up generation
+only on fast GPU links such as NVLink and can be slower than a single GPU on
+PCIe-only systems. Sequence parallelism communicates far less per block, but
+was only measured on NVLink. Measure on your hardware before enabling either.
 
 To run the black-box compatibility backend for T2V, replace the server script
 with `run_server_sana_video_diffusers.sh`. The same `/v1/videos` request
@@ -218,9 +233,9 @@ validated compatibility/reference backend.
   The denoising loop intentionally retains the checkpoint-compatible
   Diffusers `DPMSolverMultistepScheduler`.
 - Known limitations:
-    - Tensor parallelism (up to 2 GPUs) and CFG parallelism are supported for
-    the native pipeline. Sequence parallelism, Cache-DiT, TeaCache, and step
-    execution are not validated.
+    - Tensor parallelism (up to 2 GPUs), sequence parallelism (2 or 4 GPUs)
+    and CFG parallelism are supported for the native pipeline. Cache-DiT,
+    TeaCache, and step execution are not validated.
     - The Diffusers backend is a compatibility path and does not provide native
     vLLM-Omni parallelism or continuous batching.
     - Native describes pipeline and Transformer ownership, not a zero-Diffusers
