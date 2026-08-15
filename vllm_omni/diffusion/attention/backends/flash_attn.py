@@ -93,12 +93,14 @@ class FlashAttentionImpl(AttentionImpl):
         prefix: str = "",
         qkv_layout: str | None = None,
         backend_kwargs: dict | None = None,
+        role: str = "self",
         **extra_impl_args,
     ) -> None:
         self.num_heads = num_heads
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.qkv_layout = qkv_layout
+        self.is_cross_attn = role == "cross"
         cfg = get_current_diffusion_config_or_none()
         self.fa_deterministic = bool(getattr(cfg, "fa_deterministic", False)) if cfg is not None else False
         if backend_kwargs:
@@ -161,7 +163,7 @@ class FlashAttentionImpl(AttentionImpl):
 
         assert attention_mask.ndim == 2, "attention_mask must be 2D, (batch_size, seq_len)"
         batch_size, query_length = query.shape[:2]
-        if query_length == key.size(1):
+        if not self.is_cross_attn and query_length == key.size(1):
             q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_input(
                 query, key, value, attention_mask, query_length, _unpad_input
             )
