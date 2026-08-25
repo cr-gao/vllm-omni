@@ -90,6 +90,26 @@ def test_two_layer_tiny_transformer_enables_cache_dit(monkeypatch):
             cache_dit.disable_cache(enabled_adapters[0])
 
 
+def test_second_engine_enables_cache_dit_after_undisabled_first(monkeypatch):
+    """An engine never disables Cache-DiT on shutdown, and cache_dit marks the
+    shared wrapper-pipe class as cached; a second engine in the same process
+    must still get a full enable with a working cache context."""
+    enabled_adapters = _record_cache_adapters(monkeypatch)
+    first = _PipelineWithTransformer(transformer=_tiny_transformer(monkeypatch))
+    second = _PipelineWithTransformer(transformer=_tiny_transformer(monkeypatch))
+    backend = CacheDiTBackend()
+
+    try:
+        CacheDiTBackend().enable(first)
+        backend.enable(second)
+
+        assert backend.is_enabled()
+        assert second.transformer._is_cached is True
+    finally:
+        for adapter in enabled_adapters:
+            cache_dit.disable_cache(adapter)
+
+
 def test_cache_dit_pattern_mismatch_fails_closed(monkeypatch):
     transformer = _tiny_transformer(monkeypatch)
     transformer.transformer_blocks[1].forward = lambda unexpected_input: unexpected_input
