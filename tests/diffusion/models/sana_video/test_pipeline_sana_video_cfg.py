@@ -349,6 +349,7 @@ def test_i2v_cfg1_preserves_first_frame_and_steps_only_tail(monkeypatch):
         negative_prompt_attention_mask=torch.ones(b, 3),
         guidance_scale=6.0,
         conditioning_mask=_conditioning_mask(b, frames),
+        extra_step_kwargs={},
         dtype=torch.float32,
         output_slice=c,
     )
@@ -388,6 +389,7 @@ def test_i2v_cfg2_dispatch_builds_masked_branch_kwargs(monkeypatch):
         negative_prompt_attention_mask=torch.zeros(b, 3),
         guidance_scale=6.0,
         conditioning_mask=mask,
+        extra_step_kwargs={},
         dtype=torch.float32,
         output_slice=c,
     )
@@ -409,16 +411,11 @@ def test_i2v_cfg2_dispatch_builds_masked_branch_kwargs(monkeypatch):
 def test_diffuse_runs_cfg_parallel_validity_check(monkeypatch, mocker):
     """diffuse must run the CFG-parallel validity check so a scale<=1 or missing
     negative prompt warns the user instead of silently wasting a rank."""
-    _set_cfg_world_size(monkeypatch, 1)
-
-    class _SpyTransformer:
-        dtype = torch.float32
-
-        def __call__(self, hidden_states, **kwargs):
-            return (torch.zeros_like(hidden_states),)
+    _set_cfg_world_size(monkeypatch, 2)
 
     b = 1
-    pipe = _bare_t2v_pipeline(_SpyTransformer(), guidance_scale=6.0)
+    pipe = _bare_t2v_pipeline(transformer=None, guidance_scale=6.0)
+    pipe.predict_noise_maybe_with_cfg = lambda **kwargs: torch.zeros(b, 4, 2, 4, 4)
     check = mocker.patch.object(SanaVideoPipeline, "check_cfg_parallel_validity", return_value=True)
 
     pipe.diffuse(
@@ -439,17 +436,11 @@ def test_diffuse_runs_cfg_parallel_validity_check(monkeypatch, mocker):
 
 def test_i2v_diffuse_runs_cfg_parallel_validity_check(monkeypatch, mocker):
     """I2V has its own diffuse; it must also run the CFG-parallel validity check."""
-    _set_cfg_world_size(monkeypatch, 1)
+    _set_cfg_world_size(monkeypatch, 2)
     b, c, frames = 1, 4, 3
 
-    class _SpyTransformer:
-        dtype = torch.float32
-        out_channels = 2 * c
-
-        def __call__(self, hidden_states, **kwargs):
-            return (torch.zeros(hidden_states.shape[0], 2 * c, frames, 4, 4),)
-
-    pipe = _bare_i2v_pipeline(_SpyTransformer(), _I2VSpyScheduler(), guidance_scale=6.0)
+    pipe = _bare_i2v_pipeline(None, _I2VSpyScheduler(), guidance_scale=6.0)
+    pipe.predict_noise_maybe_with_cfg = lambda **kwargs: torch.zeros(b, c, frames, 4, 4)
     check = mocker.patch.object(SanaVideoPipeline, "check_cfg_parallel_validity", return_value=True)
 
     pipe.diffuse(
@@ -461,11 +452,42 @@ def test_i2v_diffuse_runs_cfg_parallel_validity_check(monkeypatch, mocker):
         negative_prompt_attention_mask=torch.ones(b, 3),
         guidance_scale=6.0,
         conditioning_mask=_conditioning_mask(b, frames),
+        extra_step_kwargs={},
         dtype=torch.float32,
         output_slice=c,
     )
 
     check.assert_called_once_with(6.0, True)
+
+
+def test_diffuse_runs_without_initialized_parallel_groups():
+    """Single-process runs (unit tests, offline scripts) never initialize the
+    distributed groups; diffuse must fall back to the serial path instead of
+    tripping the parallel-state assertion. No world-size patching on purpose."""
+
+    class _SpyTransformer:
+        dtype = torch.float32
+
+        def __call__(self, hidden_states, *, encoder_hidden_states, encoder_attention_mask, timestep, return_dict):
+            return (torch.zeros_like(hidden_states),)
+
+    b = 1
+    pipe = _bare_t2v_pipeline(_SpyTransformer(), guidance_scale=6.0)
+
+    out = pipe.diffuse(
+        latents=torch.randn(b, 4, 2, 4, 4),
+        timesteps=torch.tensor([1000.0]),
+        prompt_embeds=torch.randn(b, 3, 8),
+        prompt_attention_mask=torch.ones(b, 3),
+        negative_prompt_embeds=torch.randn(b, 3, 8),
+        negative_prompt_attention_mask=torch.ones(b, 3),
+        guidance_scale=6.0,
+        extra_step_kwargs={},
+        dtype=torch.float32,
+        output_slice=None,
+    )
+
+    assert out.shape == (b, 4, 2, 4, 4)
 
 
 def test_t2v_forwards_eta_and_generator_into_scheduler(monkeypatch):
