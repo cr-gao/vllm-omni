@@ -145,8 +145,19 @@ class _LinearScheduler:
         return (latents - 0.1 * noise_pred,)
 
 
-def _pr1_reference_loop(transformer, scheduler, latents, timesteps, prompt_embeds, prompt_mask,
-                        negative_embeds, negative_mask, guidance_scale, latent_channels, dtype):
+def _pr1_reference_loop(
+    transformer,
+    scheduler,
+    latents,
+    timesteps,
+    prompt_embeds,
+    prompt_mask,
+    negative_embeds,
+    negative_mask,
+    guidance_scale,
+    latent_channels,
+    dtype,
+):
     """The original CFG1 denoise math, verbatim, as the parity oracle."""
     prompt_embeds = torch.cat([negative_embeds, prompt_embeds], dim=0)
     prompt_mask = torch.cat([negative_mask, prompt_mask], dim=0)
@@ -187,9 +198,17 @@ def test_cfg1_refactored_diffuse_is_bit_identical_to_pr1_loop(monkeypatch):
     scheduler = _LinearScheduler()
 
     ref = _pr1_reference_loop(
-        transformer, scheduler, latents0.clone(), timesteps,
-        prompt_embeds, prompt_mask, negative_embeds, negative_mask,
-        guidance_scale, latent_channels=c, dtype=torch.float32,
+        transformer,
+        scheduler,
+        latents0.clone(),
+        timesteps,
+        prompt_embeds,
+        prompt_mask,
+        negative_embeds,
+        negative_mask,
+        guidance_scale,
+        latent_channels=c,
+        dtype=torch.float32,
     )
 
     pipe = _bare_t2v_pipeline(transformer, guidance_scale=guidance_scale)

@@ -31,6 +31,7 @@ def _init_distributed(monkeypatch):
     yield
     cleanup_dist_env_and_memory()
 
+
 _TINY_CONFIG = {
     "in_channels": 4,
     "out_channels": 4,

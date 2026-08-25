@@ -37,14 +37,12 @@ def validate_sana_video_parallel_config(parallel_config) -> None:
     tp_size = parallel_config.tensor_parallel_size
     if tp_size not in (1, 2):
         raise NotImplementedError(
-            f"SANA-Video supports tensor_parallel_size 1 or 2, got {tp_size}. "
-            "Set --tensor-parallel-size to 1 or 2."
+            f"SANA-Video supports tensor_parallel_size 1 or 2, got {tp_size}. Set --tensor-parallel-size to 1 or 2."
         )
     cfg_size = parallel_config.cfg_parallel_size
     if cfg_size not in (1, 2):
         raise NotImplementedError(
-            f"SANA-Video supports cfg_parallel_size 1 or 2, got {cfg_size}. "
-            "Set --cfg-parallel-size to 1 or 2."
+            f"SANA-Video supports cfg_parallel_size 1 or 2, got {cfg_size}. Set --cfg-parallel-size to 1 or 2."
         )
     sp_size = parallel_config.sequence_parallel_size
     if sp_size is not None and sp_size > 1:
@@ -811,8 +809,12 @@ class SanaCrossAttention(nn.Module):
         self.head_dim = head_dim
         local_inner_dim = inner_dim // tp_size
         self.to_q = ColumnParallelLinear(dim, inner_dim, bias=bias, gather_output=False, return_bias=False)
-        self.to_k = ColumnParallelLinear(cross_attention_dim, inner_dim, bias=bias, gather_output=False, return_bias=False)
-        self.to_v = ColumnParallelLinear(cross_attention_dim, inner_dim, bias=bias, gather_output=False, return_bias=False)
+        self.to_k = ColumnParallelLinear(
+            cross_attention_dim, inner_dim, bias=bias, gather_output=False, return_bias=False
+        )
+        self.to_v = ColumnParallelLinear(
+            cross_attention_dim, inner_dim, bias=bias, gather_output=False, return_bias=False
+        )
         self.norm_q = SanaDistributedRMSNorm(local_inner_dim, eps=1e-5) if qk_norm is not None else None
         self.norm_k = SanaDistributedRMSNorm(local_inner_dim, eps=1e-5) if qk_norm is not None else None
         self.to_out = nn.ModuleList(
