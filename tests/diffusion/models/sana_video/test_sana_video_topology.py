@@ -20,12 +20,21 @@ from vllm_omni.diffusion.models.sana_video.transformer_sana_video import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
-def _pc(tp: int = 1, cfg: int = 1, sp: int | None = None, text_tp: int = 1) -> SimpleNamespace:
+def _pc(
+    tp: int = 1,
+    cfg: int = 1,
+    sp: int | None = None,
+    text_tp: int = 1,
+    pp: int = 1,
+    hsdp: bool = False,
+) -> SimpleNamespace:
     return SimpleNamespace(
         tensor_parallel_size=tp,
         cfg_parallel_size=cfg,
         sequence_parallel_size=sp,
         text_encoder_tp_size=text_tp,
+        pipeline_parallel_size=pp,
+        use_hsdp=hsdp,
     )
 
 
@@ -48,6 +57,16 @@ def test_cfg3_rejected() -> None:
 def test_sequence_parallel_rejected() -> None:
     with pytest.raises(NotImplementedError, match="[Ss]equence parallel"):
         validate_sana_video_parallel_config(_pc(sp=2))
+
+
+def test_pipeline_parallel_rejected() -> None:
+    with pytest.raises(NotImplementedError, match="pipeline parallel"):
+        validate_sana_video_parallel_config(_pc(pp=2))
+
+
+def test_hsdp_rejected() -> None:
+    with pytest.raises(NotImplementedError, match="HSDP"):
+        validate_sana_video_parallel_config(_pc(hsdp=True))
 
 
 def test_text_encoder_tp_rejected() -> None:

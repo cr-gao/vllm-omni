@@ -51,6 +51,10 @@ def validate_sana_video_parallel_config(parallel_config) -> None:
             "GLUMB temporal conv have no SANA-specific SP implementation. Use tensor and/or "
             "CFG parallel instead."
         )
+    if parallel_config.pipeline_parallel_size > 1:
+        raise NotImplementedError("SANA-Video does not support pipeline parallel. Set --pipeline-parallel-size to 1.")
+    if parallel_config.use_hsdp:
+        raise NotImplementedError("SANA-Video does not support HSDP. Remove --use-hsdp.")
     if parallel_config.text_encoder_tp_size > 1:
         raise NotImplementedError(
             "SANA-Video does not support text encoder tensor parallel. Set text_encoder_tp_size to 1."
