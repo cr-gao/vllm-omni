@@ -183,7 +183,6 @@ class SanaDistributedRMSNorm(nn.Module):
         x_float: torch.Tensor,
         global_sum_sq: torch.Tensor,
         global_count: int,
-        x: torch.Tensor,
     ) -> torch.Tensor:
         """Apply the (already reduced) RMS and the per-rank weight shard."""
         mean_sq = global_sum_sq / global_count
@@ -208,12 +207,12 @@ class SanaDistributedRMSNorm(nn.Module):
             global_sum_sq = local_sum_sq
             global_count = local_count
 
-        return self._scale(x_float, global_sum_sq, global_count, x)
+        return self._scale(x_float, global_sum_sq, global_count)
 
 
 def fused_qk_rms_norm(
-    norm_q: nn.Module,
-    norm_k: nn.Module,
+    norm_q: "SanaDistributedRMSNorm",
+    norm_k: "SanaDistributedRMSNorm",
     q: torch.Tensor,
     k: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -227,13 +226,8 @@ def fused_qk_rms_norm(
     NUMERICALLY IDENTICAL to ``norm_q(q), norm_k(k)``: all-reduce is elementwise,
     so packing along the last dim reduces each slice independently with the same
     fp32 accumulation. Requires q and k to share the same shape (true for
-    self-attention — both come from the same hidden states). Falls back to
-    independent application when either norm is not a SanaDistributedRMSNorm
-    (e.g. nn.Identity when qk_norm=False).
+    self-attention — both come from the same hidden states).
     """
-    if not (isinstance(norm_q, SanaDistributedRMSNorm) and isinstance(norm_k, SanaDistributedRMSNorm)):
-        return norm_q(q), norm_k(k)
-
     # The fused path reduces one packed sum-of-squares and reuses q's token width
     # as the RMS count for BOTH q and k, so q and k must share the same shape.
     # (Self-attention guarantees this: q and k are projected from the same x.)
@@ -249,8 +243,8 @@ def fused_qk_rms_norm(
         q_sum_sq, k_sum_sq = packed[..., 0:1], packed[..., 1:2]
         count = count * tp_size
 
-    q_out = norm_q._scale(q_float, q_sum_sq, count, q)
-    k_out = norm_k._scale(k_float, k_sum_sq, count, k)
+    q_out = norm_q._scale(q_float, q_sum_sq, count)
+    k_out = norm_k._scale(k_float, k_sum_sq, count)
     return q_out, k_out
 
 
