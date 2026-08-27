@@ -172,80 +172,25 @@ class SanaDistributedRMSNorm(nn.Module):
             raise ValueError(f"RMSNorm shard shape mismatch: param={tuple(param.shape)}, shard={tuple(shard.shape)}.")
         param.data.copy_(shard)
 
-    def _local_sum_sq(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
-        """Per-rank float32 activation, local sum-of-squares, and local width."""
-        x_float = x.float()
-        local_sum_sq = x_float.pow(2).sum(dim=-1, keepdim=True)
-        return x_float, local_sum_sq, x.shape[-1]
-
-    def _scale(
-        self,
-        x_float: torch.Tensor,
-        global_sum_sq: torch.Tensor,
-        global_count: int,
-    ) -> torch.Tensor:
-        """Apply the (already reduced) RMS and the per-rank weight shard."""
-        mean_sq = global_sum_sq / global_count
-        hidden_states = x_float * torch.rsqrt(mean_sq + self.eps)
-        # Only cast to the weight dtype for fp16/bf16 weights; keep fp32 otherwise.
-        if self.weight.dtype in (torch.float16, torch.bfloat16):
-            hidden_states = hidden_states.to(self.weight.dtype)
-        return hidden_states * self.weight
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         tp_size = get_tensor_model_parallel_world_size()
-        x_float, local_sum_sq, local_count = self._local_sum_sq(x)
+        x_float = x.float()
+        sum_sq = x_float.pow(2).sum(dim=-1, keepdim=True)
+        count = x.shape[-1]
 
         if tp_size > 1:
             # Use vLLM's collective (custom all-reduce / symmetric-mem fast path
             # for small tensors) instead of raw torch.distributed.all_reduce, and
             # take the return value so the custom-AR path (which may return a new
             # buffer) is handled correctly. No .clone() needed.
-            global_sum_sq = tensor_model_parallel_all_reduce(local_sum_sq)
-            global_count = local_count * tp_size
-        else:
-            global_sum_sq = local_sum_sq
-            global_count = local_count
+            sum_sq = tensor_model_parallel_all_reduce(sum_sq)
+            count = count * tp_size
 
-        return self._scale(x_float, global_sum_sq, global_count)
-
-
-def fused_qk_rms_norm(
-    norm_q: "SanaDistributedRMSNorm",
-    norm_k: "SanaDistributedRMSNorm",
-    q: torch.Tensor,
-    k: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply q/k :class:`SanaDistributedRMSNorm` with a SINGLE fused TP all-reduce.
-
-    WHY: self-attention norms q and k every step; on TP each norm issues its own
-    tiny all-reduce of the per-token sum-of-squares, and these latency-bound
-    micro-collectives add up, so we pack both sum-of-squares into one tensor and
-    reduce once (2 collectives → 1).
-
-    NUMERICALLY IDENTICAL to ``norm_q(q), norm_k(k)``: all-reduce is elementwise,
-    so packing along the last dim reduces each slice independently with the same
-    fp32 accumulation. Requires q and k to share the same shape (true for
-    self-attention — both come from the same hidden states).
-    """
-    # The fused path reduces one packed sum-of-squares and reuses q's token width
-    # as the RMS count for BOTH q and k, so q and k must share the same shape.
-    # (Self-attention guarantees this: q and k are projected from the same x.)
-    assert q.shape == k.shape, "fused_qk_rms_norm requires q and k to have the same shape."
-
-    tp_size = get_tensor_model_parallel_world_size()
-    q_float, q_sum_sq, count = norm_q._local_sum_sq(q)
-    k_float, k_sum_sq, _ = norm_k._local_sum_sq(k)
-
-    if tp_size > 1:
-        packed = torch.cat([q_sum_sq, k_sum_sq], dim=-1)
-        packed = tensor_model_parallel_all_reduce(packed)
-        q_sum_sq, k_sum_sq = packed[..., 0:1], packed[..., 1:2]
-        count = count * tp_size
-
-    q_out = norm_q._scale(q_float, q_sum_sq, count)
-    k_out = norm_k._scale(k_float, k_sum_sq, count)
-    return q_out, k_out
+        hidden_states = x_float * torch.rsqrt(sum_sq / count + self.eps)
+        # Only cast to the weight dtype for fp16/bf16 weights; keep fp32 otherwise.
+        if self.weight.dtype in (torch.float16, torch.bfloat16):
+            hidden_states = hidden_states.to(self.weight.dtype)
+        return hidden_states * self.weight
 
 
 def _get_timestep_embedding(
@@ -634,7 +579,9 @@ class SanaLinearAttention(nn.Module):
         value = self.to_v(hidden_states)
 
         if self.norm_q is not None:
-            query, key = fused_qk_rms_norm(self.norm_q, self.norm_k, query, key)
+            query = self.norm_q(query)
+        if self.norm_k is not None:
+            key = self.norm_k(key)
 
         query = query.unflatten(2, (self.heads, -1))
         key = key.unflatten(2, (self.heads, -1))

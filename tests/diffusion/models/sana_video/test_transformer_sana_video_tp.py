@@ -19,7 +19,6 @@ from vllm_omni.diffusion.models.sana_video.transformer_sana_video import (
     SanaDistributedRMSNorm,
     SanaLinearAttention,
     SanaRMSNorm,
-    fused_qk_rms_norm,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -136,53 +135,6 @@ def test_distributed_rms_norm_tp2_shards_aggregate_to_dense(mocker) -> None:
     ref = dense(x)
 
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
-
-
-def _identity_all_reduce(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor
-
-
-def _make_qk_norms(dim: int) -> tuple[SanaDistributedRMSNorm, SanaDistributedRMSNorm]:
-    """Distinct random weights so a swapped q/k slice would be caught."""
-    torch.manual_seed(0)
-    norm_q = SanaDistributedRMSNorm(dim, eps=1e-5)
-    norm_k = SanaDistributedRMSNorm(dim, eps=1e-5)
-    norm_q.weight.data.normal_()
-    norm_k.weight.data.normal_()
-    return norm_q, norm_k
-
-
-def test_fused_qk_matches_separate_norms(mocker) -> None:
-    dim = 24
-    norm_q, norm_k = _make_qk_norms(dim)
-    q = torch.randn(2, 5, dim)
-    k = torch.randn(2, 5, dim)
-
-    mocker.patch(f"{_MODULE}.get_tensor_model_parallel_world_size", return_value=2)
-    mocker.patch(f"{_MODULE}.tensor_model_parallel_all_reduce", side_effect=_identity_all_reduce)
-    ref_q, ref_k = norm_q(q), norm_k(k)
-    fused_q, fused_k = fused_qk_rms_norm(norm_q, norm_k, q, k)
-
-    torch.testing.assert_close(fused_q, ref_q, rtol=0, atol=0)
-    torch.testing.assert_close(fused_k, ref_k, rtol=0, atol=0)
-
-
-def test_fused_qk_issues_single_all_reduce_over_packed_pair(mocker) -> None:
-    dim = 24
-    norm_q, norm_k = _make_qk_norms(dim)
-    q = torch.randn(2, 5, dim)
-    k = torch.randn(2, 5, dim)
-
-    mocker.patch(f"{_MODULE}.get_tensor_model_parallel_world_size", return_value=2)
-    mock_ar = mocker.patch(
-        f"{_MODULE}.tensor_model_parallel_all_reduce",
-        side_effect=_identity_all_reduce,
-    )
-    fused_qk_rms_norm(norm_q, norm_k, q, k)
-
-    assert mock_ar.call_count == 1
-    packed = mock_ar.call_args[0][0]
-    assert packed.shape[-1] == 2
 
 
 def test_distributed_rms_norm_weight_loader_shards_dim0(mocker) -> None:
