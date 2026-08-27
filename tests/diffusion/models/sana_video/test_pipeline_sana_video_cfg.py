@@ -73,6 +73,8 @@ def _set_cfg_world_size(monkeypatch, n):
     monkeypatch.setattr(t2v, "get_classifier_free_guidance_world_size", lambda: n, raising=False)
     monkeypatch.setattr(i2v, "get_classifier_free_guidance_world_size", lambda: n, raising=False)
     monkeypatch.setattr(cfg, "get_classifier_free_guidance_world_size", lambda: n, raising=False)
+    monkeypatch.setattr(t2v, "model_parallel_is_initialized", lambda: True, raising=False)
+    monkeypatch.setattr(i2v, "model_parallel_is_initialized", lambda: True, raising=False)
 
 
 def _bare_t2v_pipeline(transformer, guidance_scale):
@@ -507,6 +509,36 @@ def test_diffuse_runs_without_initialized_parallel_groups():
     )
 
     assert out.shape == (b, 4, 2, 4, 4)
+
+
+def test_diffuse_propagates_group_error_when_parallel_initialized(monkeypatch):
+    """Inside an initialized parallel run a failing CFG-group lookup is a real
+    error and must propagate instead of silently flipping to the serial path."""
+    import vllm_omni.diffusion.models.sana_video.pipeline_sana_video as t2v
+
+    monkeypatch.setattr(t2v, "model_parallel_is_initialized", lambda: True, raising=False)
+
+    def _broken_group_lookup():
+        raise AssertionError("classifier_free_guidance group is not initialized")
+
+    monkeypatch.setattr(t2v, "get_classifier_free_guidance_world_size", _broken_group_lookup)
+
+    b = 1
+    pipe = _bare_t2v_pipeline(None, guidance_scale=6.0)
+
+    with pytest.raises(AssertionError, match="classifier_free_guidance"):
+        pipe.diffuse(
+            latents=torch.randn(b, 4, 2, 4, 4),
+            timesteps=torch.tensor([1000.0]),
+            prompt_embeds=torch.randn(b, 3, 8),
+            prompt_attention_mask=torch.ones(b, 3),
+            negative_prompt_embeds=torch.randn(b, 3, 8),
+            negative_prompt_attention_mask=torch.ones(b, 3),
+            guidance_scale=6.0,
+            extra_step_kwargs={},
+            dtype=torch.float32,
+            output_slice=None,
+        )
 
 
 def test_t2v_forwards_eta_and_generator_into_scheduler(monkeypatch):

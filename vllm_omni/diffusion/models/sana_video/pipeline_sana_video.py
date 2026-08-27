@@ -38,7 +38,10 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import (
 )
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin, _wrap
-from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_classifier_free_guidance_world_size,
+    model_parallel_is_initialized,
+)
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
@@ -765,11 +768,8 @@ class SanaVideoPipeline(
         output_slice: int | None,
     ) -> torch.Tensor:
         do_true_cfg = self.do_classifier_free_guidance
-        try:
-            cfg_parallel = get_classifier_free_guidance_world_size() > 1
-        except AssertionError:
-            # Single-process runs have no parallel groups.
-            cfg_parallel = False
+        # Single-process runs never initialize the parallel groups.
+        cfg_parallel = model_parallel_is_initialized() and get_classifier_free_guidance_world_size() > 1
         if cfg_parallel:
             self.check_cfg_parallel_validity(guidance_scale, negative_prompt_embeds is not None)
 
