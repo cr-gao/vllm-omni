@@ -18,6 +18,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, fields
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -561,17 +562,27 @@ class GLUMBTempConv(nn.Module):
             0, 2, 1, 3
         )
         if get_sequence_parallel_world_size() > 1:
-            # The temporal conv reads one frame across each shard boundary.
-            # Every rank contributes its (first, last) frame pair; the global
-            # first/last rank keeps the dense zero padding on its outer side.
+            # The temporal conv reads one frame across each shard boundary, so
+            # each rank exchanges single frames with its neighbours only; the
+            # global first/last rank keeps the dense zero padding on its outer
+            # side.
             x = hidden_states_temporal
-            boundary = torch.cat([x[:, :, :1], x[:, :, -1:]], dim=2)
-            parts = get_sp_group().all_gather(boundary, dim=0, separate_tensors=True)
             rank = get_sequence_parallel_rank()
             world_size = get_sequence_parallel_world_size()
-            zero = torch.zeros_like(boundary[:, :, :1])
-            left = parts[rank - 1][:, :, 1:2] if rank > 0 else zero
-            right = parts[rank + 1][:, :, 0:1] if rank < world_size - 1 else zero
+            sp_group = get_sp_group()
+            left = x.new_zeros((x.shape[0], x.shape[1], 1, x.shape[3]))
+            right = torch.zeros_like(left)
+            p2p_ops = []
+            if rank > 0:
+                prev_rank = sp_group.ranks[rank - 1]
+                p2p_ops.append(dist.P2POp(dist.irecv, left, prev_rank, sp_group.device_group))
+                p2p_ops.append(dist.P2POp(dist.isend, x[:, :, :1].contiguous(), prev_rank, sp_group.device_group))
+            if rank < world_size - 1:
+                next_rank = sp_group.ranks[rank + 1]
+                p2p_ops.append(dist.P2POp(dist.isend, x[:, :, -1:].contiguous(), next_rank, sp_group.device_group))
+                p2p_ops.append(dist.P2POp(dist.irecv, right, next_rank, sp_group.device_group))
+            for req in dist.batch_isend_irecv(p2p_ops):
+                req.wait()
             padded = torch.cat([left, x, right], dim=2)
             temporal_out = nn.functional.conv2d(padded, self.conv_temp.weight, padding=0)
         else:

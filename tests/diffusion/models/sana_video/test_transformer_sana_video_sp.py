@@ -243,22 +243,43 @@ def test_gather_frames_roundtrips_uneven_shards(num_frames, world_size, mocker) 
 # ── GLUMB conv_temp halo exchange ──
 
 
-class _ReplaySpGather:
-    """Two-pass stand-in for the SP all-gather: pass 1 records each rank's
-    boundary frames, pass 2 replays the full rank-ordered list."""
+class _NoopReq:
+    def wait(self) -> None:
+        pass
 
-    def __init__(self, world_size: int) -> None:
-        self.world_size = world_size
-        self.recorded: list[torch.Tensor] = []
+
+class _ReplayP2PDist:
+    """Two-pass stand-in for torch.distributed P2P: pass 1 records each rank's
+    boundary sends, pass 2 replays them into the matching neighbour recvs."""
+
+    irecv = "irecv"
+    isend = "isend"
+
+    def __init__(self) -> None:
+        self.rank = 0
+        self.sent: dict[tuple[int, int], torch.Tensor] = {}
         self.replay = False
+        self.batches = 0
+        self.peers: set[tuple[int, int]] = set()
 
-    def all_gather(self, tensor: torch.Tensor, dim: int = 0, separate_tensors: bool = False):
-        assert separate_tensors, "halo exchange must request per-rank tensors"
-        if not self.replay:
-            self.recorded.append(tensor.clone())
-            return [tensor.clone() for _ in range(self.world_size)]
-        assert all(part.shape == tensor.shape for part in self.recorded), "all_gather requires equal shards"
-        return [part.clone() for part in self.recorded]
+    def P2POp(self, op, tensor, peer, group):
+        return (op, tensor, peer)
+
+    def batch_isend_irecv(self, ops):
+        self.batches += 1
+        for op, tensor, peer in ops:
+            self.peers.add((self.rank, peer))
+            if op == "isend":
+                self.sent[(self.rank, peer)] = tensor.clone()
+            elif self.replay:
+                tensor.copy_(self.sent[(peer, self.rank)])
+        return [_NoopReq() for _ in ops]
+
+
+class _FakeSpGroup:
+    def __init__(self, world_size: int) -> None:
+        self.ranks = list(range(world_size))
+        self.device_group = None
 
 
 def _make_glumb(mocker) -> GLUMBTempConv:
@@ -275,7 +296,8 @@ def _make_glumb(mocker) -> GLUMBTempConv:
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_glumb_conv_temp_sp_halo_matches_dense(world_size, mocker) -> None:
     """Frame shards with neighbour boundary frames exchanged must reproduce the
-    dense temporal conv, including zero padding at the global first/last frame."""
+    dense temporal conv, including zero padding at the global first/last frame.
+    The exchange must talk to the two neighbouring ranks only."""
     glumb = _make_glumb(mocker)
     num_frames = 5
     torch.manual_seed(1)
@@ -286,21 +308,24 @@ def test_glumb_conv_temp_sp_halo_matches_dense(world_size, mocker) -> None:
 
     sizes = _sp_frame_split_sizes(num_frames, world_size)
     shards = [shard.contiguous() for shard in x.split(sizes, dim=1)]
-    fake_group = _ReplaySpGather(world_size)
+    fake_dist = _ReplayP2PDist()
     mocker.patch(f"{_MODULE}.get_sequence_parallel_world_size", return_value=world_size)
-    mocker.patch(f"{_MODULE}.get_sp_group", return_value=fake_group)
+    mocker.patch(f"{_MODULE}.get_sp_group", return_value=_FakeSpGroup(world_size))
+    mocker.patch(f"{_MODULE}.dist", fake_dist)
 
     def run_ranks() -> list[torch.Tensor]:
         outs = []
         for rank in range(world_size):
+            fake_dist.rank = rank
             mocker.patch(f"{_MODULE}.get_sequence_parallel_rank", return_value=rank)
             with torch.no_grad():
                 outs.append(glumb(shards[rank]))
         return outs
 
     run_ranks()
-    assert len(fake_group.recorded) == world_size
-    fake_group.replay = True
+    assert fake_dist.batches == world_size
+    assert fake_dist.peers == {(a, b) for a in range(world_size) for b in (a - 1, a + 1) if 0 <= b < world_size}
+    fake_dist.replay = True
     out = torch.cat(run_ranks(), dim=1)
 
     torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
@@ -370,6 +395,8 @@ class _LockstepSpGroup:
 
     def __init__(self, world_size: int, tls: threading.local) -> None:
         self.world_size = world_size
+        self.ranks = list(range(world_size))
+        self.device_group = None
         self.tls = tls
         self.barrier = threading.Barrier(world_size)
         self.slots: list[torch.Tensor | None] = [None] * world_size
@@ -399,6 +426,41 @@ class _LockstepSpGroup:
                 self.gather_calls += 1
         self.barrier.wait(timeout=60)
         return parts
+
+
+class _LockstepP2PDist:
+    """Barrier-synchronized torch.distributed P2P stand-in: sends land in a
+    mailbox, all rank threads rendezvous, then recvs read their neighbour's
+    send of the same batch."""
+
+    irecv = "irecv"
+    isend = "isend"
+
+    def __init__(self, world_size: int, tls: threading.local) -> None:
+        self.tls = tls
+        self.barrier = threading.Barrier(world_size)
+        self.mailbox: dict[tuple[int, int], torch.Tensor] = {}
+        self.peers: set[tuple[int, int]] = set()
+        self.batches = 0
+        self.lock = threading.Lock()
+
+    def P2POp(self, op, tensor, peer, group):
+        return (op, tensor, peer)
+
+    def batch_isend_irecv(self, ops):
+        rank = self.tls.rank
+        with self.lock:
+            self.batches += 1
+            for op, tensor, peer in ops:
+                self.peers.add((rank, peer))
+                if op == "isend":
+                    self.mailbox[(rank, peer)] = tensor.clone()
+        self.barrier.wait(timeout=60)
+        for op, tensor, peer in ops:
+            if op == "irecv":
+                tensor.copy_(self.mailbox[(peer, rank)])
+        self.barrier.wait(timeout=60)
+        return [_NoopReq() for _ in ops]
 
 
 @pytest.mark.parametrize("task", ["t2v", "i2v"])
@@ -433,9 +495,11 @@ def test_tiny_transformer_sp2_lockstep_matches_dense(tp1_group, force_default_ge
     world_size = 2
     tls = threading.local()
     group = _LockstepSpGroup(world_size, tls)
+    fake_dist = _LockstepP2PDist(world_size, tls)
     mocker.patch(f"{_MODULE}.get_sequence_parallel_world_size", return_value=world_size)
     mocker.patch(f"{_MODULE}.get_sequence_parallel_rank", side_effect=lambda: tls.rank)
     mocker.patch(f"{_MODULE}.get_sp_group", return_value=group)
+    mocker.patch(f"{_MODULE}.dist", fake_dist)
 
     def run_rank(rank: int) -> torch.Tensor:
         tls.rank = rank
@@ -453,12 +517,14 @@ def test_tiny_transformer_sp2_lockstep_matches_dense(tp1_group, force_default_ge
 
     num_layers = _TINY_SP_CONFIG["num_layers"]
     # One attn1 state reduce per block, its inputs distinct per rank (the ranks
-    # really processed different frames), one halo gather per block plus the
-    # final frame gather.
+    # really processed different frames), one neighbour halo exchange per block
+    # per rank, and only the final frame gather is a full collective.
     assert len(group.reduce_inputs) == num_layers
     for parts in group.reduce_inputs:
         assert not torch.equal(parts[0], parts[1])
-    assert group.gather_calls == num_layers + 1
+    assert group.gather_calls == 1
+    assert fake_dist.batches == world_size * num_layers
+    assert fake_dist.peers == {(0, 1), (1, 0)}
 
     torch.testing.assert_close(outs[1], outs[0], rtol=0, atol=0)
     # Reduction-reorder noise amplified by the unit-normal test weights; any
