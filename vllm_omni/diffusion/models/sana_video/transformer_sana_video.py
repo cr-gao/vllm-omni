@@ -19,6 +19,7 @@ from dataclasses import dataclass, fields
 
 import torch
 import torch.distributed as dist
+from cache_dit import ForwardPattern
 from torch import nn
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -31,6 +32,7 @@ from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as OmniAttention
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
@@ -1036,6 +1038,12 @@ class SanaVideoTransformer3DModel(nn.Module):
     """
 
     _no_split_modules = ["SanaVideoTransformerBlock", "SanaModulatedNorm"]
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "transformer_blocks": ForwardPattern.Pattern_3,
+        },
+    )
+    _layerwise_offload_blocks_attrs = ["transformer_blocks"]
 
     # SP is implemented manually in forward (frame-aligned uneven sharding);
     # the empty plan enables the registry's SP path with zero generic hooks.
