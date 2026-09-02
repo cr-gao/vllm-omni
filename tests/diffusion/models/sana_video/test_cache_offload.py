@@ -12,7 +12,10 @@ from torch import nn
 
 import vllm_omni.diffusion.cache.cachedit.backend as cachedit_backend_module
 import vllm_omni.diffusion.offloader.layerwise_backend as layerwise_backend_module
-from tests.diffusion.models.sana_video.test_transformer_sana_video import _TINY_CONFIG
+from tests.diffusion.models.sana_video.test_transformer_sana_video import (  # noqa: F401
+    _TINY_CONFIG,
+    _init_distributed,
+)
 from tests.diffusion.offloader.test_layerwise_backend import DummyEvent, DummyStream, dummy_stream
 from vllm_omni.diffusion.attention import selector as attention_selector
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend

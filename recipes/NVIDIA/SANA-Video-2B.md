@@ -119,6 +119,30 @@ MODEL=Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
 bash examples/online_serving/text_to_video/run_curl_sana_video.sh
 ```
 
+##### Parallel native serving
+
+The native pipelines support tensor parallelism (up to 2 GPUs) and CFG
+parallelism. Tensor parallelism on 2 GPUs:
+
+```bash
+vllm serve Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
+  --omni \
+  --model-class-name SanaVideoPipeline \
+  --tensor-parallel-size 2 \
+  --dtype bfloat16 \
+  --port 8091
+```
+
+For CFG parallelism on 2 GPUs, replace `--tensor-parallel-size 2` with
+`--cfg-parallel-size 2`; it splits the guided and unguided branches across the
+two GPUs and only helps when `guidance_scale` is above 1. Passing both flags
+combines the two on 4 GPUs.
+
+Whether tensor parallelism lowers latency depends on the interconnect. Each
+transformer block adds an all-reduce, so it speeds up generation only on fast
+GPU links such as NVLink and can be slower than a single GPU on PCIe-only
+systems. Measure on your hardware before enabling it.
+
 To run the black-box compatibility backend for T2V, replace the server script
 with `run_server_sana_video_diffusers.sh`. The same `/v1/videos` request
 works; `num_frames` is adapted to Diffusers' `frames` argument. The script
@@ -263,9 +287,11 @@ for the tuning knobs.
   The denoising loop intentionally retains the checkpoint-compatible
   Diffusers `DPMSolverMultistepScheduler`.
 - Known limitations:
+    - Tensor parallelism (up to 2 GPUs) and CFG parallelism are supported for
+    the native pipeline. Sequence parallelism, TeaCache, and step execution
+    are not validated.
     - Cache-DiT and CPU offload are limited to TP1/CFG1/SP1. Cache-DiT with
-    distributed layerwise offload, TeaCache, and step execution are not
-    supported by the native pipeline.
+    distributed layerwise offload is not supported by the native pipeline.
     - Cache-DiT speedup and offload memory numbers above are single-GPU A800
     measurements; other hardware will differ. Distributed layerwise offload is
     only exercised single-rank here.
