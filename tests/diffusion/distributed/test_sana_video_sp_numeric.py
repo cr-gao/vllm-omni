@@ -11,6 +11,7 @@ timestep-slice or state-reduction misalignment fails by orders of magnitude.
 from __future__ import annotations
 
 import os
+import tempfile
 
 import pytest
 import torch
@@ -51,11 +52,11 @@ _FP32_REL_L2 = 1e-5
 _BF16_REL_L2 = 5e-2
 
 
-def _make_omni_config(sp_size: int, cfg_size: int, dtype: torch.dtype) -> OmniDiffusionConfig:
+def _make_omni_config(sp_size: int, cfg_size: int, dtype: torch.dtype, tp_size: int = 1) -> OmniDiffusionConfig:
     parallel_config = DiffusionParallelConfig(
         pipeline_parallel_size=1,
         data_parallel_size=1,
-        tensor_parallel_size=1,
+        tensor_parallel_size=tp_size,
         sequence_parallel_size=sp_size,
         ulysses_degree=sp_size,
         ring_degree=1,
@@ -98,9 +99,11 @@ def _worker(
     world_size: int,
     sp_size: int,
     cfg_size: int,
+    tp_size: int,
     dtype: torch.dtype,
     task: str,
     num_frames: int,
+    weights_path: str,
     port: int,
     result_queue,
 ):
@@ -117,13 +120,21 @@ def _worker(
     )
 
     init_distributed_environment()
-    initialize_model_parallel(cfg_parallel_size=cfg_size, sequence_parallel_size=sp_size, ulysses_degree=sp_size)
+    initialize_model_parallel(
+        cfg_parallel_size=cfg_size,
+        sequence_parallel_size=sp_size,
+        ulysses_degree=sp_size,
+        tensor_parallel_size=tp_size,
+    )
     assert get_sequence_parallel_world_size() == sp_size
 
     cfg_rank = get_classifier_free_guidance_rank() if cfg_size > 1 else 0
-    od_config = _make_omni_config(sp_size, cfg_size, dtype)
+    od_config = _make_omni_config(sp_size, cfg_size, dtype, tp_size)
     with set_current_diffusion_config(od_config):
         model = _build_model(device, dtype)
+    # Load the baseline's full weights through the real weight loaders so TP
+    # ranks hold proper shards; per-rank random init is not TP-consistent.
+    model.load_weights(iter(torch.load(weights_path, map_location="cpu").items()))
     # Each CFG branch gets distinct inputs so a CFG/SP group mix-up cannot
     # cancel out.
     latent, encoder_hidden_states, encoder_attention_mask, timestep = _make_inputs(
@@ -160,25 +171,38 @@ def _run_sp_parity(
     task: str,
     num_frames: int,
     rel_l2_bound: float,
+    tp_size: int = 1,
 ) -> float:
     mp_context = torch.multiprocessing.get_context("spawn")
     manager = mp_context.Manager()
 
     baselines = {}
-    for cfg_rank in range(cfg_size):
-        queue = manager.Queue()
-        # A world-1 run sees input seed _INPUT_SEED + 0; shift the seed via the
-        # task inputs by spawning one baseline per CFG branch input.
-        torch.multiprocessing.spawn(
-            _baseline_worker,
-            args=(dtype, task, num_frames, _INPUT_SEED + cfg_rank, 29531, queue),
-            nprocs=1,
-        )
-        baselines[cfg_rank] = queue.get()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        weights_path = os.path.join(tmpdir, "baseline_weights.pt")
+        for cfg_rank in range(cfg_size):
+            queue = manager.Queue()
+            # A world-1 run sees input seed _INPUT_SEED + 0; shift the seed via
+            # the task inputs by spawning one baseline per CFG branch input.
+            torch.multiprocessing.spawn(
+                _baseline_worker,
+                args=(
+                    dtype,
+                    task,
+                    num_frames,
+                    _INPUT_SEED + cfg_rank,
+                    weights_path if cfg_rank == 0 else "",
+                    29531,
+                    queue,
+                ),
+                nprocs=1,
+            )
+            baselines[cfg_rank] = queue.get()
 
-    queue = manager.Queue()
-    world_size = sp_size * cfg_size
-    results = _spawn((world_size, sp_size, cfg_size, dtype, task, num_frames, 29532), world_size, queue)
+        queue = manager.Queue()
+        world_size = sp_size * cfg_size * tp_size
+        results = _spawn(
+            (world_size, sp_size, cfg_size, tp_size, dtype, task, num_frames, weights_path, 29532), world_size, queue
+        )
 
     worst = 0.0
     by_cfg: dict[int, list] = {}
@@ -207,6 +231,7 @@ def _baseline_worker(
     task: str,
     num_frames: int,
     input_seed: int,
+    weights_path: str,
     port: int,
     result_queue,
 ):
@@ -228,6 +253,8 @@ def _baseline_worker(
     od_config = _make_omni_config(1, 1, dtype)
     with set_current_diffusion_config(od_config):
         model = _build_model(device, dtype)
+    if weights_path:
+        torch.save({name: param.detach().cpu() for name, param in model.named_parameters()}, weights_path)
     latent, encoder_hidden_states, encoder_attention_mask, timestep = _make_inputs(task, num_frames, input_seed)
 
     with torch.no_grad():
@@ -289,6 +316,24 @@ def test_sp2_cfg2_matches_sp1_fp32() -> None:
         cfg_size=2,
         dtype=torch.float32,
         task="i2v",
+        num_frames=21,
+        rel_l2_bound=_FP32_REL_L2,
+    )
+
+
+@pytest.mark.full_model
+@pytest.mark.diffusion
+@pytest.mark.parallel
+@hardware_test(res={"cuda": "L4"}, num_cards=4)
+def test_tp2_sp2_matches_sp1_fp32() -> None:
+    """Four processes: TP shards heads and channels while SP shards frames; the
+    combined mesh must still reproduce the serial output."""
+    _run_sp_parity(
+        sp_size=2,
+        cfg_size=1,
+        tp_size=2,
+        dtype=torch.float32,
+        task="t2v",
         num_frames=21,
         rel_l2_bound=_FP32_REL_L2,
     )

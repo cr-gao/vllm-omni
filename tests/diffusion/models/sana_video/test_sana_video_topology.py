@@ -81,9 +81,9 @@ def test_allgather_sequence_parallel_rejected() -> None:
         validate_sana_video_parallel_config(_pc(sp=2, allgather=2))
 
 
-def test_tp2_sp2_combo_rejected() -> None:
-    with pytest.raises(NotImplementedError, match="tensor parallel with sequence parallel"):
-        validate_sana_video_parallel_config(_pc(tp=2, sp=2))
+@pytest.mark.parametrize("sp", [2, 4])
+def test_tp2_sp_combos_pass(sp: int) -> None:
+    validate_sana_video_parallel_config(_pc(tp=2, sp=sp))
 
 
 def test_pipeline_parallel_rejected() -> None:

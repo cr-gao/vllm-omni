@@ -64,11 +64,6 @@ def validate_sana_video_parallel_config(parallel_config) -> None:
         )
     if parallel_config.allgather_degree > 1:
         raise NotImplementedError("SANA-Video does not support AllGather-KV sequence parallel. Use --usp instead.")
-    if tp_size > 1 and sp_size > 1:
-        raise NotImplementedError(
-            "SANA-Video does not support combining tensor parallel with sequence parallel. "
-            "Use one of them, optionally with CFG parallel."
-        )
     if parallel_config.pipeline_parallel_size > 1:
         raise NotImplementedError("SANA-Video does not support pipeline parallel. Set --pipeline-parallel-size to 1.")
     if parallel_config.use_hsdp:

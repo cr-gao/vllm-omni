@@ -149,8 +149,10 @@ attention and are rejected.
 For CFG parallelism on 2 GPUs, use `--cfg-parallel-size 2` instead; it splits
 the guided and unguided branches across the two GPUs and only helps when
 `guidance_scale` is above 1. CFG parallelism combines with either tensor
-parallelism or sequence parallelism on 4 GPUs; combining tensor and sequence
-parallelism with each other is not supported.
+parallelism or sequence parallelism on 4 GPUs. Tensor and sequence parallelism
+also combine; on the measured 4-GPU NVLink box tp2 x sp2 reached 2.55x, below
+the pure sp4 (3.24x) and sp2 x cfg2 (3.56x) configurations, so prefer those
+when four GPUs serve one request.
 
 Whether these lower latency depends on the interconnect. Each transformer
 block adds an all-reduce under tensor parallelism, so it speeds up generation

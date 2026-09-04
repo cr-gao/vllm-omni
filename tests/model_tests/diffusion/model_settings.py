@@ -59,6 +59,7 @@ DIFFUSION_TEST_SETTINGS = {
             [DiffusionAccs.TENSOR_PARALLEL, DiffusionAccs.CFG_PARALLEL],
             [DiffusionAccs.SEQUENCE_PARALLEL],
             [DiffusionAccs.SEQUENCE_PARALLEL, DiffusionAccs.CFG_PARALLEL],
+            [DiffusionAccs.TENSOR_PARALLEL, DiffusionAccs.SEQUENCE_PARALLEL],
             [DiffusionAccs.CACHE_DIT],
             [DiffusionAccs.CPU_OFFLOAD],
             [DiffusionAccs.LAYERWISE_OFFLOAD],
