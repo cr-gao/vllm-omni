@@ -568,6 +568,10 @@ class GLUMBTempConv(nn.Module):
             # each rank exchanges single frames with its neighbours only; the
             # global first/last rank keeps the dense zero padding on its outer
             # side.
+            assert self.conv_temp.kernel_size == (3, 1), (
+                "SP halo exchange assumes a temporal kernel of 3 (one frame per side), "
+                f"got {self.conv_temp.kernel_size}"
+            )
             x = hidden_states_temporal
             rank = get_sequence_parallel_rank()
             world_size = get_sequence_parallel_world_size()

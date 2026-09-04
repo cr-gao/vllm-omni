@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import torch
+from torch import nn
 
 from vllm_omni.diffusion.models.sana_video.transformer_sana_video import (
     GLUMBTempConv,
@@ -329,6 +330,20 @@ def test_glumb_conv_temp_sp_halo_matches_dense(world_size, mocker) -> None:
     out = torch.cat(run_ranks(), dim=1)
 
     torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+
+
+def test_glumb_sp_halo_rejects_non_three_frame_kernel(mocker) -> None:
+    """The single-frame halo is only correct for a three-frame temporal kernel;
+    any other width must fail loudly instead of corrupting parity."""
+    glumb = _make_glumb(mocker)
+    glumb.conv_temp = nn.Conv2d(4, 4, kernel_size=(5, 1), stride=1, padding=(2, 0), bias=False)
+    mocker.patch(f"{_MODULE}.get_sequence_parallel_world_size", return_value=2)
+    mocker.patch(f"{_MODULE}.get_sequence_parallel_rank", return_value=0)
+    mocker.patch(f"{_MODULE}.get_sp_group", return_value=_FakeSpGroup(2))
+    mocker.patch(f"{_MODULE}.dist", _ReplayP2PDist())
+    with pytest.raises(AssertionError, match="temporal kernel"):
+        with torch.no_grad():
+            glumb(torch.randn(1, 3, 3, 3, 4))
 
 
 # ── I2V per-token timestep frame slicing ──
