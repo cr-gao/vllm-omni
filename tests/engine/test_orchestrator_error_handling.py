@@ -13,6 +13,7 @@ import asyncio
 import queue
 import time
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import janus
 import pytest
@@ -22,6 +23,7 @@ from vllm.v1.serial_utils import MsgpackEncoder
 
 from vllm_omni.engine.messages import (
     AddCompanionRequestMessage,
+    CollectiveRPCRequestMessage,
     EngineQueueMessage,
     ErrorMessage,
     ShutdownRequestMessage,
@@ -1143,3 +1145,40 @@ async def test_diffusion_client_error_output_propagates_non_400_status(
     finally:
         orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
         orchestrator_fixture.thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_control_rpc_failure_is_reported_to_the_caller_not_fatal() -> None:
+    """A control RPC that fails on one replica must come back as that
+    replica's error result instead of raising out of _request_handler.
+    """
+
+    class _FailingClient(FakeStageClient):
+        async def collective_rpc_async(self, *args, **kwargs):
+            raise TimeoutError("outputs did not drain")
+
+    ok = FakeStageClient(stage_type="diffusion")
+    ok.collective_rpc_async = AsyncMock(return_value=None)
+    orchestrator, queues = _build_bare_orchestrator(
+        _build_stage_pools([[ok], [_FailingClient(stage_type="diffusion")]])
+    )
+    try:
+        await orchestrator._handle_collective_rpc(
+            CollectiveRPCRequestMessage(
+                rpc_id="rpc-1",
+                method="pause_scheduler",
+                args=(),
+                kwargs={"mode": "keep"},
+                stage_ids=[0, 1],
+            )
+        )
+
+        result = queues[2].async_q.get_nowait()
+        assert result.rpc_id == "rpc-1"
+        assert result.stage_ids == [0, 1]
+        assert result.results[0] is None
+        assert result.results[1]["supported"] is False
+        assert "outputs did not drain" in result.results[1]["error"]
+    finally:
+        for q in queues:
+            q.close()
