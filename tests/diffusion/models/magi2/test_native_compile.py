@@ -72,6 +72,31 @@ def test_pipeline_setup_compile_forwards_config_dynamic() -> None:
     assert calls == [{"fullgraph": True, "dynamic": False, "options": {"emulate_precision_casts": True}}]
 
 
+def test_pipeline_setup_compile_warns_when_granularity_is_not_regional(caplog: pytest.LogCaptureFixture) -> None:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.magi2.pipeline_magi2 import Magi2Pipeline
+
+    calls: list[dict[str, object]] = []
+
+    class _Transformer(torch.nn.Module):
+        def compile_regions(self, **compile_kwargs: object) -> None:
+            calls.append(compile_kwargs)
+
+    pipeline = object.__new__(Magi2Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.od_config = OmniDiffusionConfig(
+        model="sand-ai/MAGI-2-preview",
+        model_class_name="Magi2Pipeline",
+        diffusion_compile_granularity="full",
+    )
+    pipeline.transformer = _Transformer()
+
+    pipeline.setup_compile()
+
+    assert calls == [{"fullgraph": True, "dynamic": True, "options": {"emulate_precision_casts": True}}]
+    assert "diffusion_compile_granularity='full'" in caplog.text
+
+
 def test_compiled_graphs_are_shared_across_layers_of_one_kind() -> None:
     model = _tiny_model(moe_layers=2)
     sampler = _tiny_sampler(model)

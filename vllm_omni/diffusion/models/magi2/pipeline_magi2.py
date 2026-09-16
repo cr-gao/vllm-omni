@@ -698,6 +698,13 @@ class Magi2Pipeline(
     def setup_compile(self) -> None:
         """Compile the transformer regions; the attention and MoE kernels stay eager."""
 
+        granularity = self.od_config.diffusion_compile_granularity
+        if granularity != "regional":
+            logger.warning(
+                "MAGI-2 compiles the transformer regions itself; diffusion_compile_granularity=%r is ignored.",
+                granularity,
+            )
+
         # The mHC connections chain bf16 ops that eager rounds after every op.
         # Emulating those casts keeps the compiled rounding boundaries equal.
         self.transformer.compile_regions(
