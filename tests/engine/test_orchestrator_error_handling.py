@@ -1185,9 +1185,9 @@ async def test_control_rpc_failure_is_reported_to_the_caller_not_fatal() -> None
 
 
 @pytest.mark.asyncio
-async def test_rpc_failure_capture_is_limited_to_control_methods() -> None:
-    """Only the control methods whose worker exceptions leave StagePool are
-    reported as a result; any other RPC keeps propagating.
+async def test_rpc_failure_capture_is_limited_to_pause_and_resume() -> None:
+    """Only pause/resume failures are reported as a result; every other RPC
+    keeps propagating the way it does today.
     """
     orchestrator, queues = _build_bare_orchestrator(_build_stage_pools([[FakeStageClient(stage_type="diffusion")]]))
     orchestrator.stage_pools[0].collective_rpc = AsyncMock(side_effect=TimeoutError("worker died"))
@@ -1196,13 +1196,13 @@ async def test_rpc_failure_capture_is_limited_to_control_methods() -> None:
         return CollectiveRPCRequestMessage(rpc_id=rpc_id, method=method, args=(), kwargs={}, stage_ids=[0])
 
     try:
-        await orchestrator._handle_collective_rpc(_msg("rpc-sleep", "sleep"))
+        await orchestrator._handle_collective_rpc(_msg("rpc-resume", "resume_scheduler"))
         result = queues[2].async_q.get_nowait()
         assert result.results[0]["supported"] is False
         assert "worker died" in result.results[0]["error"]
 
         with pytest.raises(TimeoutError):
-            await orchestrator._handle_collective_rpc(_msg("rpc-loras", "list_loras"))
+            await orchestrator._handle_collective_rpc(_msg("rpc-sleep", "sleep"))
     finally:
         for q in queues:
             q.close()

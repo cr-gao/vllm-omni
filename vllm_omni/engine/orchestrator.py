@@ -57,7 +57,7 @@ from vllm_omni.engine.messages import (
 )
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import serialize_additional_information
-from vllm_omni.engine.stage_pool import ENGINE_CORE_CONTROL_METHODS, StagePool, StageUnavailableError
+from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE, OmniClientError
 from vllm_omni.metrics import definitions as metric_defs
 from vllm_omni.metrics.prometheus import OmniRequestCounter
@@ -698,13 +698,13 @@ class OrchestratorBase:
                         kwargs=kwargs,
                     )
                 except Exception as exc:
-                    if method not in ENGINE_CORE_CONTROL_METHODS:
+                    if method not in ("pause_scheduler", "resume_scheduler"):
                         raise
-                    # A control method that fails on one replica is the
-                    # caller's to retry: report it as this replica's result
-                    # rather than out of the request handler. Every caller
-                    # reaches these methods through _engine_core_rpc, which
-                    # raises on the error result.
+                    # A pause or resume that fails on one replica leaves the
+                    # engine usable, so report it as this replica's result
+                    # rather than out of the request handler; the caller
+                    # reaches both through _engine_core_rpc, which raises on
+                    # the error result and can then retry or resume.
                     stage_result = {"supported": False, "error": f"{type(exc).__name__}: {exc}"}
                 stage_ids.append(pool.stage_id)
                 results.append(stage_result)
