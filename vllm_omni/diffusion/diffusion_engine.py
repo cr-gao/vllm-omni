@@ -717,47 +717,51 @@ class DiffusionEngine:
             except queue.Empty:
                 return
 
-            fut = task.future
-            if fut.cancelled() or fut.done():
-                continue
-
-            remaining: float | None = None
-            if task.deadline is not None:
-                remaining = task.deadline - time.monotonic()
-                if remaining <= 0:
-                    if not fut.done():
-                        fut.set_exception(TimeoutError(f"RPC call to {task.method} timed out before execution."))
-                    continue
-
-            try:
-                if task.method == "pause_scheduler":
-                    result = self._run_pause_barrier(remaining)
-                elif task.method == "resume_scheduler":
-                    result = self._open_scheduling_gate()
-                else:
-                    result = self.executor.collective_rpc(
-                        method=task.method,
-                        timeout=remaining,
-                        args=task.args,
-                        kwargs=task.kwargs,
-                        unique_reply_rank=task.unique_reply_rank,
-                    )
-            except BaseException as exc:  # noqa: BLE001 - propagate to caller
-                # The future may have been cancelled (e.g. by a sync timeout
-                # or asyncio cancellation) while the executor call was
-                # running. Setting state on a cancelled/done future raises
-                # InvalidStateError, which would kill the busy loop.
-                if not fut.done():
-                    fut.set_exception(exc)
-            else:
-                if not fut.done():
-                    fut.set_result(result)
+            self._run_rpc_task(task)
 
             if task.method == "pause_scheduler":
-                # Leave the rest of the queue for the next pass: the caller is
-                # free to sleep as soon as the ACK lands, and the batch that
-                # just ran still has to be delivered off the device.
+                # A dequeued pause ends this drain whatever became of it, so
+                # the batch that just ran is delivered before anything the
+                # caller queued behind the pause. The rest of the queue is
+                # picked up on the next pass of the busy loop.
                 return
+
+    def _run_rpc_task(self, task: _RpcTask) -> None:
+        fut = task.future
+        if fut.cancelled() or fut.done():
+            return
+
+        remaining: float | None = None
+        if task.deadline is not None:
+            remaining = task.deadline - time.monotonic()
+            if remaining <= 0:
+                if not fut.done():
+                    fut.set_exception(TimeoutError(f"RPC call to {task.method} timed out before execution."))
+                return
+
+        try:
+            if task.method == "pause_scheduler":
+                result = self._run_pause_barrier(remaining)
+            elif task.method == "resume_scheduler":
+                result = self._open_scheduling_gate()
+            else:
+                result = self.executor.collective_rpc(
+                    method=task.method,
+                    timeout=remaining,
+                    args=task.args,
+                    kwargs=task.kwargs,
+                    unique_reply_rank=task.unique_reply_rank,
+                )
+        except BaseException as exc:  # noqa: BLE001 - propagate to caller
+            # The future may have been cancelled (e.g. by a sync timeout
+            # or asyncio cancellation) while the executor call was
+            # running. Setting state on a cancelled/done future raises
+            # InvalidStateError, which would kill the busy loop.
+            if not fut.done():
+                fut.set_exception(exc)
+        else:
+            if not fut.done():
+                fut.set_result(result)
 
     def _fail_pending_rpcs(self, exc: BaseException) -> None:
         while True:

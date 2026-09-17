@@ -738,6 +738,43 @@ async def test_keep_pause_ack_does_not_release_later_rpcs_before_the_batch_is_em
 
 
 @pytest.mark.asyncio
+async def test_timed_out_pause_still_ends_the_drain_before_the_batch_is_emitted():
+    """A pause whose caller already gave up is still a drain barrier: its
+    cancelled task must not let a later RPC run before the batch is emitted.
+    """
+    loop = asyncio.get_running_loop()
+    engine = _make_engine_with_loop(loop)
+    methods_at_emit: list[list[str]] = []
+    emit_outputs = engine._emit_outputs
+
+    def _recording_emit(*args, **kwargs):
+        methods_at_emit.append(_methods(engine))
+        return emit_outputs(*args, **kwargs)
+
+    engine._emit_outputs = _recording_emit
+    try:
+        gate = engine.executor.gates["A"] = threading.Event()
+        a = _submit(engine, "A")
+        await _wait_until(lambda: _executed(engine) == [("A", "v1")])
+
+        # The caller times out while A is still executing: the pause future is
+        # cancelled, but its task stays queued ahead of the sleep.
+        with pytest.raises(TimeoutError):
+            await _pause(engine, timeout=0.1)
+        sleep_rpc = asyncio.create_task(engine.async_collective_rpc("handle_sleep_task", args=("t",)))
+        await _wait_until(lambda: engine._rpc_queue.qsize() == 2)
+        gate.set()
+
+        assert (await asyncio.wait_for(a, 3.0)).error == "result_for_A"
+        assert (await asyncio.wait_for(sleep_rpc, 3.0)).error == "rpc_result_for_t"
+    finally:
+        _stop_engine(engine)
+
+    assert _methods(engine) == ["execute_model", "handle_sleep_task"]
+    assert methods_at_emit and "handle_sleep_task" not in methods_at_emit[0]
+
+
+@pytest.mark.asyncio
 async def test_pause_rejects_unsupported_modes_without_closing_the_gate():
     loop = asyncio.get_running_loop()
     engine = _make_engine_with_loop(loop)
