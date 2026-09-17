@@ -1880,6 +1880,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             ]
 
         if pooler_inter and self._should_accumulate_full_payload_output():
+            cache_keys = {"hidden"} if combined_hidden_states is not None else set()
+            if self.omni_prefix_cache is not None and combined_multimodal_outputs is not None:
+                cache_keys.update(self.omni_prefix_cache.mm_cache_keys & combined_multimodal_outputs.keys())
+            prefix_cache_keys = frozenset(cache_keys)
             with record_function_or_nullcontext("omni_output_builder:accumulate_full_payload_output"):
                 for i, rid in enumerate(req_ids_output_copy):
                     req_state = self.requests.get(rid)
@@ -1892,6 +1896,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                                 req_state.num_computed_tokens,
                                 req_state.num_computed_tokens + scheduler_output.num_scheduled_tokens[rid],
                             ),
+                            prefix_cache_keys=prefix_cache_keys,
                         )
 
         with record_function_or_nullcontext("omni_output_builder:build_multimodal_outputs"):

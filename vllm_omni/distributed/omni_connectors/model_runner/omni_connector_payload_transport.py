@@ -633,6 +633,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         output: dict[str, Any],
         token_range: tuple[int, int],
         replace_keys: frozenset[str],
+        prefix_cache_keys: frozenset[str],
     ) -> dict[str, Any]:
         """Keep previously emitted positions when an AR step replays a prefix."""
         start, end = token_range
@@ -647,8 +648,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     continue
                 if isinstance(value, torch.Tensor) and value.ndim >= 2 and key not in replace_keys:
                     num_rows = value.shape[0]
-                    # Prefix-cache recovery can include rows before this step.
-                    row_start = 0 if num_rows == end else start
+                    # Only cache-merged token-aligned tensors carry rows before this step.
+                    row_start = end - num_rows if key in prefix_cache_keys else start
                     overlap = previous_end - row_start
                     if overlap > 0:
                         if num_rows != end - row_start:
@@ -669,6 +670,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         request: Any,
         *,
         token_range: tuple[int, int] | None = None,
+        prefix_cache_keys: frozenset[str] = frozenset(),
     ) -> None:
         """Accumulate pooler_output for a request across steps (full_payload_mode).
 
@@ -677,6 +679,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         with the latest value.
 
         AR callers provide the executed input-token range [start, end).
+        prefix_cache_keys identifies token-aligned tensors from the cache merge.
         Previously emitted positions survive preemption: replayed prefixes
         are skipped and only a new suffix is appended. Non-token-aligned
         tensors cannot be sliced across a partial replay boundary. One-shot
@@ -697,7 +700,9 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         if token_range is not None:
             if existing is None:
                 self._full_payload_token_ends.pop(req_id, None)
-            pooler_output = self._reconcile_full_payload_output(req_id, pooler_output, token_range, replace_keys)
+            pooler_output = self._reconcile_full_payload_output(
+                req_id, pooler_output, token_range, replace_keys, prefix_cache_keys
+            )
             if not pooler_output:
                 return
 

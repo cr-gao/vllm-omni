@@ -516,14 +516,29 @@ def _make_async_output_runner(engine_output_type: str = "audio"):
     return runner
 
 
-def test_build_omni_output_uses_snapshots_after_accumulation(monkeypatch):
+@pytest.mark.parametrize("cache_merge", [False, True])
+def test_build_omni_output_uses_snapshots_after_accumulation(monkeypatch, cache_merge):
     runner = _make_async_output_runner()
     events = []
     ranges = {}
     runner.requests["r1"].num_computed_tokens = 10
     runner.requests["r2"].num_computed_tokens = 20
 
-    def accumulate(self, rid, payload, request, *, token_range):
+    if cache_merge:
+        runner.omni_prefix_cache = object.__new__(OmniPrefixCacheManager)
+        runner.omni_prefix_cache.mm_cache_keys = {"foo", "not_emitted"}
+        combined_hidden = {"r1": torch.tensor([[1.0]]), "r2": torch.tensor([[2.0], [3.0]])}
+        combined_mm = {"foo": combined_hidden, "passthrough": {"r1": 1, "r2": 2}}
+        monkeypatch.setattr(GPUARModelRunner, "_stage_deferred_prefix_cache_mm_outputs", lambda *args, **kwargs: None)
+        monkeypatch.setattr(GPUARModelRunner, "_model_needs_full_prefix_hidden_states", lambda self: True)
+        monkeypatch.setattr(
+            GPUARModelRunner,
+            "_prepare_prefix_cache_pooler_payload_sources",
+            lambda *args, **kwargs: (None, combined_hidden, combined_mm),
+        )
+
+    def accumulate(self, rid, payload, request, *, token_range, prefix_cache_keys):
+        assert prefix_cache_keys == (frozenset({"hidden", "foo"}) if cache_merge else frozenset())
         events.append(f"accumulate:{rid}")
         ranges[rid] = token_range
 
@@ -1044,7 +1059,7 @@ def test_build_omni_output_never_leaks_internal_pooler_output_on_wire(monkeypatc
     monkeypatch.setattr(
         GPUARModelRunner,
         "accumulate_full_payload_output",
-        lambda self, rid, payload, request, *, token_range: None,
+        lambda self, rid, payload, request, *, token_range, prefix_cache_keys: None,
     )
     monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
 

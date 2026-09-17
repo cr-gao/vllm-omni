@@ -261,7 +261,11 @@ def test_replay_preserves_snapshot_metadata_and_handles_recovered_prefix(runner)
     )
     # Cache recovery emits the whole prefix plus the newly executed suffix.
     runner.accumulate_full_payload_output(
-        "r", {"hidden": torch.full((6, 2), 2), "snapshot": torch.full((3, 3), 2), "meta": 6}, req, token_range=(4, 6)
+        "r",
+        {"hidden": torch.full((6, 2), 2), "snapshot": torch.full((3, 3), 2), "meta": 6},
+        req,
+        token_range=(4, 6),
+        prefix_cache_keys=frozenset({"hidden"}),
     )
     payload, _ = runner._materialize_full_payload_entry(runner._pending_full_payload_send["r"])
     assert torch.equal(payload["hidden"], torch.cat([torch.ones(4, 2), torch.full((2, 2), 2)]))
@@ -277,3 +281,20 @@ def test_ambiguous_partial_replay_fails_without_advancing_positions(runner):
     assert runner._full_payload_token_ends["r"] == {"audio": 4}
     payload, _ = runner._materialize_full_payload_entry(runner._pending_full_payload_send["r"])
     assert torch.equal(payload["audio"], torch.ones(20, 2))
+
+
+@pytest.mark.parametrize("previous_end", [2, 3], ids=["new-delta", "partial-replay"])
+def test_scaled_delta_is_not_inferred_as_cached_prefix(runner, previous_end):
+    original = torch.ones(previous_end * 2, 2)
+    runner.accumulate_full_payload_output("r", {"audio": original}, None, token_range=(0, previous_end))
+    delta = torch.full((4, 2), 2)
+    if previous_end == 3:
+        with pytest.raises(ValueError, match="do not align with token range"):
+            runner.accumulate_full_payload_output("r", {"audio": delta}, None, token_range=(2, 4))
+        expected = original
+    else:
+        runner.accumulate_full_payload_output("r", {"audio": delta}, None, token_range=(2, 4))
+        expected = torch.cat([original, delta])
+    payload, _ = runner._materialize_full_payload_entry(runner._pending_full_payload_send["r"])
+    assert torch.equal(payload["audio"], expected)
+    assert runner._full_payload_token_ends["r"]["audio"] == (3 if previous_end == 3 else 4)
