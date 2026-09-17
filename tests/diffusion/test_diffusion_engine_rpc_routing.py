@@ -60,9 +60,10 @@ class _ConcurrencyTrackingExecutor:
         self.is_failed = False
         self._closed = False
         self.od_config = SimpleNamespace()
-        # Pause tests: a request whose gate is registered blocks inside the
-        # executor until the gate is set; ``version`` tags each call so a test
-        # can tell which "weights" a request ran on.
+        # Pause tests: a call whose gate is registered (by request id, or by
+        # method name for ``synchronize_device``) blocks inside the executor
+        # until the gate is set; ``version`` tags each call so a test can tell
+        # which "weights" a request ran on.
         self.gates: dict[str, threading.Event] = {}
         self.version = "v1"
 
@@ -93,6 +94,9 @@ class _ConcurrencyTrackingExecutor:
             if self.rpc_delay:
                 time.sleep(self.rpc_delay)
             if method == "synchronize_device":
+                gate = self.gates.get(method)
+                if gate is not None:
+                    gate.wait(timeout=5.0)
                 return [None]
             # Distinguish per-request execution from raw RPC by method name.
             if method in {"execute_model", "execute_stepwise", "generate"}:
@@ -691,6 +695,46 @@ async def test_keep_pause_acks_after_running_batch_and_freezes_queue():
         assert _executed(engine) == [("A", "v1"), ("B", "v2")]
     finally:
         _stop_engine(engine)
+
+
+@pytest.mark.asyncio
+async def test_keep_pause_ack_does_not_release_later_rpcs_before_the_batch_is_emitted():
+    """A pause ACK must not open the queue to RPCs that touch device memory
+    (sleep) before the batch that just ran has been delivered.
+    """
+    loop = asyncio.get_running_loop()
+    engine = _make_engine_with_loop(loop)
+    barrier_gate = engine.executor.gates["synchronize_device"] = threading.Event()
+    methods_at_emit: list[list[str]] = []
+    emit_outputs = engine._emit_outputs
+
+    def _recording_emit(*args, **kwargs):
+        methods_at_emit.append(_methods(engine))
+        return emit_outputs(*args, **kwargs)
+
+    engine._emit_outputs = _recording_emit
+    try:
+        gate = engine.executor.gates["A"] = threading.Event()
+        a = _submit(engine, "A")
+        await _wait_until(lambda: _executed(engine) == [("A", "v1")])
+        pause = asyncio.create_task(_pause(engine))
+        await _wait_until(lambda: engine._scheduling_paused)
+        gate.set()
+        # The barrier holds the busy loop inside the post-execute RPC drain,
+        # so the sleep is queued before the pause ACK is published.
+        await _wait_until(lambda: "synchronize_device" in _methods(engine))
+        sleep_rpc = asyncio.create_task(engine.async_collective_rpc("handle_sleep_task", args=("t",)))
+        await _wait_until(lambda: not engine._rpc_queue.empty())
+        barrier_gate.set()
+
+        await asyncio.wait_for(pause, 3.0)
+        assert (await asyncio.wait_for(a, 3.0)).error == "result_for_A"
+        assert (await asyncio.wait_for(sleep_rpc, 3.0)).error == "rpc_result_for_t"
+    finally:
+        _stop_engine(engine)
+
+    assert _methods(engine) == ["execute_model", "synchronize_device", "handle_sleep_task"]
+    assert methods_at_emit and "handle_sleep_task" not in methods_at_emit[0]
 
 
 @pytest.mark.asyncio

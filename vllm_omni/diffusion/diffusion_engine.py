@@ -753,6 +753,12 @@ class DiffusionEngine:
                 if not fut.done():
                     fut.set_result(result)
 
+            if task.method == "pause_scheduler":
+                # Leave the rest of the queue for the next pass: the caller is
+                # free to sleep as soon as the ACK lands, and the batch that
+                # just ran still has to be delivered off the device.
+                return
+
     def _fail_pending_rpcs(self, exc: BaseException) -> None:
         while True:
             try:

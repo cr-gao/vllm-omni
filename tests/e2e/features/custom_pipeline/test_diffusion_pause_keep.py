@@ -9,6 +9,10 @@ is issued while A is still running. The pause must return only after A has
 been delivered, B must stay queued through ``sleep`` / ``wake_up``, and B may
 start only after ``resume_generation``.
 
+A second test follows the order the docs recommend for a weight update: sleep
+is issued as soon as the pause returns, without awaiting the request that was
+running, which must still be delivered intact.
+
 Both single-GPU executor backends are covered explicitly: ``uni`` (in-process
 worker) and ``mp`` (worker process with the asynchronous D2H output thread).
 
@@ -149,6 +153,44 @@ async def test_keep_pause_sleep_wake_resume_lifecycle(backend: str):
             f"pause_latency_s min/median/max="
             f"{min(pause_latencies):.3f}/{sorted(pause_latencies)[ROUNDS // 2]:.3f}/{max(pause_latencies):.3f}"
         )
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["uni", "mp"])
+async def test_sleep_right_after_keep_pause_keeps_the_running_batch(backend: str):
+    """The documented weight-update order: sleep is issued as soon as the pause
+    returns, with the request that was running still un-awaited.
+    """
+    with ExitStack() as after:
+        engine = AsyncOmni(
+            model=MODEL,
+            custom_pipeline_args={"pipeline_class": CUSTOM_PIPELINE_CLASS},
+            worker_extension_cls=WORKER_EXTENSION_CLASS,
+            enforce_eager=True,
+            enable_sleep_mode=True,
+            distributed_executor_backend=backend,
+        )
+        after.callback(engine.shutdown)
+        events: dict[str, dict[str, float]] = defaultdict(dict)
+
+        a = asyncio.create_task(_generate(engine, "a", events))
+        await _wait_for(lambda: "started" in events["a"])
+        await asyncio.sleep(0.05)
+        assert not a.done(), "A finished before the pause was issued; raise NUM_INFERENCE_STEPS"
+
+        await engine.pause_generation(mode="keep", clear_cache=False)
+        await engine.sleep(level=1)
+
+        a_output = await asyncio.wait_for(a, 60.0)
+        assert a_output.images, "A must survive a sleep issued right after the pause ACK"
+
+        await engine.wake_up()
+        await engine.resume_generation()
+        b_output = await asyncio.wait_for(_generate(engine, "b", events), 120.0)
+        assert b_output.images, "the stage must generate again after wake and resume"
 
 
 @pytest.mark.core_model

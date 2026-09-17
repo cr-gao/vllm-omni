@@ -46,6 +46,18 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Only these EngineCore helpers may skip collective_rpc_async (a generic
+# ``{method}_async`` on AsyncMPClient must not silently drop timeout), and they
+# are the only methods whose worker exceptions leave StagePool.collective_rpc.
+ENGINE_CORE_CONTROL_METHODS = frozenset(
+    {
+        "pause_scheduler",
+        "resume_scheduler",
+        "sleep",
+        "wake_up",
+    }
+)
+
 
 class StageUnavailableError(RuntimeError):
     """Raised when dispatch cannot reach a live replica of a stage.
@@ -97,16 +109,6 @@ class StagePool:
 
     DISPATCH_WAIT_TIMEOUT_S: float = 10.0
     DISPATCH_RETRY_INTERVAL_S: float = 0.1
-    # Only these EngineCore helpers may skip collective_rpc_async. A generic
-    # ``{method}_async`` on AsyncMPClient must not silently drop timeout.
-    _ENGINE_CORE_CONTROL_ASYNC_METHODS = frozenset(
-        {
-            "pause_scheduler",
-            "resume_scheduler",
-            "sleep",
-            "wake_up",
-        }
-    )
 
     def __init__(
         self,
@@ -1294,7 +1296,7 @@ class StagePool:
                 "error": f"stage {self.stage_id} replica {replica_id} is not attached",
             }
         try:
-            if self.stage_type != "diffusion" and method in self._ENGINE_CORE_CONTROL_ASYNC_METHODS:
+            if self.stage_type != "diffusion" and method in ENGINE_CORE_CONTROL_METHODS:
                 client_method = getattr(client, f"{method}_async", None)
                 if callable(client_method):
                     result = client_method(*args, **kwargs)
@@ -1315,7 +1317,7 @@ class StagePool:
                 replica_id,
                 method,
             )
-            if method in self._ENGINE_CORE_CONTROL_ASYNC_METHODS:
+            if method in ENGINE_CORE_CONTROL_METHODS:
                 raise
             if isinstance(exc, TimeoutError):
                 error = f"{type(exc).__name__}: {method} timed out after {timeout}s"

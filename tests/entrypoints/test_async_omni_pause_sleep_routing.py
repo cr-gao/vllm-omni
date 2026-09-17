@@ -558,9 +558,13 @@ def test_keep_targets_only_requested_diffusion_stages():
 
         await omni.resume_generation(stage_ids=[0])
         assert _rpc_methods(omni) == [("pause_scheduler", [1])]
+        # Stage 1's scheduler is still closed: admission must stay closed too,
+        # otherwise new requests queue on a stage that will not schedule them.
+        assert await omni.is_paused() is True
 
         await omni.resume_generation(stage_ids=[1])
         assert _rpc_methods(omni) == [("pause_scheduler", [1]), ("resume_scheduler", [1])]
+        assert await omni.is_paused() is False
 
         await omni.resume_generation()
         assert len(_rpc_methods(omni)) == 2
