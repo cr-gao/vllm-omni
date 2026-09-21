@@ -1,4 +1,3 @@
-
 """Background KV prefetch — CPU-testable mechanism.
 
 Covers opt-in gating, the start_prefetch / consume_prefetched_kv round trip over a
