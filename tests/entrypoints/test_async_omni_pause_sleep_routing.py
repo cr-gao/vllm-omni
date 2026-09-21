@@ -25,7 +25,7 @@ def _make_omni(*, stage_types: list[str]) -> AsyncOmni:
     omni._paused = False
     omni._admitting = 0
     omni._hold_admission_until_resume = False
-    omni._diffusion_keep_stage_ids = set()
+    omni._paused_stage_ids = set()
     omni._sleeping_tags = set()
     omni._stage_sleeping_tags = {}
     omni._level2_sleeping = False
@@ -618,7 +618,7 @@ def test_keep_failure_surfaces_and_leaves_explicit_resume_possible(failure):
             await omni.pause_generation(mode="keep", clear_cache=False)
 
         assert await omni.is_paused() is True
-        assert omni._diffusion_keep_stage_ids == {0}
+        assert omni._paused_stage_ids == {0}
 
         omni.collective_rpc = AsyncMock(return_value=[None])
         await omni.resume_generation()
@@ -629,7 +629,7 @@ def test_keep_failure_surfaces_and_leaves_explicit_resume_possible(failure):
             stage_ids=[0],
         )
         assert await omni.is_paused() is False
-        assert omni._diffusion_keep_stage_ids == set()
+        assert omni._paused_stage_ids == set()
 
     asyncio.run(run())
 
@@ -645,6 +645,41 @@ def test_resume_failure_keeps_admission_paused_and_target_recorded():
             await omni.resume_generation()
 
         assert await omni.is_paused() is True
-        assert omni._diffusion_keep_stage_ids == {0}
+        assert omni._paused_stage_ids == {0}
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("first, second", [([1], [0]), ([0], [1])])
+def test_mixed_engine_partial_resume_keeps_admission_paused(first, second):
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "diffusion"])
+        await omni.pause_generation(mode="keep", clear_cache=False)
+
+        await omni.resume_generation(stage_ids=first)
+        assert await omni.is_paused() is True
+
+        await omni.resume_generation(stage_ids=second)
+        assert await omni.is_paused() is False
+        assert _rpc_methods(omni)[2:] == [("resume_scheduler", first), ("resume_scheduler", second)]
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_two_ar_stages_partial_resume_keeps_admission_paused():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "llm"])
+        omni.reset_prefix_cache = AsyncMock(return_value=True)
+        omni.reset_mm_cache = AsyncMock()
+        omni.reset_encoder_cache = AsyncMock()
+        await omni.pause_generation(mode="abort")
+
+        await omni.resume_generation(stage_ids=[0])
+        assert await omni.is_paused() is True
+
+        await omni.resume_generation(stage_ids=[1])
+        assert await omni.is_paused() is False
 
     asyncio.run(run())

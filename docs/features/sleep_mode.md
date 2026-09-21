@@ -67,7 +67,7 @@ Support matrix and limits:
 | :--- | :--- |
 | Request-level execution (`step_execution=False`) with the in-process (`uni`) executor | Supported |
 | Request-level execution with the multi-process (`mp`) executor, including asynchronous output | Supported; the acknowledgement waits for the output copies |
-| Request-level execution with asynchronous KV prefetch | Supported; a prefetch still in flight only writes its own buffers and is consumed after resume |
+| Request-level execution with asynchronous KV prefetch | Supported; the acknowledgement joins any prefetch still in flight |
 | Step-level execution (`step_execution=True` / streaming output) | Not supported: the call raises `NotImplementedError` |
 | `mode="abort"` / `mode="wait"` / `wait_for_inflight_requests=True` on a diffusion stage | Unchanged: frontend admission is paused only |
 
@@ -78,9 +78,10 @@ Behavior notes:
 * A timeout or error from `pause_generation` means the pause did **not** complete; the scheduler
   stays closed and the caller must retry the pause or call `resume_generation()` explicitly. Do not
   sleep or mutate weights after a failed pause.
-* `resume_generation(stage_ids=...)` that leaves another keep-paused stage closed keeps frontend
-  admission closed as well, so new requests cannot queue on a stage that will not schedule them.
-  Admission reopens once every keep-paused stage has been resumed.
+* `resume_generation(stage_ids=...)` that leaves another paused stage closed (an AR stage, or a
+  keep-paused diffusion stage) keeps frontend admission closed as well, so new requests cannot
+  queue on a stage that will not schedule them. Admission reopens once every stage paused by
+  `pause_generation` has been resumed.
 * `clear_cache` has no diffusion-specific effect.
 * Without a pause call nothing changes: no barrier runs and batching, abort and output ordering are
   as before.

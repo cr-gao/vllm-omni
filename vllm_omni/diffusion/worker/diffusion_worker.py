@@ -858,11 +858,16 @@ class DiffusionWorker:
         return True
 
     def synchronize_device(self, timeout: float | None = None) -> None:
-        """Wait until this rank has no device work left from the batch that ran.
+        """Wait until this rank has no device work left.
 
-        ``timeout`` bounds the output drain that the multi-process worker
-        runs before this call; the device wait itself is unbounded.
+        A KV prefetch still receiving on its background thread has queued no
+        device work yet, so it is joined first. ``timeout`` bounds that join
+        (and the multi-process worker's output drain before this call); the
+        device wait itself is unbounded.
         """
+        manager = getattr(self.model_runner, "kv_transfer_manager", None)
+        if manager is not None and not manager.wait_prefetch(timeout=timeout):
+            raise TimeoutError("Diffusion KV prefetch did not finish before pause")
         current_omni_platform.synchronize()
 
     def handle_sleep_task(self, task: OmniSleepTask | dict) -> OmniACK | None:

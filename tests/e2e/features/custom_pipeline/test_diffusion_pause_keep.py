@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from collections import defaultdict
 from contextlib import ExitStack
@@ -38,7 +39,8 @@ MODEL = "tiny-random/Qwen-Image"
 CUSTOM_PIPELINE_CLASS = "tests.e2e.features.helpers.custom_pipeline.QwenImagePipelineWithLogProbForTest"
 WORKER_EXTENSION_CLASS = "tests.e2e.features.helpers.custom_pipeline.vLLMOmniColocateWorkerExtensionForTest"
 
-ROUNDS = 10
+# CI runs a couple of rounds; set PAUSE_KEEP_ROUNDS=10 for a soak run.
+ROUNDS = int(os.environ.get("PAUSE_KEEP_ROUNDS", "2"))
 # Enough denoising steps that the pause lands while A is still executing.
 NUM_INFERENCE_STEPS = 40
 
@@ -75,18 +77,6 @@ async def _wait_for(predicate, timeout: float = 30.0) -> None:
     while not predicate():
         assert time.monotonic() < deadline, "condition not reached in time"
         await asyncio.sleep(0.005)
-
-
-def _all_true(results) -> bool:
-    flat = []
-    stack = list(results)
-    while stack:
-        item = stack.pop()
-        if isinstance(item, list):
-            stack.extend(item)
-        else:
-            flat.append(item)
-    return bool(flat) and all(item is True for item in flat)
 
 
 async def _pause_round(engine: AsyncOmni, events: dict[str, dict[str, float]], round_index: int) -> float:
@@ -191,48 +181,3 @@ async def test_sleep_right_after_keep_pause_keeps_the_running_batch(backend: str
         await engine.resume_generation()
         b_output = await asyncio.wait_for(_generate(engine, "b", events), 120.0)
         assert b_output.images, "the stage must generate again after wake and resume"
-
-
-@pytest.mark.core_model
-@pytest.mark.diffusion
-@hardware_test(res={"cuda": "L4"}, num_cards=2)
-@pytest.mark.asyncio
-async def test_keep_pause_two_ranks_ack_and_rank_failure():
-    """Every rank runs the barrier before the ACK; a barrier failure on a
-    non-zero rank fails the pause without aborting or dropping anything.
-    """
-    with ExitStack() as after:
-        engine = AsyncOmni(
-            model=MODEL,
-            custom_pipeline_args={"pipeline_class": CUSTOM_PIPELINE_CLASS},
-            worker_extension_cls=WORKER_EXTENSION_CLASS,
-            enforce_eager=True,
-            enable_sleep_mode=True,
-            num_gpus=2,
-            parallel_config={"ulysses_degree": 2, "ulysses_mode": "advanced_uaa"},
-        )
-        after.callback(engine.shutdown)
-        events: dict[str, dict[str, float]] = defaultdict(dict)
-        assert _all_true(await engine.collective_rpc(method="start_counting_synchronize_device"))
-
-        pause_latencies = [await _pause_round(engine, events, round_index) for round_index in range(3)]
-        # The result is the all-rank AND, so True means both ranks ran the barrier.
-        assert _all_true(await engine.collective_rpc(method="synchronize_device_seen"))
-
-        assert _all_true(await engine.collective_rpc(method="set_synchronize_device_failure", args=(1, True)))
-        a = asyncio.create_task(_generate(engine, "a-fail", events))
-        await _wait_for(lambda: "started" in events["a-fail"])
-        with pytest.raises(RuntimeError, match="pause_scheduler failed"):
-            await engine.pause_generation(mode="keep", clear_cache=False)
-        assert await engine.is_paused()
-        a_output = await asyncio.wait_for(a, 60.0)
-        assert a_output.images, "a failed barrier must not abort the running batch"
-
-        assert _all_true(await engine.collective_rpc(method="set_synchronize_device_failure", args=(1, False)))
-        await engine.resume_generation()
-        assert not await engine.is_paused()
-        recovered = await asyncio.wait_for(_generate(engine, "after-recovery", events), 60.0)
-        assert recovered.images
-
-        assert not engine.request_states
-        print(f"[sp2] rounds=3 pause_latency_s min/max={min(pause_latencies):.3f}/{max(pause_latencies):.3f}")

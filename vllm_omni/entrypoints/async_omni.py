@@ -95,9 +95,10 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # sleep uses _paused as a temporary admission gate and clears it
         # on wake so sleep → wake → generate keeps working.
         self._hold_admission_until_resume: bool = False
-        # Diffusion stages paused with mode="keep"; resume_generation must
-        # reopen their schedulers before admission is restored.
-        self._diffusion_keep_stage_ids: set[int] = set()
+        # Stages whose scheduler pause_generation closed (AR in any mode,
+        # diffusion with mode="keep"); admission stays closed until
+        # resume_generation has reopened all of them.
+        self._paused_stage_ids: set[int] = set()
         self._sleeping_tags: set[str] = set()
         self._stage_sleeping_tags: dict[int, set[str]] = {}
         self._level2_sleeping: bool = False
@@ -722,6 +723,11 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             self._hold_admission_until_resume = True
 
         ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
+        if mode != "keep":
+            diffusion_stage_ids = []
+        # Recorded before the RPCs so a failed or cancelled pause can still
+        # be undone with an explicit resume_generation.
+        self._paused_stage_ids.update(ar_stage_ids, diffusion_stage_ids)
         if ar_stage_ids:
             logger.info(
                 "[%s] Pausing AR stage(s) %s via EngineCore.pause_scheduler(mode=%s)",
@@ -736,10 +742,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 stage_ids=ar_stage_ids,
                 kwargs={"mode": mode, "clear_cache": clear_cache},
             )
-        if diffusion_stage_ids and mode == "keep":
-            # Recorded before the RPC so a failed or cancelled pause can still
-            # be undone with an explicit resume_generation.
-            self._diffusion_keep_stage_ids.update(diffusion_stage_ids)
+        if diffusion_stage_ids:
             logger.info(
                 "[%s] Pausing diffusion stage(s) %s via DiffusionEngine pause_scheduler(mode=keep)",
                 self._name,
@@ -767,19 +770,20 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         if ar_stage_ids:
             logger.info("[%s] Resuming AR stage(s) %s via EngineCore", self._name, ar_stage_ids)
             await self._engine_core_rpc("resume_scheduler", stage_ids=ar_stage_ids)
-        keep_stage_ids = [sid for sid in diffusion_stage_ids if sid in self._diffusion_keep_stage_ids]
-        if keep_stage_ids:
-            logger.info("[%s] Resuming diffusion stage(s) %s via DiffusionEngine", self._name, keep_stage_ids)
-            await self._engine_core_rpc("resume_scheduler", stage_ids=keep_stage_ids)
-            self._diffusion_keep_stage_ids.difference_update(keep_stage_ids)
+            self._paused_stage_ids.difference_update(ar_stage_ids)
+        diffusion_stage_ids = [sid for sid in diffusion_stage_ids if sid in self._paused_stage_ids]
+        if diffusion_stage_ids:
+            logger.info("[%s] Resuming diffusion stage(s) %s via DiffusionEngine", self._name, diffusion_stage_ids)
+            await self._engine_core_rpc("resume_scheduler", stage_ids=diffusion_stage_ids)
+            self._paused_stage_ids.difference_update(diffusion_stage_ids)
 
-        if self._diffusion_keep_stage_ids:
+        if self._paused_stage_ids:
             # Reopening admission now would let new requests queue on a stage
             # whose scheduler is still closed.
             logger.info(
-                "[%s] Admission stays paused: diffusion stage(s) %s are still keep-paused",
+                "[%s] Admission stays paused: stage(s) %s are still paused",
                 self._name,
-                sorted(self._diffusion_keep_stage_ids),
+                sorted(self._paused_stage_ids),
             )
             return
 
