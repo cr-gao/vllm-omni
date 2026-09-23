@@ -540,7 +540,7 @@ class OmniPrefixCacheManager:
                 if num_computed > 0:
                     # block_ids is per-kv-group; group 0 only.
                     block_groups = event.block_ids
-                    if not block_groups:
+                    if not block_groups or not block_groups[0]:
                         # Fail at the cause: a hit we cannot snapshot now would
                         # crash at materialize time with less context (materialize is
                         # forbidden from reading the live batch).
@@ -606,7 +606,7 @@ class OmniPrefixCacheManager:
         num_sched = {write.req_id: write.row_end - write.row_start for write in write_layout.writes}
         query_start = {write.req_id: write.row_start for write in write_layout.writes}
 
-        slots_cpu: torch.Tensor | None = None
+        slots_cpu: torch.Tensor | None = write_layout.slots_cpu
         mm_outputs = mm_outputs or {}
         freeze_event = None
 
@@ -614,10 +614,8 @@ class OmniPrefixCacheManager:
         if num_tokens_unpadded > 0:
             # Derive the slot mapping on CPU: reading the device one back
             # would need a stream sync that waits on the whole forward.
-            slots_cpu = torch.tensor(
-                [slot for write in write_layout.writes for slot in write.slots],
-                dtype=torch.long,
-            )
+            if slots_cpu is None:
+                raise ValueError("write_layout is missing its CPU slot snapshot")
             if int(slots_cpu.numel()) != num_tokens_unpadded:
                 # Fail at the cause: skipping the save would leave rows absent
                 # behind hashes vLLM already published — a delayed crash at

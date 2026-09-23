@@ -36,7 +36,11 @@ except ModuleNotFoundError:
     sys.modules["vllm"] = _vllm
     sys.modules["vllm.logger"] = _vllm_logger
 
-from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
+from vllm_omni.core.prefix_cache.adapter import (
+    PrefixCacheEventKind,
+    PrefixCacheRequestEvent,
+    PrefixCacheSchedulerAdapter,
+)
 from vllm_omni.core.prefix_cache.controller import StagingBufferHolder
 from vllm_omni.core.prefix_cache.group_view import (
     FullAttentionGroupView,
@@ -347,6 +351,13 @@ def test_absent_hit_fails_fast():
         mgr.materialize(sid, ["c"])
     if d2h is not None:
         assert not mgr._controller._staging_pool._busy[d2h.staging_slot]
+
+
+def test_empty_hit_block_group_fails_at_register():
+    mgr, _ = make_manager()
+    event = PrefixCacheRequestEvent("empty", PrefixCacheEventKind.STARTED, hit_end=4, block_ids=((),))
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="carries no block_ids"):
+        mgr.new_step_starts((event,))
 
 
 def test_hit_not_block_aligned_fails_at_register():

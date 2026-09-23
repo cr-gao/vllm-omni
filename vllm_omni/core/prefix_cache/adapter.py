@@ -52,21 +52,21 @@ class PrefixCacheWrite:
     req_id: str
     row_start: int
     row_end: int
-    slots: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class PrefixCacheWriteLayout:
     writes: tuple[PrefixCacheWrite, ...]
     total_rows: int
+    slots_cpu: Any = None
 
 
 class PrefixCacheSchedulerAdapter:
     """Translate scheduler output and post-update batch state.
 
-    ``aborted_req_ids`` is deliberately optional: current main does not carry
-    an explicit abort side channel, and finished IDs must never be guessed to
-    be aborted.
+    ``aborted_req_ids`` is deliberately optional: current vLLM/Omni scheduler
+    outputs do not carry an explicit abort side channel yet. Finished IDs are
+    never guessed to be aborted.
     """
 
     def __init__(self) -> None:
@@ -116,6 +116,12 @@ class PrefixCacheSchedulerAdapter:
                     int(output_tokens[index]) if index < len(output_tokens) else 0,
                 )
 
+        # Clear terminal observations before classifying new requests. A
+        # request ID may be reused in the same scheduler step.
+        finished = set(getattr(scheduler_output, "finished_req_ids", ()) or ())
+        for req_id in sorted(finished | aborted):
+            self._observed_req_ids.discard(str(req_id))
+
         for data in getattr(scheduler_output, "scheduled_new_reqs", ()) or ():
             req_id = self._req_id(data)
             kind: PrefixCacheEventKind = (
@@ -152,12 +158,10 @@ class PrefixCacheSchedulerAdapter:
                 )
             )
 
-        finished = set(getattr(scheduler_output, "finished_req_ids", ()) or ())
         for req_id in sorted(finished | aborted):
             req_id = str(req_id)
             kind = PrefixCacheEventKind.ABORTED if req_id in aborted else PrefixCacheEventKind.FINISHED
             events.append(PrefixCacheRequestEvent(req_id, kind))
-            self._observed_req_ids.discard(req_id)
         return tuple(events)
 
     def translate_step(self, scheduler_output: Any) -> PrefixCacheStep:
@@ -189,8 +193,7 @@ class PrefixCacheSchedulerAdapter:
                     req_id,
                     start,
                     end,
-                    tuple(int(x) for x in slots[cursor : cursor + count].tolist()),
                 )
             )
             cursor += count
-        return PrefixCacheWriteLayout(tuple(writes), cursor)
+        return PrefixCacheWriteLayout(tuple(writes), cursor, slots)
