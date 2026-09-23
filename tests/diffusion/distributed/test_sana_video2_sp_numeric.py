@@ -123,9 +123,10 @@ def _worker(rank: int, world_size: int, backend: str, mode: str, port: int, dire
     from vllm_omni.platforms import current_omni_platform
 
     torch.set_num_threads(1)
+    local_rank = 0 if backend == "gloo" else rank
     os.environ.update(
         RANK=str(rank),
-        LOCAL_RANK=str(rank),
+        LOCAL_RANK=str(local_rank),
         WORLD_SIZE=str(world_size),
         MASTER_ADDR="127.0.0.1",
         MASTER_PORT=str(port),
@@ -133,7 +134,7 @@ def _worker(rank: int, world_size: int, backend: str, mode: str, port: int, dire
     device = torch.device("cpu" if backend == "gloo" else f"cuda:{rank}")
     if backend == "nccl":
         current_omni_platform.set_device(device)
-    init_distributed_environment(backend=backend)
+    init_distributed_environment(local_rank=local_rank, backend=backend)
     try:
         initialize_model_parallel(
             sequence_parallel_size=world_size,
