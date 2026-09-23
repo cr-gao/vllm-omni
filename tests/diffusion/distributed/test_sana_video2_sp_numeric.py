@@ -32,6 +32,8 @@ _ABS_LIMIT = 1e-5
 
 
 def _model(device: torch.device):
+    assert torch.get_float32_matmul_precision() == "highest"
+    assert not torch.backends.cuda.matmul.allow_tf32
     from vllm_omni.diffusion.models.sana_video2.transformer_sana_video2 import (
         SanaVideo2TransformerConfig,
         SanaVideo2TransformerModel,
@@ -100,7 +102,8 @@ def _trajectory(model, task: str, seed: int, device: torch.device):
 def _reference(cases, device: torch.device):
     model = _model(device)
     outputs = {}
-    with torch.no_grad():
+    # Keep the patch Conv3d in IEEE FP32 as well as the attention layers.
+    with torch.no_grad(), torch.backends.cudnn.flags(enabled=True, allow_tf32=False):
         for index, (task, dims) in enumerate(cases):
             outputs[f"forward_{index}"] = model(*_inputs(*dims, task, _SEED + index + 1, device)).cpu()
         outputs["sampling_t2v"] = _trajectory(model, "t2v", _SEED + 101, device)
@@ -144,13 +147,17 @@ def _worker(rank: int, world_size: int, backend: str, mode: str, port: int, dire
             ring_degree=1,
             ulysses_mode=mode,
         )
-        config = OmniDiffusionConfig(model="test", dtype=torch.float32, parallel_config=parallel)
+        config = OmniDiffusionConfig(model=directory, dtype=torch.float32, parallel_config=parallel)
         model = _model(device)
         model.load_state_dict(torch.load(f"{directory}/weights.pt", map_location=device, weights_only=True))
         sp_group = get_sp_group()
         model.set_sequence_parallel(sp_group)
         results = {}
-        with torch.no_grad(), set_forward_context(omni_diffusion_config=config):
+        with (
+            torch.no_grad(),
+            torch.backends.cudnn.flags(enabled=True, allow_tf32=False),
+            set_forward_context(omni_diffusion_config=config),
+        ):
             # All ranks reject the short request before any collective.
             short = _inputs(1, 1, 1, "t2v", _SEED + 99, device)
             try:
@@ -242,6 +249,7 @@ def test_gloo_fp32_dense_equivalence(world_size, mode, cases, tmp_path):
     "world_size,mode",
     [
         pytest.param(2, "strict", marks=hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=2)),
+        pytest.param(2, "advanced_uaa", marks=hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=2)),
         pytest.param(4, "advanced_uaa", marks=hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=4)),
         pytest.param(8, "advanced_uaa", marks=hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=8)),
     ],
@@ -249,4 +257,5 @@ def test_gloo_fp32_dense_equivalence(world_size, mode, cases, tmp_path):
 def test_nccl_fp32_dense_equivalence(world_size, mode, tmp_path):
     if torch.accelerator.device_count() < world_size:
         pytest.skip(f"requires {world_size} accessible CUDA devices")
-    _run(world_size, "nccl", mode, tmp_path, [("ti2v", (5, 2, 2)), ("t2v", (5, 2, 2))])
+    dims = (5, 2, 2) if mode == "strict" else (5, 1, 3)
+    _run(world_size, "nccl", mode, tmp_path, [("ti2v", dims), ("t2v", dims), ("ti2v", (4, 2, 2))])

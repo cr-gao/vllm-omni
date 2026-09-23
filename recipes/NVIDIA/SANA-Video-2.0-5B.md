@@ -112,8 +112,9 @@ the sampler and VAE remain replicated.
 | Configuration | Input contract | Validation status |
 | --- | --- | --- |
 | SP1 | Native path | Existing native evidence below |
-| SP2, `strict` | Token count divisible by 2 | Experimental; GPU acceptance pending |
-| SP2/4/8, `advanced_uaa` | At least one video token per rank | Experimental; GPU acceptance pending |
+| SP2, `strict` | Token count divisible by 2 | Narrow-model NCCL FP32 verified; real-checkpoint acceptance pending |
+| SP2, `advanced_uaa` | At least one video token per rank | Narrow-model NCCL FP32 verified; real-checkpoint acceptance pending |
+| SP4/8, `advanced_uaa` | At least one video token per rank | Experimental; GPU acceptance pending |
 
 The released model has 10 softmax heads. SP4/SP8 require `advanced_uaa`, which
 pads heads inside the shared communication strategy. Video tokens are split
@@ -163,6 +164,25 @@ These are maxima across the recorded cases/steps, compared with the same
 weights on SP1. SP4 includes 15 tokens split 4/4/4/3 and head padding 10 to 12.
 Neither the random narrow model nor CPU Gloo establishes GPU or video quality.
 
+Two A800-SXM4-80GB GPUs with NVLink also pass the narrow-model NCCL checks
+in both SP2 modes (PyTorch 2.13, vLLM 0.28, Diffusers 0.40, seed 8006):
+
+| Check | SP2 strict max abs / relative L2 | SP2 advanced max abs / relative L2 |
+| --- | --- | --- |
+| T2V/TI2V transformer, consecutive shapes | `6.56e-7 / 3.48e-7` | `7.75e-7 / 4.76e-7` |
+| Five-step T2V, CFG 8 | `1.91e-6 / 8.10e-7` | `1.91e-6 / 8.10e-7` |
+| Five-step TI2V, CFG 8 | `4.14e-6 / 2.03e-6` | `4.14e-6 / 2.03e-6` |
+
+These FP32 tests disable TF32 for the patch Conv3d and require IEEE FP32
+matmul, retaining native SDPA selection and the original `1e-5` gates.
+With the default cuDNN TF32 setting, the narrow-model TI2V trajectory reached
+`1.97e-5` maximum absolute error and failed the elementwise gate. Fixed-input
+replay and a Conv3d precision comparison localized the amplification to TF32
+rounding of the evolving latent. The production precision settings are
+unchanged; the strict FP32 result does not establish default-TF32 or BF16
+trajectory agreement. SP2 advanced includes 15 tokens split 8/7. SP4/SP8
+NCCL remain untested on this two-GPU host.
+
 ```bash
 python -m pytest -o addopts= -q tests/diffusion/models/sana_video2
 python -m pytest -o addopts= -s -q \
@@ -177,7 +197,7 @@ four/eight visible GPUs to exercise those degrees. Tests print maximum absolute
 and relative L2 error by rank and compare every recorded sampler step. FP32
 thresholds are fixed in the test; do not relax them to accommodate a failed run.
 
-GPU/NCCL correctness, BF16 drift, real-checkpoint SP1/SP agreement, decoded
+BF16 drift, real-checkpoint SP1/SP agreement, decoded
 video agreement, full-resolution numerical agreement and NVLink performance
 have **not** been established for this SP implementation. Before declaring a
 configuration supported, compare same-weight SP1/SP at 64x96/9 frames and
