@@ -13,6 +13,7 @@
 # limitations under the License.
 #
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Native inference transformer for the released SANA-Video 2.0 5B.
 
@@ -220,6 +221,8 @@ class SanaVideo2LoadReport:
 
 
 class SanaVideo2TransformerModel(nn.Module):
+    _sp_plan = {}
+
     def __init__(self, config: SanaVideo2TransformerConfig | Mapping | None = None):
         super().__init__()
         if config is None:
@@ -257,6 +260,24 @@ class SanaVideo2TransformerModel(nn.Module):
         )
         self.attn_res = BlockAttentionResidual(c.hidden_size)
         self.final_layer = T2IFinalLayer(c.hidden_size, c.patch_size, c.in_channels)
+        self._sp_group = None
+
+    def set_sequence_parallel(self, sp_group) -> None:
+        if sp_group is not None and sp_group.world_size > 1:
+            if sp_group.ring_world_size != 1 or sp_group.ulysses_world_size != sp_group.world_size:
+                raise ValueError("SANA-Video 2.0 requires pure Ulysses sequence parallelism")
+            from vllm_omni.diffusion.attention.parallel.ulysses import UlyssesParallelAttention
+
+            ulysses = UlyssesParallelAttention(sp_group, scatter_idx=2, gather_idx=1, use_sync=False)
+            self._sp_group = sp_group
+        else:
+            ulysses = None
+            self._sp_group = None
+        for kind, block in zip(self.block_attention_types, self.blocks):
+            if kind == "linear":
+                block.attn.set_sequence_parallel(self._sp_group)
+            else:
+                block.attn.set_sequence_parallel(ulysses)
 
     @property
     def dtype(self):
@@ -304,6 +325,27 @@ class SanaVideo2TransformerModel(nn.Module):
             if c.timestep_norm_scale_factor != 1.0
             else timestep.long().float()
         )
+        sp_group = self._sp_group
+        if sp_group is not None:
+            from vllm_omni.diffusion.forward_context import get_ulysses_mode
+
+            world_size = sp_group.world_size
+            total_tokens = frames * height * width
+            if total_tokens < world_size:
+                raise ValueError(f"Video tokens={total_tokens} must be at least SP world size={world_size}")
+            mode = get_ulysses_mode(default="strict")
+            if mode == "strict":
+                if total_tokens % world_size:
+                    raise ValueError("Ulysses strict mode requires equal token shards")
+                for kind, block in zip(self.block_attention_types, self.blocks):
+                    if kind == "softmax" and block.attn.heads % world_size:
+                        raise ValueError("Ulysses strict mode requires softmax heads divisible by SP world size")
+            elif mode != "advanced_uaa":
+                raise ValueError(f"Unsupported Ulysses mode: {mode}")
+            base, remainder = divmod(total_tokens, world_size)
+            sizes = [base + (rank < remainder) for rank in range(world_size)]
+            start = sum(sizes[: sp_group.rank_in_group])
+            stop = start + sizes[sp_group.rank_in_group]
         x = self.x_embedder(hidden_states.to(self.dtype))
         thw = (frames, height, width)
         ropes = {"linear": self.rope_linear(thw, x.device), "softmax": self.rope_softmax(thw, x.device)}
@@ -313,6 +355,13 @@ class SanaVideo2TransformerModel(nn.Module):
         y = self.y_embedder(y.to(self.dtype))
         if c.y_norm:
             y = self.attention_y_norm(y)
+        if sp_group is not None:
+            x = x[:, start:stop]
+            ropes = {kind: rope[:, :, start:stop] for kind, rope in ropes.items()}
+            if timestep.ndim == 3:
+                frame_indices = torch.arange(start, stop, device=x.device) // (height * width)
+                t0 = t0.index_select(2, frame_indices)
+                t = t.index_select(2, frame_indices)
         # Match the release inference buffer layout as well as its arithmetic.
         # In BF16, recomputing norms on a differently strided stack can change
         # rounding and compound through the learned depth projections.
@@ -338,6 +387,11 @@ class SanaVideo2TransformerModel(nn.Module):
                 partial = None
         x = self.attn_res.attend_buffer(self.attn_res.final_proj, values, keys, active_count, None)
         x = self.final_layer(x, t)
+        if sp_group is not None:
+            max_size = max(sizes)
+            padded = F.pad(x, (0, 0, 0, max_size - x.shape[1]))
+            parts = sp_group.all_gather(padded, dim=0, separate_tensors=True)
+            x = torch.cat([part[:, :size] for part, size in zip(parts, sizes)], dim=1)
         return x.transpose(1, 2).reshape(batch, c.in_channels, frames, height, width)
 
     def load_weights(self, weights) -> SanaVideo2LoadReport:

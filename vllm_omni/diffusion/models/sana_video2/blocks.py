@@ -13,6 +13,7 @@
 # limitations under the License.
 #
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Production transformer blocks used by Sana-Video 2.0."""
 
@@ -88,6 +89,10 @@ class GatedLinearAttention(nn.Module):
         self.beta_proj = nn.Linear(dim, num_heads, bias=True)
         self.output_gate = nn.Linear(dim, dim, bias=True)
         self.o_norm = RMSNorm(head_dim, scale_factor=1.0, eps=norm_eps, norm_dim=-2)
+        self._sp_group = None
+
+    def set_sequence_parallel(self, sp_group) -> None:
+        self._sp_group = sp_group
 
     def forward(
         self,
@@ -114,6 +119,8 @@ class GatedLinearAttention(nn.Module):
             v = v.float()
 
         key_value = torch.matmul(v, k_gated.transpose(-1, -2))
+        if self._sp_group is not None:
+            key_value = self._sp_group.all_reduce(key_value)
         # The former ReLU-kernel denominator was scalar along ``head_dim`` and
         # was effectively canceled by the following RMSNorm.
         out = torch.matmul(key_value, q_rotated).to(output_dtype)
@@ -149,6 +156,10 @@ class GatedSoftmaxAttention(nn.Module):
             self.q_norm = nn.Identity()
             self.k_norm = nn.Identity()
         self.output_gate = nn.Linear(dim, dim, bias=True)
+        self._ulysses_attention = None
+
+    def set_sequence_parallel(self, ulysses_attention) -> None:
+        self._ulysses_attention = ulysses_attention
 
     def forward(
         self,
@@ -169,6 +180,10 @@ class GatedSoftmaxAttention(nn.Module):
         if getattr(self, "fp32_attention", False):
             q, k, v = q.float(), k.float(), v.float()
 
+        context = None
+        if self._ulysses_attention is not None:
+            q, k, v, _, context = self._ulysses_attention.pre_attention(q, k, v, None)
+
         out = F.scaled_dot_product_attention(
             q.transpose(1, 2),
             k.transpose(1, 2),
@@ -176,6 +191,8 @@ class GatedSoftmaxAttention(nn.Module):
             dropout_p=0.0,
             is_causal=False,
         )
+        if self._ulysses_attention is not None:
+            out = self._ulysses_attention.post_attention(out.transpose(1, 2), context).transpose(1, 2)
         out = out.transpose(1, 2).reshape(batch, tokens, channels).to(output_dtype)
         out = out * torch.sigmoid(self.output_gate(x))
         return self.proj(out)

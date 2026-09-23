@@ -42,17 +42,23 @@ TEXT_ENCODER_REVISION = "569d9809d0c8b6722d4d31b5a77a2ec7a400650a"
 def validate_parallel_config(config):
     for name in (
         "tensor_parallel_size",
-        "sequence_parallel_size",
         "cfg_parallel_size",
         "pipeline_parallel_size",
         "text_encoder_tp_size",
-        "ulysses_degree",
         "vae_patch_parallel_size",
         "ring_degree",
         "allgather_degree",
     ):
         if (getattr(config.parallel_config, name, 1) or 1) != 1:
             raise ValueError(f"SANA-Video 2.0 currently requires {name}=1")
+    parallel = config.parallel_config
+    sp_size = parallel.sequence_parallel_size or 1
+    if sp_size not in (1, 2, 4, 8):
+        raise ValueError("SANA-Video 2.0 requires sequence_parallel_size in (1, 2, 4, 8)")
+    if parallel.ulysses_degree != sp_size:
+        raise ValueError("SANA-Video 2.0 requires ulysses_degree=sequence_parallel_size")
+    if sp_size > 1 and parallel.ulysses_mode == "strict" and 10 % sp_size:
+        raise ValueError("SANA-Video 2.0 has 10 softmax heads; use ulysses_mode='advanced_uaa' for SP4/SP8")
     if getattr(config, "quantization_config", None) is not None:
         raise ValueError("SANA-Video 2.0 quantization is not implemented")
     if config.parallel_config.use_hsdp:
@@ -136,6 +142,12 @@ class SanaVideo2Pipeline(nn.Module, SupportImageInput, SupportsComponentDiscover
         if any(component is None for component in (tokenizer, text_encoder, vae, transformer)):
             raise ValueError("SANA-Video 2.0 requires tokenizer, text encoder, LTX 2.3 VAE, and transformer")
         self.tokenizer, self.text_encoder, self.vae, self.transformer = tokenizer, text_encoder, vae, transformer
+        self.sp_group = None
+        if od_config is not None and (od_config.parallel_config.sequence_parallel_size or 1) > 1:
+            from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+
+            self.sp_group = get_sp_group()
+            self.transformer.set_sequence_parallel(self.sp_group)
         if (
             vae.config.latent_channels,
             vae.config.temporal_compression_ratio,
@@ -315,6 +327,11 @@ class SanaVideo2Pipeline(nn.Module, SupportImageInput, SupportsComponentDiscover
             pixels = prepare_image(_image(image), height, width)[None, :, None].to(self.device, self.vae.dtype)
             image_latents = normalize_latents(self.vae, self.vae.encode(pixels).latent_dist.mode())
             latents[:, :, :1] = image_latents
+
+        if self.sp_group is not None:
+            latents = self.sp_group.broadcast(latents.contiguous())
+            embeddings = self.sp_group.broadcast(embeddings.contiguous())
+            mask = self.sp_group.broadcast(mask.contiguous())
 
         def predict(x, time, noise_space=False):
             inputs = torch.cat([x, x]) if do_cfg else x
