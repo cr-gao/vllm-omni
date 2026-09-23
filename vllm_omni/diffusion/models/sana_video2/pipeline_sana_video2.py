@@ -15,6 +15,7 @@ from transformers import AutoModel, AutoTokenizer
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import DistributedAutoencoderKLLTX2Video
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.request import resolve_video_num_frames
@@ -41,8 +42,6 @@ TEXT_ENCODER_REVISION = "569d9809d0c8b6722d4d31b5a77a2ec7a400650a"
 
 def validate_parallel_config(config):
     for name in (
-        "tensor_parallel_size",
-        "cfg_parallel_size",
         "pipeline_parallel_size",
         "text_encoder_tp_size",
         "vae_patch_parallel_size",
@@ -52,13 +51,22 @@ def validate_parallel_config(config):
         if (getattr(config.parallel_config, name, 1) or 1) != 1:
             raise ValueError(f"SANA-Video 2.0 currently requires {name}=1")
     parallel = config.parallel_config
+    tp_size = parallel.tensor_parallel_size or 1
+    cfg_size = parallel.cfg_parallel_size or 1
+    if tp_size not in (1, 2):
+        raise ValueError("SANA-Video 2.0 requires tensor_parallel_size in (1, 2)")
+    if cfg_size not in (1, 2):
+        raise ValueError("SANA-Video 2.0 requires cfg_parallel_size in (1, 2)")
     sp_size = parallel.sequence_parallel_size or 1
     if sp_size not in (1, 2, 4, 8):
         raise ValueError("SANA-Video 2.0 requires sequence_parallel_size in (1, 2, 4, 8)")
     if parallel.ulysses_degree != sp_size:
         raise ValueError("SANA-Video 2.0 requires ulysses_degree=sequence_parallel_size")
-    if sp_size > 1 and parallel.ulysses_mode == "strict" and 10 % sp_size:
-        raise ValueError("SANA-Video 2.0 has 10 softmax heads; use ulysses_mode='advanced_uaa' for SP4/SP8")
+    local_softmax_heads = 10 // tp_size
+    if sp_size > 1 and parallel.ulysses_mode == "strict" and local_softmax_heads % sp_size:
+        raise ValueError(
+            f"SANA-Video 2.0 has {local_softmax_heads} softmax heads per TP rank; use ulysses_mode='advanced_uaa'"
+        )
     if getattr(config, "quantization_config", None) is not None:
         raise ValueError("SANA-Video 2.0 quantization is not implemented")
     if config.parallel_config.use_hsdp:
@@ -114,7 +122,7 @@ def get_sana_video2_post_process_func(od_config):
     return postprocess
 
 
-class SanaVideo2Pipeline(nn.Module, SupportImageInput, SupportsComponentDiscovery, ProgressBarMixin):
+class SanaVideo2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput, SupportsComponentDiscovery, ProgressBarMixin):
     _dit_modules = ["transformer"]
     _encoder_modules = ["text_encoder"]
     _vae_modules = ["vae"]
@@ -143,11 +151,23 @@ class SanaVideo2Pipeline(nn.Module, SupportImageInput, SupportsComponentDiscover
             raise ValueError("SANA-Video 2.0 requires tokenizer, text encoder, LTX 2.3 VAE, and transformer")
         self.tokenizer, self.text_encoder, self.vae, self.transformer = tokenizer, text_encoder, vae, transformer
         self.sp_group = None
-        if od_config is not None and (od_config.parallel_config.sequence_parallel_size or 1) > 1:
-            from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+        self.tp_group = None
+        self.cfg_group = None
+        if od_config is not None:
+            parallel = od_config.parallel_config
+            if (parallel.tensor_parallel_size or 1) > 1:
+                from vllm.distributed.parallel_state import get_tp_group
 
-            self.sp_group = get_sp_group()
-            self.transformer.set_sequence_parallel(self.sp_group)
+                self.tp_group = get_tp_group()
+            if (parallel.sequence_parallel_size or 1) > 1:
+                from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+
+                self.sp_group = get_sp_group()
+                self.transformer.set_sequence_parallel(self.sp_group)
+            if (parallel.cfg_parallel_size or 1) > 1:
+                from vllm_omni.diffusion.distributed.parallel_state import get_cfg_group
+
+                self.cfg_group = get_cfg_group()
         if (
             vae.config.latent_channels,
             vae.config.temporal_compression_ratio,
@@ -188,7 +208,7 @@ class SanaVideo2Pipeline(nn.Module, SupportImageInput, SupportsComponentDiscover
             raise ValueError("SANA-Video 2.0 requires float32 or bfloat16 inference")
         with torch.device("meta"):
             transformer = SanaVideo2TransformerModel(model_config)
-        transformer.to_empty(device=device).to(dtype=dtype)
+        transformer.materialize(device=device, dtype=dtype)
         self.checkpoint_report = transformer.load_checkpoint(root / "checkpoints/SANA_Video_2.0_5B_720p.pth")
         text_path = options.get("text_encoder_model", TEXT_ENCODER_ID)
         text_revision = options.get(
@@ -266,6 +286,14 @@ class SanaVideo2Pipeline(nn.Module, SupportImageInput, SupportsComponentDiscover
         if not math.isfinite(flow_shift) or flow_shift <= 0:
             raise ValueError("flow_shift must be finite and positive")
 
+    def predict_noise(self, *, x, time, embeddings, mask, noise_space=False):
+        timestep = (time * 1000).expand(x.shape[0]) if time.ndim == 0 else time
+        prediction = self.transformer(x, timestep, embeddings, mask)
+        if noise_space:
+            sigma = time.reshape((1,) * x.ndim).to(x)
+            prediction = (1 - sigma) * prediction + x
+        return prediction
+
     @torch.no_grad()
     def generate(
         self,
@@ -328,12 +356,33 @@ class SanaVideo2Pipeline(nn.Module, SupportImageInput, SupportsComponentDiscover
             image_latents = normalize_latents(self.vae, self.vae.encode(pixels).latent_dist.mode())
             latents[:, :, :1] = image_latents
 
-        if self.sp_group is not None:
-            latents = self.sp_group.broadcast(latents.contiguous())
-            embeddings = self.sp_group.broadcast(embeddings.contiguous())
-            mask = self.sp_group.broadcast(mask.contiguous())
+        for group in (self.tp_group, self.sp_group, self.cfg_group):
+            if group is not None:
+                latents = group.broadcast(latents.contiguous())
+                embeddings = group.broadcast(embeddings.contiguous())
+                mask = group.broadcast(mask.contiguous())
 
         def predict(x, time, noise_space=False):
+            if self.cfg_group is not None:
+                positive = dict(
+                    x=x,
+                    time=time,
+                    embeddings=embeddings[batch:] if do_cfg else embeddings,
+                    mask=mask[batch:] if do_cfg else mask,
+                    noise_space=noise_space,
+                )
+                negative = (
+                    dict(x=x, time=time, embeddings=embeddings[:batch], mask=mask[:batch], noise_space=noise_space)
+                    if do_cfg
+                    else None
+                )
+                return self.predict_noise_maybe_with_cfg(
+                    do_true_cfg=do_cfg,
+                    true_cfg_scale=guidance_scale,
+                    positive_kwargs=positive,
+                    negative_kwargs=negative,
+                    cfg_normalize=False,
+                )
             inputs = torch.cat([x, x]) if do_cfg else x
             if time.ndim == 0:
                 timestep = (time * 1000).expand(inputs.shape[0])
@@ -341,7 +390,6 @@ class SanaVideo2Pipeline(nn.Module, SupportImageInput, SupportsComponentDiscover
                 timestep = torch.cat([time, time]) if do_cfg else time
             prediction = self.transformer(inputs, timestep, embeddings, mask)
             if noise_space:
-                # Upstream applies CFG after flow->noise conversion, not before.
                 sigma = time.reshape((1,) * x.ndim).to(inputs)
                 prediction = (1 - sigma) * prediction + inputs
             if do_cfg:

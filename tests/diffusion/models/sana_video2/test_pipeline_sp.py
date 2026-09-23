@@ -46,8 +46,8 @@ def test_rejects_strict_nondivisible_anchor_heads(degree):
 @pytest.mark.parametrize(
     "overrides,match",
     [
-        ({"tensor_parallel_size": 2}, "tensor_parallel_size"),
-        ({"cfg_parallel_size": 2}, "cfg_parallel_size"),
+        ({"tensor_parallel_size": 4}, "tensor_parallel_size"),
+        ({"cfg_parallel_size": 4}, "cfg_parallel_size"),
         ({"ring_degree": 2}, "ring_degree"),
         ({"allgather_degree": 2}, "allgather_degree"),
         ({"ulysses_degree": 1}, "ulysses_degree"),

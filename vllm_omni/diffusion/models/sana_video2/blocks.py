@@ -20,8 +20,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
 
-from .components import MultiHeadCrossAttention, RMSNorm, t2i_modulate
+from .components import MultiHeadCrossAttention, RMSNorm, _tp_size, t2i_modulate
 
 
 def _apply_rope_channel_first(hidden_states: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -49,9 +50,23 @@ class SwiGLU(nn.Module):
         super().__init__()
         hidden_features = hidden_features or 4 * in_features
         out_features = out_features or in_features
-        self.gate_proj = nn.Linear(in_features, hidden_features, bias=bias)
-        self.up_proj = nn.Linear(in_features, hidden_features, bias=bias)
-        self.down_proj = nn.Linear(hidden_features, out_features, bias=bias)
+        tp_size = _tp_size()
+        if hidden_features % tp_size:
+            raise ValueError("SwiGLU hidden features must divide TP size")
+        if tp_size > 1:
+            self.gate_proj = ColumnParallelLinear(
+                in_features, hidden_features, bias=bias, gather_output=False, return_bias=False
+            )
+            self.up_proj = ColumnParallelLinear(
+                in_features, hidden_features, bias=bias, gather_output=False, return_bias=False
+            )
+            self.down_proj = RowParallelLinear(
+                hidden_features, out_features, bias=bias, input_is_parallel=True, return_bias=False
+            )
+        else:
+            self.gate_proj = nn.Linear(in_features, hidden_features, bias=bias)
+            self.up_proj = nn.Linear(in_features, hidden_features, bias=bias)
+            self.down_proj = nn.Linear(hidden_features, out_features, bias=bias)
         self.act = nn.SiLU()
 
     def forward(self, x: torch.Tensor, **_: object) -> torch.Tensor:
@@ -73,21 +88,33 @@ class GatedLinearAttention(nn.Module):
             raise ValueError(f"dim={dim} must be divisible by head_dim={head_dim}.")
         num_heads = dim // head_dim
         super().__init__()
-        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
-        self.proj = nn.Linear(dim, dim)
+        tp_size = _tp_size()
+        if num_heads % tp_size:
+            raise ValueError("Linear-attention heads must divide TP size")
+        if tp_size > 1:
+            self.qkv = QKVParallelLinear(dim, head_dim, num_heads, bias=False, return_bias=False)
+            self.proj = RowParallelLinear(dim, dim, bias=True, input_is_parallel=True, return_bias=False)
+        else:
+            self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+            self.proj = nn.Linear(dim, dim)
         self.fp32_attention = True
-        self.heads = num_heads
+        self.heads = num_heads // tp_size
         self.dim = head_dim
+        self.local_channels = dim // tp_size
         self.eps = eps  # Retained for compatibility with the training implementation.
         if qk_norm:
-            self.q_norm = RMSNorm(dim, scale_factor=1.0, eps=norm_eps)
-            self.k_norm = RMSNorm(dim, scale_factor=1.0, eps=norm_eps)
+            self.q_norm = RMSNorm(self.local_channels, scale_factor=1.0, eps=norm_eps, tp_size=tp_size)
+            self.k_norm = RMSNorm(self.local_channels, scale_factor=1.0, eps=norm_eps, tp_size=tp_size)
         else:
             self.q_norm = nn.Identity()
             self.k_norm = nn.Identity()
 
-        self.beta_proj = nn.Linear(dim, num_heads, bias=True)
-        self.output_gate = nn.Linear(dim, dim, bias=True)
+        if tp_size > 1:
+            self.beta_proj = ColumnParallelLinear(dim, num_heads, bias=True, gather_output=False, return_bias=False)
+            self.output_gate = ColumnParallelLinear(dim, dim, bias=True, gather_output=False, return_bias=False)
+        else:
+            self.beta_proj = nn.Linear(dim, num_heads, bias=True)
+            self.output_gate = nn.Linear(dim, dim, bias=True)
         self.o_norm = RMSNorm(head_dim, scale_factor=1.0, eps=norm_eps, norm_dim=-2)
         self._sp_group = None
 
@@ -100,8 +127,8 @@ class GatedLinearAttention(nn.Module):
         rotary_emb: torch.Tensor | None = None,
         **_: object,
     ) -> torch.Tensor:
-        batch, tokens, channels = x.shape
-        q, k, v = self.qkv(x).reshape(batch, tokens, 3, channels).unbind(2)
+        batch, tokens, _ = x.shape
+        q, k, v = self.qkv(x).reshape(batch, tokens, 3, self.local_channels).unbind(2)
         output_dtype = q.dtype
 
         q = self.q_norm(q).transpose(-1, -2).reshape(batch, self.heads, self.dim, tokens)
@@ -125,7 +152,7 @@ class GatedLinearAttention(nn.Module):
         # was effectively canceled by the following RMSNorm.
         out = torch.matmul(key_value, q_rotated).to(output_dtype)
         out = self.o_norm(out)
-        out = out.reshape(batch, channels, tokens).permute(0, 2, 1)
+        out = out.reshape(batch, self.local_channels, tokens).permute(0, 2, 1)
         out = out * torch.sigmoid(self.output_gate(x))
         return self.proj(out)
 
@@ -144,18 +171,30 @@ class GatedSoftmaxAttention(nn.Module):
             raise ValueError(f"dim={dim} must be divisible by head_dim={head_dim}.")
         num_heads = dim // head_dim
         super().__init__()
-        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
-        self.proj = nn.Linear(dim, dim)
+        tp_size = _tp_size()
+        if num_heads % tp_size:
+            raise ValueError("Softmax-attention heads must divide TP size")
+        if tp_size > 1:
+            self.qkv = QKVParallelLinear(dim, head_dim, num_heads, bias=False, return_bias=False)
+            self.proj = RowParallelLinear(dim, dim, bias=True, input_is_parallel=True, return_bias=False)
+        else:
+            self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+            self.proj = nn.Linear(dim, dim)
         self.fp32_attention = True
-        self.heads = num_heads
+        self.heads = num_heads // tp_size
         self.dim = head_dim
+        self.local_channels = dim // tp_size
         if qk_norm:
-            self.q_norm = RMSNorm(dim, scale_factor=1.0, eps=norm_eps)
-            self.k_norm = RMSNorm(dim, scale_factor=1.0, eps=norm_eps)
+            self.q_norm = RMSNorm(self.local_channels, scale_factor=1.0, eps=norm_eps, tp_size=tp_size)
+            self.k_norm = RMSNorm(self.local_channels, scale_factor=1.0, eps=norm_eps, tp_size=tp_size)
         else:
             self.q_norm = nn.Identity()
             self.k_norm = nn.Identity()
-        self.output_gate = nn.Linear(dim, dim, bias=True)
+        self.output_gate = (
+            ColumnParallelLinear(dim, dim, bias=True, gather_output=False, return_bias=False)
+            if tp_size > 1
+            else nn.Linear(dim, dim, bias=True)
+        )
         self._ulysses_attention = None
 
     def set_sequence_parallel(self, ulysses_attention) -> None:
@@ -167,8 +206,8 @@ class GatedSoftmaxAttention(nn.Module):
         rotary_emb: torch.Tensor | None = None,
         **_: object,
     ) -> torch.Tensor:
-        batch, tokens, channels = x.shape
-        q, k, v = self.qkv(x).reshape(batch, tokens, 3, channels).unbind(2)
+        batch, tokens, _ = x.shape
+        q, k, v = self.qkv(x).reshape(batch, tokens, 3, self.local_channels).unbind(2)
         output_dtype = q.dtype
         q = self.q_norm(q).reshape(batch, tokens, self.heads, self.dim)
         k = self.k_norm(k).reshape(batch, tokens, self.heads, self.dim)
@@ -193,7 +232,7 @@ class GatedSoftmaxAttention(nn.Module):
         )
         if self._ulysses_attention is not None:
             out = self._ulysses_attention.post_attention(out.transpose(1, 2), context).transpose(1, 2)
-        out = out.transpose(1, 2).reshape(batch, tokens, channels).to(output_dtype)
+        out = out.transpose(1, 2).reshape(batch, tokens, self.local_channels).to(output_dtype)
         out = out * torch.sigmoid(self.output_gate(x))
         return self.proj(out)
 

@@ -29,9 +29,19 @@ from pathlib import Path
 import torch
 from torch import nn
 from torch.nn import functional as F
+from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
+from vllm.model_executor.parameter import ModelWeightParameter
 
 from .blocks import SanaVideo2Block
-from .components import CaptionEmbedder, PatchEmbedMS3D, RMSNorm, T2IFinalLayer, TimestepEmbedder, WanRotaryPosEmbed
+from .components import (
+    CaptionEmbedder,
+    PatchEmbedMS3D,
+    RMSNorm,
+    T2IFinalLayer,
+    TimestepEmbedder,
+    WanRotaryPosEmbed,
+    _tp_size,
+)
 
 
 def get_softmax_layer_indices(depth: int, softmax_ratio: float = 0.25) -> list[int]:
@@ -394,6 +404,30 @@ class SanaVideo2TransformerModel(nn.Module):
             x = torch.cat([part[:, :size] for part, size in zip(parts, sizes)], dim=1)
         return x.transpose(1, 2).reshape(batch, c.in_channels, frames, height, width)
 
+    def materialize(self, device: torch.device, dtype: torch.dtype) -> None:
+        sharded = []
+        for module in self.modules():
+            for name, param in module.named_parameters(recurse=False):
+                if isinstance(param, ModelWeightParameter) or hasattr(param, "weight_loader"):
+                    sharded.append((module, name, param))
+        self.to_empty(device=device).to(dtype=dtype)
+        for module, name, original in sharded:
+            param = module._parameters[name]
+            if isinstance(original, ModelWeightParameter):
+                module.register_parameter(
+                    name,
+                    ModelWeightParameter(
+                        data=param.data,
+                        input_dim=original.input_dim,
+                        output_dim=original.output_dim,
+                        weight_loader=original.weight_loader,
+                    ),
+                )
+            else:
+                param.weight_loader = original.weight_loader
+                if hasattr(original, "output_dim"):
+                    param.output_dim = original.output_dim
+
     def load_weights(self, weights) -> SanaVideo2LoadReport:
         """Load upstream keys verbatim; no lossy renaming or partial loading.
 
@@ -402,6 +436,18 @@ class SanaVideo2TransformerModel(nn.Module):
         Unconditional text conditioning is a pipeline input, not this buffer.
         """
         expected = self.state_dict()
+        tp_size = _tp_size()
+        shard_dims = {}
+        if tp_size > 1:
+            for name, module in self.named_modules():
+                if isinstance(module, RowParallelLinear):
+                    shard_dims[f"{name}.weight"] = 1
+                elif isinstance(module, ColumnParallelLinear):
+                    shard_dims[f"{name}.weight"] = 0
+                    if module.bias is not None:
+                        shard_dims[f"{name}.bias"] = 0
+                elif isinstance(module, RMSNorm) and module.tp_size > 1:
+                    shard_dims[f"{name}.weight"] = 0
         mapped = {}
         ignored = []
         seen = set()
@@ -426,14 +472,17 @@ class SanaVideo2TransformerModel(nn.Module):
                 continue
             if key not in expected:
                 errors.append(f"unexpected key {key}")
-            elif tensor.shape != expected[key].shape:
-                errors.append(
-                    f"shape mismatch {key}: checkpoint {tuple(tensor.shape)}, model {tuple(expected[key].shape)}"
-                )
-            elif not tensor.is_floating_point():
-                errors.append(f"non-floating weight {key}: {tensor.dtype}")
             else:
-                mapped[key] = tensor
+                full_shape = list(expected[key].shape)
+                shard_dim = shard_dims.get(key)
+                if shard_dim is not None:
+                    full_shape[shard_dim] *= tp_size
+                if tuple(tensor.shape) != tuple(full_shape):
+                    errors.append(f"shape mismatch {key}: checkpoint {tuple(tensor.shape)}, model {tuple(full_shape)}")
+                elif not tensor.is_floating_point():
+                    errors.append(f"non-floating weight {key}: {tensor.dtype}")
+                else:
+                    mapped[key] = tensor
         missing = set(expected) - set(mapped)
         if missing:
             errors.append(f"missing keys: {sorted(missing)}")
@@ -441,7 +490,18 @@ class SanaVideo2TransformerModel(nn.Module):
             raise ValueError("Invalid SANA-Video 2.0 checkpoint:\n" + "\n".join(errors))
         if any(t.is_meta for t in expected.values()):
             raise ValueError("Materialize the model with to_empty() before loading weights")
-        self.load_state_dict(mapped, strict=True)
+        params = dict(self.named_parameters())
+        buffers = dict(self.named_buffers())
+        with torch.no_grad():
+            for key, tensor in mapped.items():
+                target = params.get(key)
+                if target is None:
+                    target = buffers[key]
+                loader = getattr(target, "weight_loader", None)
+                if callable(loader):
+                    loader(target, tensor)
+                else:
+                    target.copy_(tensor.to(device=target.device, dtype=target.dtype))
         return SanaVideo2LoadReport(
             tuple(sorted(mapped)),
             tuple(sorted(ignored)),

@@ -26,10 +26,18 @@ import torch
 from diffusers.models.embeddings import get_1d_rotary_pos_embed
 from torch import nn
 from torch.nn import functional as F
+from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_reduce
+from vllm.distributed.parallel_state import model_parallel_is_initialized
+from vllm.model_executor.layers.linear import ColumnParallelLinear, MergedColumnParallelLinear, RowParallelLinear
+from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
+
+
+def _tp_size() -> int:
+    return get_tensor_model_parallel_world_size() if model_parallel_is_initialized() else 1
 
 
 class RMSNorm(torch.nn.Module):
-    def __init__(self, dim: int, scale_factor=1.0, eps: float = 1e-6, norm_dim: int = -1):
+    def __init__(self, dim: int, scale_factor=1.0, eps: float = 1e-6, norm_dim: int = -1, tp_size: int = 1):
         """
             Initialize the RMSNorm normalization layer.
 
@@ -48,6 +56,11 @@ class RMSNorm(torch.nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim) * scale_factor)
         self.norm_dim = norm_dim
+        self.tp_size = tp_size
+        if tp_size > 1:
+            if norm_dim != -1:
+                raise ValueError("TP RMSNorm requires the last dimension")
+            self.weight.weight_loader = sharded_weight_loader(0)
 
     def _norm(self, x):
         """
@@ -60,6 +73,9 @@ class RMSNorm(torch.nn.Module):
             torch.Tensor: The normalized tensor.
 
         """
+        if self.tp_size > 1:
+            sum_sq = tensor_model_parallel_all_reduce(x.pow(2).sum(self.norm_dim, keepdim=True))
+            return x * torch.rsqrt(sum_sq / (self.weight.numel() * self.tp_size) + self.eps)
         return x * torch.rsqrt(x.pow(2).mean(self.norm_dim, keepdim=True) + self.eps)
 
     def forward(self, x):
@@ -244,18 +260,29 @@ class MultiHeadCrossAttention(nn.Module):
 
     def __init__(self, d_model, num_heads, qk_norm=True):
         super().__init__()
-        self.num_heads = num_heads
+        tp_size = _tp_size()
+        if num_heads % tp_size:
+            raise ValueError("Cross-attention heads must divide TP size")
+        self.num_heads = num_heads // tp_size
         self.head_dim = d_model // num_heads
-        self.q_linear = nn.Linear(d_model, d_model)
-        self.kv_linear = nn.Linear(d_model, 2 * d_model)
-        self.proj = nn.Linear(d_model, d_model)
-        self.q_norm = RMSNorm(d_model, eps=1e-6) if qk_norm else nn.Identity()
-        self.k_norm = RMSNorm(d_model, eps=1e-6) if qk_norm else nn.Identity()
+        self.local_channels = d_model // tp_size
+        if tp_size > 1:
+            self.q_linear = ColumnParallelLinear(d_model, d_model, bias=True, gather_output=False, return_bias=False)
+            self.kv_linear = MergedColumnParallelLinear(
+                d_model, [d_model, d_model], bias=True, gather_output=False, return_bias=False
+            )
+            self.proj = RowParallelLinear(d_model, d_model, bias=True, input_is_parallel=True, return_bias=False)
+        else:
+            self.q_linear = nn.Linear(d_model, d_model)
+            self.kv_linear = nn.Linear(d_model, 2 * d_model)
+            self.proj = nn.Linear(d_model, d_model)
+        self.q_norm = RMSNorm(self.local_channels, eps=1e-6, tp_size=tp_size) if qk_norm else nn.Identity()
+        self.k_norm = RMSNorm(self.local_channels, eps=1e-6, tp_size=tp_size) if qk_norm else nn.Identity()
 
     def forward(self, x, cond, mask=None):
-        batch, tokens, channels = x.shape
+        batch, tokens, _ = x.shape
         q = self.q_norm(self.q_linear(x)).view(batch, tokens, self.num_heads, self.head_dim)
-        k, v = self.kv_linear(cond).view(batch, -1, 2, channels).unbind(2)
+        k, v = self.kv_linear(cond).view(batch, -1, 2, self.local_channels).unbind(2)
         k = self.k_norm(k).view(batch, -1, self.num_heads, self.head_dim)
         v = v.reshape(batch, -1, self.num_heads, self.head_dim)
         if mask is not None:
@@ -266,4 +293,4 @@ class MultiHeadCrossAttention(nn.Module):
         out = F.scaled_dot_product_attention(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask, dropout_p=0.0
         )
-        return self.proj(out.transpose(1, 2).reshape(batch, tokens, channels))
+        return self.proj(out.transpose(1, 2).reshape(batch, tokens, self.local_channels))

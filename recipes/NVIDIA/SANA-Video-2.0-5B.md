@@ -97,16 +97,17 @@ separate framework mechanism for replacing the pipeline class.
 ## Current execution scope
 
 The native default uses one NVIDIA GPU with BF16 or FP32 transformer weights.
-An experimental pure-Ulysses SP path is available as described below. TP, CFG
-parallelism, pipeline parallelism, distributed VAE, HSDP, quantization,
-caching, and CPU/layerwise offload are rejected. Custom sigma/timestep schedules
-and multiple videos per request are not implemented. Reducing the inference
-step count does not turn the formal checkpoint into the 4-step preview.
+Experimental pure-Ulysses SP, TP2, and CFG2 paths are described below.
+Pipeline parallelism, distributed VAE, HSDP, quantization, caching, and
+CPU/layerwise offload are rejected. Custom sigma/timestep schedules and multiple
+videos per request are not implemented. Reducing the inference step count does
+not turn the formal checkpoint into the 4-step preview.
 
 ## Experimental sequence parallelism
 
-Use vLLM 0.29.0, PyTorch 2.13 and Diffusers 0.40. Keep TP=1 and CFG
-parallel=1. Native batch CFG remains enabled. The transformer
+The SP-only measurements in this section use vLLM 0.29.0, PyTorch 2.13 and
+Diffusers 0.40, with TP=1 and CFG parallel=1. Native batch CFG remains enabled.
+The transformer
 splits flattened video tokens before allocating Attention Residual buffers.
 Linear layers sum their FP32 states over the full SP group; softmax anchors
 use the shared Ulysses communication with native FP32 SDPA. Each denoising
@@ -196,6 +197,52 @@ CUDA_VISIBLE_DEVICES=0,1 python -m pytest -o addopts= -s -q \
 The NCCL cases skip degrees larger than the visible device count. Tests print
 maximum absolute and relative L2 error by rank and compare every recorded
 sampler step.
+
+## Experimental TP and CFG parallelism
+
+Set `tensor_parallel_size=2` for TP2 or `cfg_parallel_size=2` for CFG2 in the
+offline `Omni` constructor. TP splits self- and cross-attention heads and the
+SwiGLU intermediate width. Q/K RMSNorm still computes statistics across the
+full checkpoint channel dimension; other transformer state remains replicated.
+CFG2 computes the positive branch on CFG rank 0 and the negative branch on rank
+1. With guidance at most 1, both ranks compute the conditional branch. Both
+ranks continue the same sampler after the branch exchange.
+
+For TP2+SP2, the released 10 softmax heads become five heads per TP rank.
+Select `ulysses_mode="advanced_uaa"`; `strict` cannot divide those five heads
+across SP2. The same mode supports uneven video-token shards. A combined
+offline configuration is:
+
+```python
+engine = Omni(
+    model="Efficient-Large-Model/SANA-Video_2.0_5B_720p",
+    dtype="bfloat16",
+    enforce_eager=True,
+    tensor_parallel_size=2,
+    cfg_parallel_size=2,
+    ulysses_degree=2,
+    ulysses_mode="advanced_uaa",
+)
+```
+
+This combination needs eight GPUs. TP2 alone and CFG2 alone need two GPUs;
+TP2+CFG2 and CFG2+SP2 need four. The implementation accepts only TP1/2 and
+CFG1/2. Keep `--usp` equal to the Ulysses degree when serving with SP.
+
+The new paths were checked with synthetic same-weight models using real CPU
+Gloo process groups: TP2 and TP2+SP2 on 32 layers, and CFG2, TP2+CFG2,
+CFG2+SP2, TP2+SP2+CFG2 on T2V/TI2V sampler steps with guidance on/off.
+These checks do not establish 5B checkpoint behavior, NCCL correctness,
+decoded-video accuracy, or throughput. Multi-GPU NCCL and full-checkpoint runs
+remain unverified for TP and CFG.
+Run the focused checks with:
+
+```bash
+python -m pytest -o addopts= -q tests/diffusion/models/sana_video2
+python -m pytest -o addopts= -q \
+  tests/diffusion/distributed/test_sana_video2_tp_numeric.py \
+  tests/diffusion/distributed/test_sana_video2_tp_cfg_pipeline.py
+```
 
 In the direct pipeline, real 5B weights were compared at three small shapes
 for 50 steps with seed 42, CFG 8 and flow shift 12. Across 150 FP32 latent
