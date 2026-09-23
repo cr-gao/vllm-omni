@@ -204,6 +204,11 @@ _DIFFUSION_MODELS = {
         "pipeline_ming_imagegen",
         "MingImagePipeline",
     ),
+    "MingImageDiffusionPipeline": (
+        "ming_image",
+        "pipeline",
+        "MingImageDiffusionPipeline",
+    ),
     "SanaWmPipeline": (
         "sana_wm",
         "pipeline_sana_wm",
@@ -390,6 +395,7 @@ _DIFFUSION_MODELS = {
         "Krea2Pipeline",
     ),
 }
+_DIFFUSION_MODELS["MingImageLayeredDiffusionPipeline"] = _DIFFUSION_MODELS["MingImageDiffusionPipeline"]
 
 
 DiffusionModelRegistry = _ModelRegistry(
@@ -487,9 +493,56 @@ def initialize_model(
         # at model loading time, not inside individual model files
         _apply_sequence_parallel_if_enabled(model, od_config)
 
+        # Install the Wan VAE decoder fast path once the VAE parallel mode is
+        # known. This runs inside the weight-loading memory pool, so any weight
+        # re-layout it performs stays offloadable by sleep mode.
+        _apply_wan_vae_fastpath_if_enabled(model, od_config)
+
         return model
     else:
         raise ValueError(f"Model class {od_config.model_class_name} not found in diffusion model registry.")
+
+
+def _apply_wan_vae_fastpath_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
+    """Install the Wan VAE decoder fast path on every diffusers Wan VAE of the pipeline.
+
+    Controlled by ``od_config.vae_fast_path`` (``off`` / ``lossless`` /
+    ``channels_last``). Only CUDA is supported; other platforms keep the
+    reference diffusers decoder. Failures never abort model loading.
+    """
+    level = getattr(od_config, "vae_fast_path", "lossless")
+    if level == "off":
+        return
+    if not current_omni_platform.is_cuda():
+        logger.debug("Wan VAE fast path is only supported on CUDA; skipping")
+        return
+
+    from diffusers.models.autoencoders import AutoencoderKLWan
+
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import install_wan_vae_fastpath
+    from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
+
+    candidates: list[tuple[str, nn.Module]] = []
+    try:
+        discovered = ModuleDiscovery.discover(model)
+        candidates = list(zip(discovered.vae_names, discovered.vaes, strict=True))
+    except Exception:
+        logger.debug("Wan VAE fast path: component discovery failed; falling back to `vae`", exc_info=True)
+    if not candidates and isinstance(getattr(model, "vae", None), nn.Module):
+        candidates = [("vae", model.vae)]
+
+    for name, vae in candidates:
+        if not isinstance(vae, AutoencoderKLWan):
+            continue
+        try:
+            report = install_wan_vae_fastpath(vae, level=level)
+        except Exception:
+            logger.warning(
+                "Failed to install the Wan VAE fast path on %s; using the reference decoder", name, exc_info=True
+            )
+            continue
+        if report.installed:
+            logger.info("Wan VAE fast path (%s) active on %s", level, name)
 
 
 def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
@@ -616,6 +669,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "BagelPipeline": "get_bagel_post_process_func",
     "LancePipeline": "get_lance_post_process_func",
     "MingImagePipeline": "get_ming_image_post_process_func",
+    "MingImageDiffusionPipeline": "get_ming_image_post_process_func",
     "InternVLAA1Pipeline": "get_internvla_a1_post_process_func",
     "Pi0Pipeline": "get_pi0_post_process_func",
     "Pi05Pipeline": "get_pi05_post_process_func",
@@ -649,6 +703,9 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Krea2Pipeline": "get_krea2_post_process_func",
     "HunyuanImage3ForCausalMM": "get_hunyuan_image3_post_process_func",
 }
+_DIFFUSION_POST_PROCESS_FUNCS["MingImageLayeredDiffusionPipeline"] = _DIFFUSION_POST_PROCESS_FUNCS[
+    "MingImageDiffusionPipeline"
+]
 
 _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
     # arch: ir_op_priority_func
