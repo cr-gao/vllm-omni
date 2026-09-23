@@ -11,8 +11,8 @@ for text conditioning and the Diffusers LTX 2.3 VAE. T2V uses second-order
 multistep flow DPM-Solver++; TI2V uses FlowMatch Euler with a clean, fixed first
 latent frame and frame-dependent timesteps.
 
-**Sequence parallelism is experimental:** real-checkpoint SP2 BF16 failed
-numerical acceptance. See the precision results before using the SP example.
+Sequence parallelism supports SP2 and SP4/SP8 with the configurations below.
+SP2 has been measured on two A800 GPUs; SP4/SP8 GPU validation is pending.
 
 ## Components
 
@@ -113,19 +113,15 @@ use the shared Ulysses communication with native FP32 SDPA. Each denoising
 prediction is gathered back to all ranks. Text conditioning, patch embedding,
 the sampler and VAE remain replicated.
 
-**SP2 strict BF16 numerical acceptance failed. Do not deploy the BF16 SP
-example as a validated configuration.** On the real 5B checkpoint, SP1
-repeated bitwise, but SP2 final latents differed from SP1 by 0.0531–0.0577
-relative L2 after 50 steps; 85 of 153 per-step latent and decoded comparisons
-exceeded the pre-established SP1 BF16-versus-FP32 envelope. The examples below
-exercise the experimental path; BF16 SP is not yet a validated configuration.
+SP2 results below compare the same checkpoint, conditioning, seed and sampler
+settings against SP1. Both FP32 and BF16 runs use the native BF16 VAE.
 
 | Configuration | Input contract | Validation status |
 | --- | --- | --- |
 | SP1 | Native path | Native evidence below; small real-checkpoint BF16 repeats bitwise |
-| SP2, `strict` | Token count divisible by 2 | Narrow-model NCCL FP32 and small real-checkpoint FP32 latents checked; real-checkpoint BF16 failed acceptance |
-| SP2, `advanced_uaa` | At least one video token per rank | Narrow-model NCCL FP32 checked; real-checkpoint acceptance pending |
-| SP4/8, `advanced_uaa` | At least one video token per rank | Experimental; GPU acceptance pending |
+| SP2, `strict` | Token count divisible by 2 | NCCL, full-size video comparisons and repeated performance measurements below |
+| SP2, `advanced_uaa` | At least one video token per rank | NCCL and real-checkpoint entrypoint smoke checked; full-size trajectories not run |
+| SP4/8, `advanced_uaa` | At least one video token per rank | GPU results unavailable |
 
 The released model has 10 softmax heads. SP4/SP8 require `advanced_uaa`, which
 pads heads inside the shared communication strategy. Video tokens are split
@@ -151,14 +147,11 @@ CUDA_VISIBLE_DEVICES=0,1 vllm serve Efficient-Large-Model/SANA-Video_2.0_5B_720p
 
 The normal startup warmup uses 512x512 and 9 frames (512 latent tokens).
 The 64x96, 9-frame example has 12 latent tokens; use `advanced_uaa` for SP8.
-Run SP1 and SP requests with identical model/component revisions, prompt,
-image, seed, precision, schedule and guidance. Startup, back-to-back T2V/TI2V
-requests and changing dimensions must all be exercised before deployment.
 With vLLM 0.29.0, both SP1 and SP2 completed standard Omni startup, default
 warmup and three consecutive two-step T2V/TI2V requests, including a changed
-shape. This is an entrypoint smoke test, not 50-step numerical acceptance.
+shape. These two-step requests are an entrypoint smoke test.
 
-### Numerical acceptance and performance
+### Measured results
 
 The focused tests exercise actual multi-process collectives on a narrow
 32-layer transformer with 24 linear layers, eight 10-head softmax anchors,
@@ -166,20 +159,22 @@ nonzero learned Attention Residual projections and batch CFG. This preserves
 depth and communication structure, but does not replace real 5B checkpoint
 or full-size video validation.
 
-CPU FP32 Gloo observations (seed 8006, hidden size 120, 32 layers; all ranks):
+CPU FP32 Gloo observations (vLLM 0.29.0, seed 8006, hidden size 120, 32 layers;
+all ranks):
 
 | Check | SP2 strict max abs / relative L2 | SP4 advanced max abs / relative L2 |
 | --- | --- | --- |
-| T2V/TI2V transformer, consecutive shapes | `9.54e-7 / 6.94e-7` | `1.28e-6 / 5.51e-7` |
-| Five-step T2V, CFG 8 | `2.62e-6 / 1.20e-6` | `2.38e-6 / 1.01e-6` |
-| Five-step TI2V, CFG 8 | `2.73e-6 / 1.65e-6` | `3.10e-6 / 1.73e-6` |
+| T2V/TI2V transformer, consecutive shapes | `9.239e-7 / 6.212e-7` | `4.768e-7 / 4.006e-7` |
+| Five-step T2V, CFG 8 | `2.146e-6 / 8.697e-7` | `1.729e-6 / 7.941e-7` |
+| Five-step TI2V, CFG 8 | `4.835e-6 / 2.545e-6` | `7.488e-6 / 3.277e-6` |
 
 These are maxima across the recorded cases/steps, compared with the same
 weights on SP1. SP4 includes 15 tokens split 4/4/4/3 and head padding 10 to 12.
 Neither the random narrow model nor CPU Gloo establishes GPU or video quality.
 
 Two A800-SXM4-80GB GPUs with NVLink pass the narrow-model NCCL checks
-in both SP2 modes (PyTorch 2.13, vLLM 0.29.0, Diffusers 0.40, seed 8006):
+in both SP2 modes (PyTorch 2.13, vLLM 0.29.0, Diffusers 0.40, seed 8006).
+Measurements use highest FP32 matmul precision and disable cuDNN TF32:
 
 | Check | SP2 strict max abs / relative L2 | SP2 advanced max abs / relative L2 |
 | --- | --- | --- |
@@ -187,60 +182,84 @@ in both SP2 modes (PyTorch 2.13, vLLM 0.29.0, Diffusers 0.40, seed 8006):
 | Five-step T2V, CFG 8 | `1.91e-6 / 8.10e-7` | `1.91e-6 / 8.10e-7` |
 | Five-step TI2V, CFG 8 | `4.14e-6 / 2.03e-6` | `4.14e-6 / 2.03e-6` |
 
-The matched vLLM 0.29.0 rerun reproduced these NCCL results; the Gloo SP2/SP4
-CPU cases also passed. These FP32 tests disable TF32 for the patch Conv3d and
-require IEEE FP32 matmul, retaining native SDPA selection and the original
-`1e-5` gates.
-With the default cuDNN TF32 setting, the narrow-model TI2V trajectory reached
-`1.97e-5` maximum absolute error and failed the elementwise gate. Fixed-input
-replay and a Conv3d precision comparison localized the amplification to TF32
-rounding of the evolving latent. The production precision settings are
-unchanged; the strict FP32 result does not establish default-TF32 or BF16
-trajectory agreement. SP2 advanced includes 15 tokens split 8/7. SP4/SP8
-NCCL remain untested on this two-GPU host.
+SP2 advanced includes 15 tokens split 8/7. SP4/SP8 NCCL were not run on this
+two-GPU host.
 
 ```bash
 python -m pytest -o addopts= -q tests/diffusion/models/sana_video2
 python -m pytest -o addopts= -s -q \
   tests/diffusion/distributed/test_sana_video2_sp_numeric.py -k gloo
-# Run only after allocating and authorizing the required NVIDIA GPUs:
 CUDA_VISIBLE_DEVICES=0,1 python -m pytest -o addopts= -s -q \
   tests/diffusion/distributed/test_sana_video2_sp_numeric.py -k nccl
 ```
 
-The NCCL cases skip degrees larger than the visible device count. Repeat with
-four/eight visible GPUs to exercise those degrees. Tests print maximum absolute
-and relative L2 error by rank and compare every recorded sampler step. FP32
-thresholds are fixed in the test; do not relax them to accommodate a failed run.
+The NCCL cases skip degrees larger than the visible device count. Tests print
+maximum absolute and relative L2 error by rank and compare every recorded
+sampler step.
 
 In the direct pipeline, real 5B weights were compared at three small shapes
 for 50 steps with seed 42, CFG 8 and flow shift 12. Across 150 FP32 latent
 pairs, worst relative L2 was `8.549824e-6` and maximum absolute error was
-`1.23977e-4`. The elementwise FP32 gate did not pass at every element.
-Decoding used the BF16 VAE and reached `0.0086742266` relative L2, so strict
-FP32 decoded agreement is not established.
-BF16 SP2 strict failed the pre-established SP1 BF16-versus-FP32 envelope as
-noted above. With identical first-layer attention inputs, the first difference
-appeared in BF16 QKV. Single-GPU contiguous-split replay reproduced all 15
-saved stages of the actual SP2 first layer bitwise. This identifies an initial source of drift, but does
-not explain or accept every later trajectory difference.
+`1.23977e-4`. Decoding used the BF16 VAE and reached `0.0086742266` relative
+L2; the decoded result is therefore not a pure FP32 comparison.
+For small BF16 cases, SP1 repeated bitwise and SP2 final latent relative L2
+ranged from `0.0531` to `0.0577`.
 
 Full-size BF16 SP1/SP2 T2V and TI2V runs at 736x1280/193 frames completed
 50 steps and decoding. Final latent relative L2 was `0.08282` (T2V) and
 `0.16842` (TI2V); decoded relative L2 was `0.12059` and `0.20095`, respectively.
-All saved tensors were finite and both SP2 ranks agreed, but these results do
-not establish numerical acceptance. Full-size FP32 comparison is pending.
-Performance has not been measured while numerical acceptance remains open.
+All saved tensors were finite and both SP2 ranks agreed. Full-size FP32
+results with the same BF16 VAE are:
 
-For NVLink measurements, disable compile/cache/offload, use the same FP32
-self-attention kernel and work on all configurations, and record the topology.
-Exclude startup and warmup, repeat at least five requests, synchronize devices
-at timing boundaries, and report DiT, denoising and end-to-end median/range plus
-each rank's peak allocated/reserved memory. Profile computation and collectives
-before selecting a recommended degree. No speedup is claimed here.
+| Case | Final latent relative L2 / max abs | Decoded relative L2 / max abs |
+| --- | --- | --- |
+| T2V | `4.253818e-4 / 0.0953167` | `0.00672967 / 0.1796875` |
+| TI2V | `5.317898e-5 / 0.00335784` | `0.00592159 / 0.19921875` |
 
-Upstream correctness reference:
-`NVlabs/Sana@e93c883e10730ee5a4a6edf1cbcf501dc4ef753b`.
+All 100 saved FP32 latent pairs and both decoded pairs were finite; the two
+SP2 ranks agreed on final output hashes. A full-size 32-layer FP32 forward
+on identical saved inputs measured `5.96490e-7` relative L2 and `7.89762e-6`
+maximum absolute error. Decoded video comparisons are reported separately.
+
+### Decoded video comparison
+
+The following SP1/SP2 metrics use all 193 native-postprocessed RGB uint8
+frames before MP4 encoding. PSNR uses the mean squared error over all pixels;
+SSIM uses the repository accuracy helper's TorchMetrics settings. The prompt
+is “A small red boat sailing across a calm lake.” TI2V uses a fixed synthetic
+RGB conditioning image. Both cases use seed 42 and 50 denoising steps.
+
+| Transformer dtype | Case | PSNR, dB | Mean SSIM | Worst-frame SSIM |
+| --- | --- | ---: | ---: | ---: |
+| BF16 | T2V | 30.418 | 0.958446 | 0.952506 |
+| BF16 | TI2V | 25.733 | 0.938138 | 0.915454 |
+| FP32 | T2V | 53.808 | 0.999215 | 0.999113 |
+| FP32 | TI2V | 54.311 | 0.999196 | 0.998331 |
+
+These measurements cover one prompt/seed and one TI2V conditioning image.
+
+### Performance
+
+Measured on 2x A800-SXM4-80GB with NVLink, using BF16 T2V, 736x1280, 193 frames,
+10 denoising steps, seed 42, CFG 8 and flow shift 12. Each configuration ran
+five measured requests after a two-step warmup; compile, caching and offload
+were disabled. End-to-end timing covers `pipeline.generate`, including text
+conditioning and VAE decoding, with device synchronization at both boundaries.
+Startup and artifact writes are excluded. SP2 reports the slower rank.
+
+| Metric | SP1 | SP2 strict |
+| --- | --- | --- |
+| End-to-end median (range), seconds | `74.589 (74.450–74.681)` | `39.365 (39.194–39.407)` |
+| DiT median (range), seconds | `71.849 (71.717–71.933)` | `36.610 (36.466–36.645)` |
+| Denoising median (range), seconds | `71.853 (71.721–71.938)` | `36.614 (36.470–36.650)` |
+| Peak allocated per rank, GiB | `32.390` | `32.390` |
+| Peak reserved per rank, GiB | `46.342` | `42.941` |
+
+The measured end-to-end speedup is **1.895x** and DiT speedup is **1.963x**
+for this ten-step workload. These timings do not measure 50-step latency.
+A separate two-step profile recorded the FP32 softmax attention kernel at
+`8.476 s` on SP1 and `4.107 / 4.094 s` per SP2 rank. NCCL kernel durations
+summed to `0.105 / 0.107 s` per SP2 rank; concurrent streams can overlap.
 
 ## Online requests
 

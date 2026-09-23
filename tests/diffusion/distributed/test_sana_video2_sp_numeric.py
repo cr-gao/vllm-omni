@@ -220,8 +220,6 @@ def _run(world_size: int, backend: str, mode: str, tmp_path, cases):
                     f"SP{world_size} {backend} {mode} rank={rank} {name} step={step} "
                     f"max_abs={absolute:.3e} rel_l2={relative:.3e}"
                 )
-                # Solver states can be much larger than denoiser outputs;
-                # elementwise relative tolerance handles their FP32 scale.
                 torch.testing.assert_close(result, target, rtol=1e-5, atol=_ABS_LIMIT)
                 assert relative <= _REL_L2_LIMIT, (
                     f"{name} step={step} rank={rank}: max_abs={absolute:.3e}, rel_l2={relative:.3e}"
