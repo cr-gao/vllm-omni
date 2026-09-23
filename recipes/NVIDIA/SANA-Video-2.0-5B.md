@@ -204,8 +204,8 @@ Set `tensor_parallel_size=2` for TP2 or `cfg_parallel_size=2` for CFG2 in the
 offline `Omni` constructor. TP splits self- and cross-attention heads and the
 SwiGLU intermediate width. Q/K RMSNorm still computes statistics across the
 full checkpoint channel dimension; other transformer state remains replicated.
-CFG2 computes the positive branch on CFG rank 0 and the negative branch on rank
-1. With guidance at most 1, both ranks compute the conditional branch. Both
+CFG2 computes the positive branch on CFG rank 0 and the negative branch on CFG
+rank 1. With guidance at most 1, both ranks compute the conditional branch. Both
 ranks continue the same sampler after the branch exchange.
 
 For TP2+SP2, the released 10 softmax heads become five heads per TP rank.
