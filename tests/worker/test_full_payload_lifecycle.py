@@ -15,7 +15,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import Request, RequestStatus
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, DeviceConfig, VllmConfig
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
@@ -29,7 +29,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.fixture(params=[OmniARScheduler, OmniGenerationScheduler], ids=["ar", "generation"])
 def scheduler(request):
     sched = request.param.__new__(request.param)
-    sched.vllm_config = VllmConfig()
+    sched.vllm_config = VllmConfig(device_config=DeviceConfig(device="cpu"))
     sched.requests = {}
     sched.running = []
     sched.waiting = create_request_queue(SchedulingPolicy.FCFS)

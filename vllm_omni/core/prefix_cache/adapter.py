@@ -58,6 +58,8 @@ class PrefixCacheWrite:
     req_id: str
     row_start: int
     row_end: int
+    token_start: int
+    token_end: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,7 +204,8 @@ class PrefixCacheSchedulerAdapter:
             count = int(num_scheduled_tokens.get(req_id, 0))
             if count < 0:
                 raise OmniPrefixCacheUnmatchError(f"negative scheduled token count for req {req_id}: {count}")
-            writes.append(PrefixCacheWrite(req_id, cursor, cursor + count))
+            token_start, token_end = group_view.token_range(req_id, count)
+            writes.append(PrefixCacheWrite(req_id, cursor, cursor + count, token_start, token_end))
             cursor += count
         slots = group_view.step_slots_cpu(list(req_order), dict(num_scheduled_tokens))
         return PrefixCacheWriteLayout(tuple(writes), cursor, slots)
