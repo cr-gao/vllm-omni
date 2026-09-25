@@ -89,6 +89,10 @@ class FakeView:
     def batch_req_ids(self) -> list[str]:
         return list(self.order)
 
+    def token_range(self, req_id, num_scheduled):
+        start = self.computed.get(req_id, 0)
+        return start, start + num_scheduled
+
     def step_slots_cpu(self, req_ids, num_scheduled) -> torch.Tensor:
         parts = []
         for r in req_ids:
@@ -1399,12 +1403,14 @@ def test_same_step_hit_refreshes_prefetch_after_write(reuse_blocks, deferred_mm)
         blocks = [0, 1] if reuse_blocks else [8, 9]
         sid = run_step(mgr, view, {"old": (blocks, 0, 8)}, mm={"mm": torch.full((8, 2), 100.0)})
         mgr.materialize(sid, ["old"])
-        mgr.new_step_starts(FakeSchedOut(finished=["old"]))
+        mgr.new_step_starts(PrefixCacheSchedulerAdapter().translate_step(FakeSchedOut(finished=["old"])))
 
         mgr.new_step_starts(
-            FakeSchedOut(
-                new_reqs=[FakeNewReq("a", 0, [[0, 1]]), FakeNewReq("b", 8, [[0, 1, 2]])],
-                num_scheduled={"a": 8, "b": 4},
+            PrefixCacheSchedulerAdapter().translate_step(
+                FakeSchedOut(
+                    new_reqs=[FakeNewReq("a", 0, [[0, 1]]), FakeNewReq("b", 8, [[0, 1, 2]])],
+                    num_scheduled={"a": 8, "b": 4},
+                )
             )
         )
         old_prefetch = dict(mgr._hit_prefetch["b"])
@@ -1417,7 +1423,8 @@ def test_same_step_hit_refreshes_prefetch_after_write(reuse_blocks, deferred_mm)
         view.computed.update(a=0, b=8)
         hidden = torch.cat([torch.full((8, HIDDEN), 20.0), torch.full((4, HIDDEN), 30.0)])
         mm = torch.cat([torch.full((8, 2), 200.0), torch.full((4, 2), 300.0)])
-        sid = mgr.save_outputs(hidden, {"mm": mm}, num_tokens_unpadded=12, num_tokens_padded=12)
+        layout = PrefixCacheSchedulerAdapter().build_write_layout(view, num_scheduled_tokens={"a": 8, "b": 4})
+        sid = mgr.save_outputs(hidden, {"mm": mm}, num_tokens_unpadded=12, num_tokens_padded=12, write_layout=layout)
         outs = mgr.materialize(sid, ["a", "b"])
 
         assert torch.equal(outs.hidden_states["b"][:8], hidden[:8])

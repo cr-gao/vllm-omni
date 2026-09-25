@@ -52,6 +52,8 @@ class PrefixCacheWrite:
     req_id: str
     row_start: int
     row_end: int
+    token_start: int
+    token_end: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,11 +190,14 @@ class PrefixCacheSchedulerAdapter:
         for req_id in req_order:
             start, end = offsets[req_id]
             count = end - start
+            token_start, token_end = group_view.token_range(req_id, count)
             writes.append(
                 PrefixCacheWrite(
                     req_id,
                     start,
                     end,
+                    token_start,
+                    token_end,
                 )
             )
             cursor += count
