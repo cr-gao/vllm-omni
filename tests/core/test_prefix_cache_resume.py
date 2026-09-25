@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU regression for prefix delivery across real vLLM preemption."""
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +25,8 @@ from vllm_omni.core.prefix_cache.interface import HIDDEN_KEY, PrefixCacheConfig
 from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+logger = logging.getLogger(__name__)
 
 BLOCK_SIZE = 4
 NUM_BLOCKS = 16
@@ -139,6 +142,15 @@ class _CPUCacheRun:
         delivery = self.manager.delivery_view(raw, req_ids)
         delivered = delivery.hidden_states
         self.manager.ack_delivery(delivery)
+        for req_id in req_ids:
+            logger.info(
+                "req=%s resumed=%s scheduled=[%d,%d) delivered=%s",
+                req_id,
+                req_id in output.scheduled_cached_reqs.resumed_req_ids,
+                starts[req_id],
+                starts[req_id] + output.num_scheduled_tokens[req_id],
+                delivered[req_id][:, 0].tolist(),
+            )
         self.scheduler.update_from_output(
             output,
             ModelRunnerOutput(

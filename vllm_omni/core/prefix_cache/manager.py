@@ -768,7 +768,6 @@ class OmniPrefixCacheManager:
             if ctx is not None and not step_released:
                 self._release_step_staging(ctx)
 
-    @_locked
     def delivery_view(self, outputs: StageCacheOutputs, req_ids: list[str]) -> StageCacheOutputs:
         """Clip replay using save-time boundaries, independent of builder completion order."""
         ranges = {r: (outputs.delivery_starts[r], outputs.token_ranges[r][1]) for r in req_ids}
@@ -970,9 +969,7 @@ class OmniPrefixCacheManager:
             self._invalidate_overwritten_prefetches()
             self._prefetch_hit_spans()
         self._next_step_id = step_id + 1
-        progress = {
-            req_id: self._request_progress.setdefault(req_id, PrefixCacheRequestProgress()) for req_id in token_ranges
-        }
+        progress = {req_id: self._request_progress[req_id] for req_id in token_ranges}
         self._step_ctxs[step_id] = _StepContext(
             token_ranges=dict(token_ranges),
             progress=progress,

@@ -401,7 +401,7 @@ def test_save_requires_slot_snapshot_with_cache_contract_error():
                 {},
                 num_tokens_unpadded=1,
                 num_tokens_padded=1,
-                write_layout=PrefixCacheWriteLayout((PrefixCacheWrite("a", 0, 1),), 1),
+                write_layout=PrefixCacheWriteLayout((PrefixCacheWrite("a", 0, 1, 0, 1),), 1),
             )
     finally:
         mgr.shutdown()
