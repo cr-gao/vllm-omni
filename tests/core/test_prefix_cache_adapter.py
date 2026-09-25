@@ -32,6 +32,10 @@ class FakeView:
     def batch_req_ids(self):
         return ["b", "a"]
 
+    def token_range(self, req_id, num_scheduled):
+        start = {"b": 12, "a": 7}[req_id]
+        return start, start + num_scheduled
+
     def step_slots_cpu(self, req_ids, num_scheduled):
         return torch.tensor([20, 21, 7], dtype=torch.long)
 
@@ -374,3 +378,8 @@ def test_negative_continuation_does_not_become_a_new_hit():
     )
     assert step.events == ()
     assert step.scheduled_tokens == (("r", 0),)
+
+def test_write_layout_keeps_request_positions_separate_from_batch_rows():
+    layout = PrefixCacheSchedulerAdapter().build_write_layout(FakeView(), num_scheduled_tokens={"b": 2, "a": 1})
+    assert [(w.token_start, w.token_end) for w in layout.writes] == [(12, 14), (7, 8)]
+    assert [(w.row_start, w.row_end) for w in layout.writes] == [(0, 2), (2, 3)]
