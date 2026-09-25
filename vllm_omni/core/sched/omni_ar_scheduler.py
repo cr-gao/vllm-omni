@@ -1380,6 +1380,19 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     or finished
                 )
             ):
+                if output_is_stale:
+                    # Preemption reset the live counter; use this frame's scheduled end.
+                    cached = scheduler_output.scheduled_cached_reqs
+                    if req_id in cached.req_ids:
+                        index = cached.req_ids.index(req_id)
+                        start = cached.num_computed_tokens[index]
+                    else:
+                        start = next(
+                            data.num_computed_tokens
+                            for data in scheduler_output.scheduled_new_reqs
+                            if data.req_id == req_id
+                        )
+                    confirmed_num_computed_tokens = start + num_tokens_scheduled
                 save_kwargs = {
                     "new_token_ids": new_token_ids,
                     "confirmed_num_computed_tokens": confirmed_num_computed_tokens,

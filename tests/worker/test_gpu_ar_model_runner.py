@@ -2392,7 +2392,9 @@ def test_token_only_output_keeps_prefix_cache_merge(token_only_builder, mocker):
     runner.omni_prefix_cache = object()
     cached = {"codes.audio": {"r1": torch.tensor([31]), "r2": torch.tensor([32])}}
     merge = mocker.patch.object(
-        runner, "_prepare_prefix_cache_pooler_payload_sources", return_value=(None, None, cached)
+        runner,
+        "_prepare_prefix_cache_pooler_payload_sources",
+        return_value=(None, StageCacheOutputs(hidden_states=None, mm_outputs=cached)),
     )
     output = runner._build_omni_model_runner_output_from_snapshot(**kwargs, prefix_cache_step_id=7)
 
@@ -2504,6 +2506,7 @@ def test_shutdown_drops_cached_sampled_token_override(mocker):
 
     assert runner._sampled_token_ids_cpu_override is None
     upstream.assert_called_once()
+
 
 @pytest.mark.parametrize("hit,delivered", [(8, 6), (8, 8), (4, 8)])
 def test_full_payload_cache_recovery_uses_per_key_ends_without_double_clipping(monkeypatch, hit, delivered):

@@ -235,6 +235,7 @@ def test_step_begin_and_save_keep_the_translated_snapshot(monkeypatch):
     runner._prefix_cache_adapter = PrefixCacheSchedulerAdapter()
     runner._prefix_cache_group_view = SimpleNamespace(
         batch_req_ids=lambda: ["r"],
+        token_range=lambda req_id, count: (0, count),
         step_slots_cpu=lambda req_ids, counts: torch.arange(counts["r"], dtype=torch.long),
     )
     arrival = SimpleNamespace(

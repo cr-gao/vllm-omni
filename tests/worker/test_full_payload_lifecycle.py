@@ -32,6 +32,8 @@ def scheduler(request):
     sched.vllm_config = VllmConfig(device_config=DeviceConfig(device="cpu"))
     sched.requests = {}
     sched.running = []
+    sched.deferred_waiting = set()
+    sched.kv_holding_waiting = create_request_queue(SchedulingPolicy.FCFS)
     sched.waiting = create_request_queue(SchedulingPolicy.FCFS)
     sched.skipped_waiting = create_request_queue(SchedulingPolicy.FCFS)
     sched.num_waiting_for_streaming_input = 0
@@ -39,6 +41,7 @@ def scheduler(request):
     sched.input_coordinator = None
     sched.connector = None
     sched.ec_connector = None
+    sched.aux_output_connector = None
     sched._inflight_prefills = set()
     sched.encoder_cache_manager = MagicMock()
     sched._free_request_blocks = MagicMock()
@@ -105,6 +108,7 @@ def runner(request):
     host.requests = {}
     host.execute_model_state = None
     host.routed_experts_initialized = False
+    host._prev_step_idle = False
     host._warmup_state_cleared = True
     host.omni_prefix_cache = None
     host.kv_transfer_manager = MagicMock()

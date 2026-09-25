@@ -79,10 +79,8 @@ class PrefixCacheSchedulerAdapter:
     decode, chunked prefill and a live ID re-entering scheduled_new_reqs.
 
     ABORTED requires an explicit optional cancellation field:
-    ``discarded_req_ids`` (the producer proposed in PR #7681) or
-    ``aborted_req_ids``. Neither is produced by the current scheduler
-    contract; until a producer lands, production terminals remain FINISHED.
-    These fields are accepted for forward compatibility, not inferred.
+    ``discarded_req_ids`` from the Omni scheduler or ``aborted_req_ids``.
+    Cancellation is never inferred from ordinary completion.
     """
 
     def __init__(self) -> None:
