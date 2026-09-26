@@ -393,6 +393,8 @@ class StageDiffusionClient(StageClientBase):
             return None
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
+        if self._engine_dead:
+            return
         self._request_socket.send(
             self._encoder.encode(
                 {
