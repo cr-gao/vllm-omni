@@ -1078,6 +1078,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         for sid in diffusion_stage_ids:
             final_acks.extend(await self._wake_diffusion([sid], requested_tags))
             self._clear_stage_sleep([sid], requested_tags)
+        if diffusion_stage_ids:
+            await asyncio.sleep(0.1)
 
         # Only clear the level-2 flag once all tags are warm, in case partial
         # wake support (e.g. tags=["kv_cache"] only) is added in the future.
@@ -1105,9 +1107,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         logger.info("[%s] Wake-up (diffusion) initiated (Task: %s).", self._name, task_id)
         task = OmniWakeTask(tags=requested_tags, task_id=task_id)
         rpc_results = await self.collective_rpc(method="handle_wake_task", args=(task,), stage_ids=stage_ids)
-        final_acks = await self._resolve_diffusion_acks("handle_wake_task", rpc_results)
-        await asyncio.sleep(0.1)
-        return final_acks
+        return await self._resolve_diffusion_acks("handle_wake_task", rpc_results)
 
     async def is_sleeping(self) -> bool:
         """Return whether all stages are sleeping.

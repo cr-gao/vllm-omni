@@ -959,3 +959,18 @@ def test_wake_up_clears_diffusion_stages_that_woke_before_a_failure():
         assert omni._stage_sleeping_tags == {1: _SLEEP_TAGS}
 
     asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_wake_up_settles_once_for_several_diffusion_stages(mocker):
+    async def run() -> None:
+        omni = _make_omni(stage_types=["diffusion", "diffusion"])
+        await omni.sleep(level=1)
+        settle = mocker.patch("vllm_omni.entrypoints.async_omni.asyncio.sleep", new=AsyncMock())
+
+        await omni.wake_up()
+
+        assert omni.collective_rpc.await_count == 3
+        settle.assert_awaited_once_with(0.1)
+
+    asyncio.run(run())
