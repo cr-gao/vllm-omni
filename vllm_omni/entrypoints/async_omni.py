@@ -973,10 +973,12 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             )
             self._record_stage_sleep(ar_stage_ids, sleep_tags, level)
 
-        # One stage at a time, so a failure keeps the stages that already slept on record.
-        for sid in diffusion_stage_ids:
-            final_acks.extend(await self._sleep_diffusion([sid], level))
-            self._record_stage_sleep([sid], sleep_tags, level)
+        if diffusion_stage_ids:
+            try:
+                final_acks.extend(await self._sleep_diffusion(diffusion_stage_ids, level))
+            finally:
+                # A failed sleep may have released part of a stage, so wake_up must still reach it.
+                self._record_stage_sleep(diffusion_stage_ids, sleep_tags, level)
 
         return final_acks
 

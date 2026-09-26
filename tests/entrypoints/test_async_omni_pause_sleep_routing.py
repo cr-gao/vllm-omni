@@ -849,7 +849,8 @@ def test_sleep_raises_when_diffusion_stage_fails(result):
         with pytest.raises(RuntimeError, match="handle_sleep_task failed: out of memory"):
             await omni.sleep(level=1)
 
-        assert not omni._sleeping_tags
+        # The stage may be partly asleep, so it stays on record for wake_up.
+        assert omni._sleeping_tags == _SLEEP_TAGS
 
     asyncio.run(run())
 
@@ -872,7 +873,7 @@ def test_wake_up_raises_when_diffusion_stage_fails(result):
 
 
 @pytest.mark.cpu
-def test_sleep_records_ar_stage_when_diffusion_stage_fails():
+def test_sleep_records_all_stages_when_diffusion_stage_fails():
     async def run() -> None:
         omni = _make_omni(stage_types=["llm", "diffusion"])
         omni._sleep_diffusion = AsyncMock(side_effect=RuntimeError("handle_sleep_task failed"))
@@ -880,7 +881,7 @@ def test_sleep_records_ar_stage_when_diffusion_stage_fails():
         with pytest.raises(RuntimeError):
             await omni.sleep(level=1)
 
-        assert omni._stage_sleeping_tags == {0: _SLEEP_TAGS}
+        assert omni._stage_sleeping_tags == {0: _SLEEP_TAGS, 1: _SLEEP_TAGS}
 
     asyncio.run(run())
 
@@ -916,20 +917,26 @@ def test_sleep_level2_is_recorded_when_diffusion_stage_fails():
 
 
 @pytest.mark.cpu
-def test_sleep_records_diffusion_stages_that_slept_before_a_failure():
+def test_wake_up_reaches_diffusion_stage_after_failed_sleep():
     async def run() -> None:
-        omni = _make_omni(stage_types=["diffusion", "diffusion"])
+        omni = _make_omni(stage_types=["diffusion"])
         omni.collective_rpc = AsyncMock(
-            side_effect=[
-                [OmniACK(task_id="t", status="SUCCESS", stage_id=0, rank=0)],
-                [OmniACK(task_id="t", status="ERROR", error_msg="out of memory")],
+            return_value=[
+                [
+                    OmniACK(task_id="t", status="SUCCESS", stage_id=0, rank=0),
+                    OmniACK(task_id="t", status="ERROR", error_msg="out of memory"),
+                ]
             ]
         )
-
         with pytest.raises(RuntimeError, match="out of memory"):
             await omni.sleep(level=1)
 
-        assert omni._stage_sleeping_tags == {0: _SLEEP_TAGS}
+        omni.collective_rpc = AsyncMock(return_value=[OmniACK(task_id="t", status="SUCCESS", stage_id=0, rank=0)])
+        await omni.wake_up()
+
+        omni.collective_rpc.assert_awaited_once()
+        assert not omni._sleeping_tags
+        assert omni._paused is False
 
     asyncio.run(run())
 
