@@ -3017,8 +3017,8 @@ async def omni_sleep(request: OmniSleepRequest, raw_request: Request):
     except RuntimeError as e:
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Failed to sleep: {e}") from e
     finally:
-        # A failed sleep may have released part of a stage, so wakeup must still reach it.
-        sleeping_set.update(request.stage_ids)
+        # Mirror the engine: a failed sleep may still leave stages for wakeup to reach.
+        sleeping_set.update([sid for sid in request.stage_ids if await engine_client.is_sleeping(stage_ids=[sid])])
     return {
         "status": "SUCCESS",
         "acks": [dataclasses.asdict(a) if dataclasses.is_dataclass(a) and not isinstance(a, type) else a for a in acks],

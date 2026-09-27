@@ -1002,3 +1002,65 @@ def test_rpc_failure_result_is_not_resolved_as_ack():
         omni.event_resolver.resolve.assert_not_awaited()
 
     asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_sleep_raises_with_reason_of_rpc_error_envelope():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["diffusion"])
+        omni.collective_rpc = AsyncMock(return_value=[{"error": True, "reason": "worker crashed"}])
+
+        with pytest.raises(RuntimeError, match="handle_sleep_task failed: worker crashed"):
+            await omni.sleep(level=1)
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_failed_level2_sleep_can_still_be_woken():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["diffusion"])
+        omni.collective_rpc = AsyncMock(return_value=[OmniACK(task_id="t", status="ERROR", error_msg="out of memory")])
+        with pytest.raises(RuntimeError, match="out of memory"):
+            await omni.sleep(level=2)
+
+        omni.collective_rpc = AsyncMock(return_value=[OmniACK(task_id="t", status="SUCCESS", stage_id=0, rank=0)])
+        await omni.wake_up()
+
+        omni.collective_rpc.assert_awaited_once()
+        assert omni._paused is False
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_partial_level2_sleep_still_blocks_wake_up():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["diffusion"])
+        omni.collective_rpc = AsyncMock(
+            return_value=[
+                [
+                    OmniACK(task_id="t", status="SUCCESS", stage_id=0, rank=0),
+                    OmniACK(task_id="t", status="ERROR", error_msg="out of memory"),
+                ]
+            ]
+        )
+        with pytest.raises(RuntimeError, match="out of memory"):
+            await omni.sleep(level=2)
+
+        with pytest.raises(NotImplementedError):
+            await omni.wake_up()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_is_sleeping_for_given_stages():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "diffusion"])
+        await omni.sleep(stage_ids=[1], level=1)
+
+        assert await omni.is_sleeping(stage_ids=[1])
+        assert not await omni.is_sleeping(stage_ids=[0])
+
+    asyncio.run(run())

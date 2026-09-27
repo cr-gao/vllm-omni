@@ -251,7 +251,7 @@ curl -X POST http://localhost:8000/v1/images/generations \
 
 | Method | Arguments | Return Type | Description |
 | :--- | :--- | :--- | :--- |
-| **sleep** | `stage_ids: List[int], level: int` | `List[OmniACK]` | Triggers hibernation for specified stages. Raises `RuntimeError` if a stage fails; the stages stay marked as sleeping, so `wake_up` brings them back. |
+| **sleep** | `stage_ids: List[int], level: int` | `List[OmniACK]` | Triggers hibernation for specified stages. Raises `RuntimeError` if a stage fails; the stages stay marked as sleeping, so `wake_up` brings them back, unless a level-2 sleep already discarded weights on some replica. |
 | **wake_up** | `stage_ids: List[int]` | `List[OmniACK]` | Reloads weights and re-maps memory. Raises `RuntimeError` if a stage fails; that stage stays sleeping and the call can be retried. |
 | **pause_generation** | `mode: str, stage_ids: List[int]` | `None` | Stops admission; with `mode="keep"` also stops diffusion schedulers and returns after their ACK. |
 | **resume_generation** | `stage_ids: List[int]` | `None` | Reopens paused schedulers, then admission. |
