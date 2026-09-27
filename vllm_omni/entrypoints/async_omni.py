@@ -999,9 +999,12 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         for stage_res in rpc_results:
             worker_acks = stage_res if isinstance(stage_res, list) else [stage_res]
             for ack in worker_acks:
-                if ack is not None:
+                if ack is None:
+                    continue
+                # StagePool's result for a failed RPC has no task_id to resolve.
+                if not isinstance(ack, dict) or "task_id" in ack:
                     await self.event_resolver.resolve(ack)
-                    final_acks.append(ack)
+                final_acks.append(ack)
         errors = [error for ack in final_acks if (error := self._diffusion_ack_error(ack))]
         if errors:
             raise RuntimeError(f"{method} failed: {'; '.join(errors)}")
@@ -1013,6 +1016,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # and StagePool returns {"supported": False, "error": ...} when the RPC failed.
         if isinstance(ack, dict):
             status, error_msg, rpc_error = ack.get("status"), ack.get("error_msg"), ack.get("error")
+            if not rpc_error and (ack.get("todo") or ack.get("supported") is False):
+                rpc_error = str(ack)
         else:
             status, error_msg, rpc_error = getattr(ack, "status", None), getattr(ack, "error_msg", None), None
         if status == "ERROR":

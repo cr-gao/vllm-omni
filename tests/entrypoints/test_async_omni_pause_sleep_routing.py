@@ -974,3 +974,31 @@ def test_wake_up_settles_once_for_several_diffusion_stages(mocker):
         settle.assert_awaited_once_with(0.1)
 
     asyncio.run(run())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("result", [{"supported": False}, {"todo": "not supported yet"}], ids=["unsupported", "todo"])
+def test_sleep_raises_on_rpc_result_without_error(result):
+    async def run() -> None:
+        omni = _make_omni(stage_types=["diffusion"])
+        omni.collective_rpc = AsyncMock(return_value=[result])
+
+        with pytest.raises(RuntimeError, match="handle_sleep_task failed"):
+            await omni.sleep(level=1)
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_rpc_failure_result_is_not_resolved_as_ack():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["diffusion"])
+        omni.event_resolver.resolve = AsyncMock()
+        omni.collective_rpc = AsyncMock(return_value=[{"supported": False, "error": "out of memory"}])
+
+        with pytest.raises(RuntimeError, match="out of memory"):
+            await omni.sleep(level=1)
+
+        omni.event_resolver.resolve.assert_not_awaited()
+
+    asyncio.run(run())
