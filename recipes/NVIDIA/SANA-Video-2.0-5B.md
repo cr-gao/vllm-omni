@@ -102,6 +102,65 @@ step count does not turn the formal checkpoint into the 4-step preview.
 Upstream correctness reference:
 `NVlabs/Sana@e93c883e10730ee5a4a6edf1cbcf501dc4ef753b`.
 
+## CUDA graphs
+
+For fixed-shape single-GPU inference, opt in through `model_config`:
+
+```python
+engine = Omni(
+    model="Efficient-Large-Model/SANA-Video_2.0_5B_720p",
+    dtype="bfloat16",
+    enforce_eager=False,
+    model_config={
+        "cuda_graph_shapes": [
+            {"height": 64, "width": 96, "num_frames": 9, "task": "t2v", "guidance_scale": 8.0},
+            {"height": 64, "width": 96, "num_frames": 9, "task": "ti2v", "guidance_scale": 8.0},
+        ],
+    },
+)
+```
+
+Each entry prepares a graph at model setup. `task` defaults to `t2v` and
+`guidance_scale` to `8.0`. Guidance values greater than 1 share the CFG-enabled
+shape; values at most 1 require a separate entry. T2V and TI2V have different
+timestep layouts and need separate entries. Height and width are pixel
+dimensions, and `num_frames` is the output video frame count. Declare only the
+shapes needed: each captured signature retains its own GPU memory pool.
+
+The runner reuses vLLM's breakable CUDA graph capture, initially capturing the
+transformer's tensor computation in one segment, including attention. Input
+validation and RoPE preparation stay outside capture. The default 300-token
+text shape is preserved, and prompt, mask, latent and timestep values are
+updated on replay. Outputs are copied so subsequent replays cannot overwrite
+earlier results. Text encoding, sampling, CFG combination and VAE decoding
+continue to run through the native pipeline.
+
+Requests with an uncaptured shape or input dtype run eagerly; serving does
+not capture new graphs. The generic 9-frame startup request does not prepare
+other video shapes. `enforce_eager=True` disables CUDA graph setup. With no
+`cuda_graph_shapes`, execution retains its existing compilation policy.
+CUDA graph setup takes precedence over `diffusion_compile_granularity` and
+does not enable `torch.compile`.
+
+For an already constructed native `SanaVideo2Pipeline`,
+`pipeline.prepare_cuda_graphs([...])` explicitly prepares the same entries
+before calling `generate`. Repeated preparation replaces the configured
+graph set. Prepare and generate serially, with resident, unchanged weights.
+Parallelism, cache acceleration and offload retain the restrictions above.
+
+GPU correctness coverage uses a small transformer with both attention types
+and multiple Attention Residual groups, plus both native sampling paths:
+
+```bash
+python -m pytest -o addopts= -q tests/diffusion/models/sana_video2
+```
+
+These tests check FP32/BF16 replay, changed prompts and masks, independent
+shapes, output ownership, CFG modes and per-step T2V/TI2V latent equality.
+They do not establish performance or full-resolution capacity for the 5B
+checkpoint. Measure initial capture time, steady inference, end-to-end
+latency and GPU memory separately for a deployment.
+
 ## Online requests
 
 The official model ID and local release directories resolve to the same native

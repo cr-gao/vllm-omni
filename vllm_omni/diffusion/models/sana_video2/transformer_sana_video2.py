@@ -13,6 +13,7 @@
 # limitations under the License.
 #
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Native inference transformer for the released SANA-Video 2.0 5B.
 
@@ -275,6 +276,17 @@ class SanaVideo2TransformerModel(nn.Module):
         Timesteps are B or B,1,F,1,1 (TI2V). All depth state and video dimensions
         are local to this call; no state is reused across requests or timesteps.
         """
+        self.validate_inputs(hidden_states, timestep, encoder_hidden_states, encoder_attention_mask)
+        ropes = self.prepare_rotary_emb(hidden_states)
+        return self.forward_tensor(hidden_states, timestep, encoder_hidden_states, encoder_attention_mask, ropes)
+
+    def validate_inputs(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_attention_mask: torch.Tensor | None,
+    ) -> None:
         c = self.config
         if hidden_states.ndim != 5 or hidden_states.shape[1] != c.in_channels:
             raise ValueError("Latents must have shape (batch, in_channels, frames, height, width)")
@@ -295,18 +307,36 @@ class SanaVideo2TransformerModel(nn.Module):
                 raise ValueError("Text mask must be bool with shape (batch, text_tokens)")
             if not mask.any(dim=1).all():
                 raise ValueError("Each sample must contain at least one unmasked text token")
-        if timestep.shape == (batch, 1, frames, 1, 1):
-            timestep = timestep.reshape(batch, 1, frames)
-        elif timestep.shape != (batch,):
+        if timestep.shape not in ((batch, 1, frames, 1, 1), (batch,)):
             raise ValueError("Timesteps must have shape (batch,) or (batch, 1, frames, 1, 1)")
+
+    def prepare_rotary_emb(self, hidden_states: torch.Tensor) -> dict[str, torch.Tensor]:
+        thw = hidden_states.shape[2:]
+        return {
+            "linear": self.rope_linear(thw, hidden_states.device),
+            "softmax": self.rope_softmax(thw, hidden_states.device),
+        }
+
+    def forward_tensor(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_attention_mask: torch.Tensor | None,
+        ropes: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Tensor computation with validated inputs and device-resident RoPE."""
+        c = self.config
+        batch, _, frames, height, width = hidden_states.shape
+        y, mask = encoder_hidden_states, encoder_attention_mask
+        if timestep.ndim == 5:
+            timestep = timestep.reshape(batch, 1, frames)
         timestep = (
             timestep.float() / c.timestep_norm_scale_factor
             if c.timestep_norm_scale_factor != 1.0
             else timestep.long().float()
         )
         x = self.x_embedder(hidden_states.to(self.dtype))
-        thw = (frames, height, width)
-        ropes = {"linear": self.rope_linear(thw, x.device), "softmax": self.rope_softmax(thw, x.device)}
         t = self.t_embedder(timestep.flatten())
         t0 = self.t_block(t).unflatten(0, timestep.shape)
         t = t.unflatten(0, timestep.shape)

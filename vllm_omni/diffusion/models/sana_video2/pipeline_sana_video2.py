@@ -4,6 +4,7 @@
 
 import math
 from pathlib import Path
+from typing import Any
 
 import torch
 from diffusers.utils.torch_utils import randn_tensor
@@ -130,6 +131,8 @@ class SanaVideo2Pipeline(nn.Module, SupportImageInput, SupportsComponentDiscover
         super().__init__()
         self.weights_sources = []
         self.instruction = tuple(instruction)
+        self.od_config = od_config
+        self._cuda_graph_runner = None
         if od_config is not None:
             validate_parallel_config(od_config)
             tokenizer, text_encoder, vae, transformer = self._load_components(od_config)
@@ -148,8 +151,59 @@ class SanaVideo2Pipeline(nn.Module, SupportImageInput, SupportsComponentDiscover
     def device(self):
         return next(self.transformer.parameters()).device
 
+    def setup_compile(self) -> None:
+        if self.od_config is None or self.od_config.enforce_eager:
+            return
+        shapes = (self.od_config.model_config or {}).get("cuda_graph_shapes", [])
+        if shapes:
+            self.prepare_cuda_graphs(shapes)
+        elif self.od_config.diffusion_compile_granularity == "full":
+            self.transformer.compile(dynamic=self.od_config.diffusion_compile_dynamic)
+
+    @torch.no_grad()
+    def prepare_cuda_graphs(self, shapes: list[dict[str, Any]]) -> None:
+        """Capture declared video shapes before serving; other shapes remain eager."""
+        if self.od_config is not None and self.od_config.enforce_eager:
+            return
+        from .cuda_graph import SanaVideo2CudaGraphRunner
+
+        runner = SanaVideo2CudaGraphRunner(self.transformer)
+        for shape in shapes:
+            extra = set(shape) - {"height", "width", "num_frames", "task", "guidance_scale"}
+            if extra:
+                raise ValueError(f"Unknown CUDA graph shape options: {sorted(extra)}")
+            height = shape["height"]
+            width = shape["width"]
+            frames = shape["num_frames"]
+            guidance = shape.get("guidance_scale", 8.0)
+            task = shape.get("task", "t2v")
+            if task not in ("t2v", "ti2v"):
+                raise ValueError("CUDA graph task must be 't2v' or 'ti2v'")
+            self.check_inputs(height, width, frames, 50, guidance, 12.0)
+            batch = 2 if guidance > 1 else 1
+            latent_frames = (frames - 1) // 8 + 1
+            config = self.transformer.config
+            latent = torch.zeros(
+                batch,
+                config.in_channels,
+                latent_frames,
+                height // 32,
+                width // 32,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            time_shape = (batch,) if task == "t2v" else (batch, 1, latent_frames, 1, 1)
+            timestep = torch.full(time_shape, 900.0, device=self.device, dtype=torch.float32)
+            if task == "ti2v":
+                timestep[:, :, 0] = 0
+            text = torch.zeros(batch, 300, config.caption_channels, device=self.device, dtype=torch.bfloat16)
+            mask = torch.ones(batch, 300, device=self.device, dtype=torch.bool)
+            runner.capture(latent, timestep, text, mask)
+        self._cuda_graph_runner = runner
+
     def _load_components(self, config):
         options = dict(config.model_config or {})
+        options.pop("cuda_graph_shapes", None)
         allowed = {
             "vae_model",
             "vae_revision",
@@ -316,13 +370,15 @@ class SanaVideo2Pipeline(nn.Module, SupportImageInput, SupportsComponentDiscover
             image_latents = normalize_latents(self.vae, self.vae.encode(pixels).latent_dist.mode())
             latents[:, :, :1] = image_latents
 
+        transformer = self._cuda_graph_runner if self._cuda_graph_runner is not None else self.transformer
+
         def predict(x, time, noise_space=False):
             inputs = torch.cat([x, x]) if do_cfg else x
             if time.ndim == 0:
                 timestep = (time * 1000).expand(inputs.shape[0])
             else:
                 timestep = torch.cat([time, time]) if do_cfg else time
-            prediction = self.transformer(inputs, timestep, embeddings, mask)
+            prediction = transformer(inputs, timestep, embeddings, mask)
             if noise_space:
                 # Upstream applies CFG after flow->noise conversion, not before.
                 sigma = time.reshape((1,) * x.ndim).to(inputs)
