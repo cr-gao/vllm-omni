@@ -349,7 +349,7 @@ class StageDiffusionClient(StageClientBase):
             self.replica_id,
             request_id,
         )
-        self._request_socket.send(
+        self._send_request(
             self._encoder.encode(
                 {
                     "type": "add_request",
@@ -361,6 +361,18 @@ class StageDiffusionClient(StageClientBase):
                 }
             )
         )
+
+    def _send_request(self, data: bytes) -> None:
+        # The subprocess can die before _engine_dead is set, and a blocking send to it never returns.
+        while True:
+            try:
+                self._request_socket.send(data, flags=zmq.NOBLOCK)
+                return
+            except zmq.Again:
+                if self._proc_manager is not None and not self._proc_manager.proc.is_alive():
+                    self._engine_dead = True
+                    raise EngineDeadError() from None
+                self._request_socket.poll(100, zmq.POLLOUT)
 
     def get_diffusion_output_nowait(self) -> OmniRequestOutput | None:
         self._drain_responses()
@@ -448,9 +460,7 @@ class StageDiffusionClient(StageClientBase):
 
         kwargs = kwargs or {}
         rpc_id = uuid.uuid4().hex
-        self._pending_rpcs.add(rpc_id)
-
-        self._request_socket.send(
+        self._send_request(
             self._encoder.encode(
                 {
                     "type": "collective_rpc",
@@ -462,6 +472,7 @@ class StageDiffusionClient(StageClientBase):
                 }
             )
         )
+        self._pending_rpcs.add(rpc_id)
 
         deadline = time.monotonic() + timeout if timeout else None
         # Wait for the matching RPC response, buffering result messages.
