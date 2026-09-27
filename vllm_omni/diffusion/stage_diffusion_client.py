@@ -395,14 +395,19 @@ class StageDiffusionClient(StageClientBase):
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         if self._engine_dead:
             return
-        self._request_socket.send(
-            self._encoder.encode(
-                {
-                    "type": "abort",
-                    "request_ids": list(request_ids),
-                }
+        try:
+            # The subprocess can die before _engine_dead is set, and a blocking send to it never returns.
+            self._request_socket.send(
+                self._encoder.encode(
+                    {
+                        "type": "abort",
+                        "request_ids": list(request_ids),
+                    }
+                ),
+                flags=zmq.NOBLOCK,
             )
-        )
+        except zmq.Again:
+            pass
 
     async def submit_interaction_async(
         self,
