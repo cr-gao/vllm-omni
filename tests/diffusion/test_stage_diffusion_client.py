@@ -80,21 +80,25 @@ def test_abort_returns_when_engine_is_dead():
     client = _client_without_subprocess()
     client._engine_dead = True
 
-    abort = threading.Thread(target=asyncio.run, args=(client.abort_requests_async(["req-0"]),), daemon=True)
-    abort.start()
-    abort.join(timeout=5)
-
-    assert not abort.is_alive()
+    thread, outcome = _run_in_thread(client.abort_requests_async(["req-0"]))
+    thread.join(timeout=5)
+    try:
+        assert not thread.is_alive()
+        assert "error" not in outcome
+    finally:
+        _close(client, thread)
 
 
 def test_abort_returns_when_subprocess_is_gone_before_engine_dead_is_set():
     client = _client_without_subprocess()
 
-    abort = threading.Thread(target=asyncio.run, args=(client.abort_requests_async(["req-0"]),), daemon=True)
-    abort.start()
-    abort.join(timeout=5)
-
-    assert not abort.is_alive()
+    thread, outcome = _run_in_thread(client.abort_requests_async(["req-0"]))
+    thread.join(timeout=5)
+    try:
+        assert not thread.is_alive()
+        assert "error" not in outcome
+    finally:
+        _close(client, thread)
 
 
 @pytest.mark.parametrize("call", ["add_request", "collective_rpc"])
