@@ -78,6 +78,7 @@ from vllm_omni.core.prefix_cache.interface import (
     OmniPrefixCacheStagingTimeoutError,
     OmniPrefixCacheUnmatchError,
     PrefixCacheConfig,
+    PrefixCacheRequestProgress,
     ReqId,
     StageCacheOutputs,
     StepId,
@@ -254,13 +255,6 @@ class _SlotRef:
     absent: torch.Tensor | None = None
 
 
-@dataclass
-class _RequestProgress:
-    """Successful local handoff boundary, retained across preemption."""
-
-    delivered_upto: int = 0
-
-
 @dataclass(kw_only=True)
 class _StepContext:
     """Save-time snapshot of one step; consumed exactly once.
@@ -275,7 +269,7 @@ class _StepContext:
     # Packed layout in batch order: req -> [start, end) of this step's rows.
     spans: dict[ReqId, tuple[int, int]]
     token_ranges: dict[ReqId, tuple[int, int]]
-    progress: dict[ReqId, _RequestProgress]
+    progress: dict[ReqId, PrefixCacheRequestProgress]
     delivery_starts: dict[ReqId, int]
     hit_starts: dict[ReqId, int]
     token_mm_keys: frozenset[TensorName]
@@ -442,7 +436,7 @@ class OmniPrefixCacheManager:
         if (hk := self._policy.hidden_key) is not None:
             self._slot_status.init_table(hk)
         self._request_tasks = _RequestTaskTable()
-        self._request_progress: dict[ReqId, _RequestProgress] = {}
+        self._request_progress: dict[ReqId, PrefixCacheRequestProgress] = {}
         # Join worklists — not occupancy, not the request-task table.
         self._join_next_step_tids: list[Tid] = []
         self._join_finished_tids: set[Tid] = set()  # escalated on finish/abort
@@ -524,7 +518,7 @@ class OmniPrefixCacheManager:
             for event in events:
                 req_id = event.req_id
                 if event.kind is PrefixCacheEventKind.STARTED:
-                    self._request_progress[req_id] = _RequestProgress()
+                    self._request_progress[req_id] = PrefixCacheRequestProgress()
                 elif event.kind is not PrefixCacheEventKind.RESUMED:
                     continue
                 progress = self._request_progress[req_id]

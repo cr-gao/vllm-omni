@@ -141,11 +141,10 @@ def test_cached_mm_is_clipped_but_global_metadata_is_preserved():
 
 
 def test_delivery_clips_current_only_fields_relative_to_scheduled_origin():
-    from vllm_omni.core.prefix_cache.interface import StageCacheOutputs
-    from vllm_omni.core.prefix_cache.manager import _RequestProgress
+    from vllm_omni.core.prefix_cache.interface import PrefixCacheRequestProgress, StageCacheOutputs
 
     mgr, _ = make_manager()
-    progress = _RequestProgress(delivered_upto=13)
+    progress = PrefixCacheRequestProgress(delivered_upto=13)
     raw = StageCacheOutputs(
         hidden_states={"a": torch.arange(6, 14).reshape(-1, 1)},
         mm_outputs={
@@ -167,11 +166,10 @@ def test_delivery_clips_current_only_fields_relative_to_scheduled_origin():
 
 
 def test_delivery_acknowledges_only_selected_requests():
-    from vllm_omni.core.prefix_cache.interface import StageCacheOutputs
-    from vllm_omni.core.prefix_cache.manager import _RequestProgress
+    from vllm_omni.core.prefix_cache.interface import PrefixCacheRequestProgress, StageCacheOutputs
 
     mgr, _ = make_manager()
-    a, b = _RequestProgress(), _RequestProgress()
+    a, b = PrefixCacheRequestProgress(), PrefixCacheRequestProgress()
     raw = StageCacheOutputs(
         hidden_states={"a": torch.zeros(2, 1), "b": torch.zeros(2, 1)},
         mm_outputs={},
