@@ -24,8 +24,8 @@ from vllm.v1.worker import gpu_input_batch
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from vllm_omni.core.prefix_cache import ModelCachePolicy
-from vllm_omni.core.prefix_cache.interface import StageCacheOutputs
-from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager, _RequestProgress
+from vllm_omni.core.prefix_cache.interface import PrefixCacheRequestProgress, StageCacheOutputs
+from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
@@ -570,8 +570,8 @@ def test_prefix_delivery_builder_clips_payload_and_acks_downstream_only(monkeypa
     runner._async_chunk = False
     runner.omni_prefix_cache = _delivery_test_manager()
     progress = {
-        "r1": _RequestProgress(delivered_upto=5),
-        "r2": _RequestProgress(delivered_upto=2),
+        "r1": PrefixCacheRequestProgress(delivered_upto=5),
+        "r2": PrefixCacheRequestProgress(delivered_upto=2),
     }
     raw = StageCacheOutputs(
         hidden_states={"r1": torch.arange(6).float().unsqueeze(1), "r2": torch.arange(2).float().unsqueeze(1)},
@@ -614,13 +614,13 @@ def test_prefix_delivery_builder_acks_only_after_success(monkeypatch):
     runner = _make_async_output_runner(engine_output_type="latent")
     runner._async_chunk = False
     runner.omni_prefix_cache = _delivery_test_manager()
-    progress = _RequestProgress()
+    progress = PrefixCacheRequestProgress()
     raw = StageCacheOutputs(
         hidden_states={"r1": torch.tensor([[1.0], [2.0]]), "r2": torch.tensor([[3.0], [4.0]])},
         mm_outputs={},
         token_ranges={"r1": (0, 2), "r2": (0, 2)},
         scheduled_token_ranges={"r1": (0, 2), "r2": (0, 2)},
-        _progress={"r1": progress, "r2": _RequestProgress()},
+        _progress={"r1": progress, "r2": PrefixCacheRequestProgress()},
         delivery_starts={"r1": 0, "r2": 0},
     )
     monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("latent", ["r1"]))
@@ -645,13 +645,13 @@ def test_prefix_delivery_clips_scheduled_hidden_when_cached_hidden_disabled(monk
     runner._async_chunk = False
     runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=False)
     runner.omni_prefix_cache = _delivery_test_manager()
-    progress = _RequestProgress(delivered_upto=5)
+    progress = PrefixCacheRequestProgress(delivered_upto=5)
     raw = StageCacheOutputs(
         hidden_states=None,
         mm_outputs={},
         token_ranges={"r1": (0, 6), "r2": (0, 2)},
         scheduled_token_ranges={"r1": (4, 6), "r2": (0, 2)},
-        _progress={"r1": progress, "r2": _RequestProgress()},
+        _progress={"r1": progress, "r2": PrefixCacheRequestProgress()},
         delivery_starts={"r1": 5, "r2": 0},
     )
     monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("latent", ["r1"]))
@@ -678,13 +678,13 @@ def test_sparse_list_only_audio_keeps_later_payload_after_empty_step(monkeypatch
     runner.omni_prefix_cache = _delivery_test_manager()
     discarded: list[int] = []
     runner.omni_prefix_cache.discard_step = discarded.append
-    progress = _RequestProgress()
+    progress = PrefixCacheRequestProgress()
     raw = StageCacheOutputs(
         hidden_states=None,
         mm_outputs={"codes.audio": {"r1": [torch.tensor([9])], "r2": []}},
         token_ranges={"r1": (5, 6), "r2": (0, 2)},
         scheduled_token_ranges={"r1": (5, 6), "r2": (0, 2)},
-        _progress={"r1": progress, "r2": _RequestProgress()},
+        _progress={"r1": progress, "r2": PrefixCacheRequestProgress()},
     )
     monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("audio", req_ids))
     monkeypatch.setattr(
@@ -732,7 +732,7 @@ def test_build_omni_output_uses_snapshots_after_accumulation(monkeypatch, cache_
                     scheduled_token_ranges={"r1": (10, 11), "r2": (20, 22)},
                     cached_mm_keys=frozenset({"foo"}),
                     token_mm_keys=frozenset({"foo"}),
-                    _progress={"r1": _RequestProgress(), "r2": _RequestProgress()},
+                    _progress={"r1": PrefixCacheRequestProgress(), "r2": PrefixCacheRequestProgress()},
                 ),
             ),
         )
@@ -1507,7 +1507,7 @@ def test_build_omni_output_uses_combined_prefix_cache_mm_payload_for_partial_dow
         mm_outputs=combined_mm,
         token_ranges={r: (0, 1) for r in ("r1", "r2", "r3")},
         scheduled_token_ranges={r: (0, 1) for r in ("r1", "r2", "r3")},
-        _progress={r: _RequestProgress() for r in ("r1", "r2", "r3")},
+        _progress={r: PrefixCacheRequestProgress() for r in ("r1", "r2", "r3")},
         delivery_starts={"r1": 0, "r2": 0, "r3": 0},
     )
     runner.omni_prefix_cache = _delivery_test_manager()
@@ -2456,7 +2456,7 @@ def test_full_payload_cache_recovery_uses_per_key_ends_without_double_clipping(m
         token_range=(0, delivered - 2),
     )
     ends = runner._full_payload_token_ends["r1"]
-    progress = _RequestProgress(delivered_upto=min(ends.values()))
+    progress = PrefixCacheRequestProgress(delivered_upto=min(ends.values()))
     origin, end = min(hit, delivered - 2), hit + 2
     raw = StageCacheOutputs(
         hidden_states={"r1": torch.arange(origin, end).reshape(-1, 1)},
