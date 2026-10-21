@@ -3,9 +3,10 @@
 """HF-numerics mode for the Qwen3-Omni thinker text decoder.
 
 Enabled with ``additional_config: {hf_numerics: true}`` on the thinker stage. RMSNorm,
-the residual and deepstack adds, rotary embedding and the MoE block then follow the transformers
-implementation op for op, so a trainer that runs the HF model under batch-invariant
-kernels recomputes the rollout log-probs bitwise. Each replaced op is a custom op,
+the residual and deepstack adds, rotary embedding and MoE routing then follow the transformers
+implementation op for op, and the experts run through ``fused_experts``, which a trainer can
+register as the experts implementation of the HF model. Under batch-invariant kernels the
+trainer then recomputes the rollout log-probs bitwise. Each replaced op is a custom op,
 opaque to torch.compile.
 """
 
@@ -13,13 +14,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
-from transformers.activations import ACT2FN
-from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.model_executor.layers.fused_moe import UnquantizedFusedMoEMethod
+from vllm.config import VllmConfig
+from vllm.model_executor.layers.fused_moe import UnquantizedFusedMoEMethod, fused_experts
 from vllm.model_executor.layers.fused_moe.oracle.unquantized import UnquantizedMoeBackend
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.models.qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeSparseMoeBlock
-from vllm.platforms import current_platform
 
 
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -104,27 +103,6 @@ def _(
     return torch.empty_like(query), torch.empty_like(key)
 
 
-class _Experts:
-    """The attributes ``grouped_mm_experts_forward`` reads from an HF experts module."""
-
-    has_gate = True
-    has_bias = False
-    is_transposed = False
-    is_concatenated = True
-    _is_expert_parallel = False
-
-    def __init__(self, gate_up_proj: torch.Tensor, down_proj: torch.Tensor, hidden_act: str):
-        self.gate_up_proj = gate_up_proj
-        self.down_proj = down_proj
-        self.num_experts = gate_up_proj.shape[0]
-        self.act_fn = ACT2FN[hidden_act]
-
-    def _apply_gate(self, gate_up_out: torch.Tensor) -> torch.Tensor:
-        from transformers.integrations.moe import _default_apply_gate
-
-        return _default_apply_gate(self, gate_up_out)
-
-
 @torch.library.custom_op("vllm_omni::hf_moe", mutates_args=())
 def hf_moe(
     x: torch.Tensor,
@@ -133,18 +111,15 @@ def hf_moe(
     w2: torch.Tensor,
     top_k: int,
     norm_topk_prob: bool,
-    hidden_act: str,
 ) -> torch.Tensor:
-    # Imported here so the default thinker path never loads this private transformers helper.
-    from transformers.integrations.moe import grouped_mm_experts_forward
-
     router_logits = F.linear(x, gate_weight)
     router_probs = F.softmax(router_logits, dtype=torch.float, dim=-1)
     top_value, top_index = torch.topk(router_probs, top_k, dim=-1)
     if norm_topk_prob:
         top_value = top_value / top_value.sum(dim=-1, keepdim=True)
+    # The HF router hands the experts weights rounded to the activation dtype.
     top_value = top_value.to(router_logits.dtype)
-    return grouped_mm_experts_forward(_Experts(w13, w2, hidden_act), x, top_index, top_value)
+    return fused_experts(x, w13, w2, top_value.float(), top_index.to(torch.int32))
 
 
 @hf_moe.register_fake
@@ -155,7 +130,6 @@ def _(
     w2: torch.Tensor,
     top_k: int,
     norm_topk_prob: bool,
-    hidden_act: str,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -193,7 +167,6 @@ class HFNumericsSparseMoeBlock(Qwen3MoeSparseMoeBlock):
             experts.w2_weight,
             self.top_k,
             self.norm_topk_prob,
-            self.hidden_act,
         )
         return out.view(hidden_states.shape)
 
@@ -227,19 +200,8 @@ class HFNumericsDecoderLayer(Qwen3MoeDecoderLayer):
                 f"hf_numerics needs the Triton MoE backend, got {quant_method.unquantized_backend.value}; "
                 "set kernel_config.moe_backend='triton' (--moe-backend triton)"
             )
-        native_grouped_mm = (
-            current_platform.is_cuda()
-            and (current_platform.is_device_capability_family(90) or current_platform.is_device_capability_family(100))
-            and vllm_config.model_config.dtype == torch.bfloat16
-        )
-        if vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE and not native_grouped_mm:
-            raise ValueError(
-                "hf_numerics can run under CUDA graphs only with bf16 on SM90/SM100 GPUs, where torch grouped_mm "
-                "has a native kernel; set enforce_eager=True"
-            )
         # The stock layer builds the MoE block itself; swapping the class keeps its loaded experts and
         # replaces only the forward.
         self.mlp.__class__ = HFNumericsSparseMoeBlock
         self.mlp.top_k = config.num_experts_per_tok
         self.mlp.norm_topk_prob = config.norm_topk_prob
-        self.mlp.hidden_act = config.hidden_act

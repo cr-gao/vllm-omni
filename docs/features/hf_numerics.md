@@ -2,9 +2,10 @@
 
 `hf_numerics` is an opt-in mode of the Qwen3-Omni thinker stage for true on-policy
 RL. With it enabled, the text decoder computes RMSNorm, the residual and deepstack adds, rotary
-embedding and the MoE block exactly as the transformers implementation does, so a
-trainer that runs the HF model under batch-invariant kernels recomputes the rollout
-log-probs bitwise instead of within a tolerance.
+embedding and MoE routing exactly as the transformers implementation does, and runs the
+experts through vLLM's `fused_experts`, which the trainer registers as the experts
+implementation of the HF model. A trainer that runs the HF model under batch-invariant
+kernels then recomputes the rollout log-probs bitwise instead of within a tolerance.
 
 ## What changes
 
@@ -14,11 +15,13 @@ log-probs bitwise instead of within a tolerance.
 | Residual add | fused add-norm on the unrounded sum | plain add in the activation dtype, norm on the rounded sum |
 | Deepstack visual add | added to the MLP output before the residual add | added to the rounded layer output (residual + MLP) |
 | Rotary embedding | vLLM M-RoPE kernel | HF cos/sin computed in fp32 per call and the HF `rotate_half` formula |
-| MoE | `fused_topk` + fused experts | fp32 softmax, top-k, renormalise, cast to the activation dtype, then `grouped_mm` experts |
+| MoE routing | `fused_topk` | fp32 softmax, top-k, renormalise, cast to the activation dtype, as the HF router |
+| MoE experts | `fused_experts` | unchanged; the trainer side runs the same kernel through transformers' `ExpertsInterface` |
 
 Attention, dense GEMMs, embedding and the LM head are unchanged: they already match
 the HF model bitwise under `VLLM_BATCH_INVARIANT=1`, as long as both sides use the
-same FlashAttention kernel.
+same FlashAttention kernel. `fused_experts` is batch-invariant under the same flag, so
+the trainer's packed batch and the rollout's decode batch give the same rows.
 
 Each replaced op is a `torch.library` custom op, so it is opaque to `torch.compile`.
 
@@ -36,22 +39,14 @@ stages:
 
 The mode is meant to be combined with `VLLM_BATCH_INVARIANT=1`, `tensor_parallel_size: 1`
 and no expert parallelism. Only the default rope type and MoE decoder layers are
-supported. Two more requirements are checked when the model is built:
-
-- **Unquantized Triton MoE backend.** The MoE block reads the loaded expert weights
-  as HF `[experts, 2 * intermediate, hidden]` / `[experts, hidden, intermediate]`
-  matrices. The FlashInfer backends repack them after loading, so any other backend
-  is rejected; set `moe_backend: triton` (`--moe-backend triton`) when `auto` would
-  pick FlashInfer.
-- **CUDA graphs only with a native `grouped_mm` kernel.** In PyTorch 2.13,
-  `torch._grouped_mm` has a native kernel only for bf16 on SM90 (Hopper) and SM100
-  (datacenter Blackwell); see `_grouped_mm_cuda` in
-  `aten/src/ATen/native/cuda/GroupedBlas.cpp`. Everywhere else it falls back to a per-expert loop that
-  copies the group offsets to the host, which cannot be captured into a CUDA graph.
-  On other GPUs or dtypes, set `enforce_eager: true`.
+supported. One more requirement is checked when the model is built: the
+**unquantized Triton MoE backend**. The MoE block reads the loaded expert weights
+as HF `[experts, 2 * intermediate, hidden]` / `[experts, hidden, intermediate]`
+matrices. The FlashInfer backends repack them after loading, so any other backend
+is rejected; set `moe_backend: triton` (`--moe-backend triton`) when `auto` would
+pick FlashInfer.
 
 ## Cost
 
-The replaced ops are unfused eager PyTorch. On a 4-layer Qwen3-Omni-30B-A3B thinker on
-one H20, thinker-only stage with CUDA graphs, 32 concurrent requests × 512 tokens,
-throughput went from 3318 to 2228 tok/s. Keep the mode off for serving.
+The replaced norm, rotary and routing ops are unfused eager PyTorch; the experts keep the
+fused kernel. Keep the mode off for serving.

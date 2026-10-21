@@ -15,6 +15,8 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     apply_rotary_pos_emb,
 )
 from vllm.config import KernelConfig, ModelConfig, VllmConfig, set_current_vllm_config
+from vllm.model_executor.layers.fused_moe import fused_experts
+from vllm.model_executor.layers.fused_moe import fused_moe as fused_moe_module
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.utils.torch_utils import set_default_torch_dtype
 
@@ -23,7 +25,6 @@ from vllm_omni.model_executor.models.qwen3_omni.hf_numerics import (
     HFNumericsDecoderLayer,
     HFNumericsRMSNorm,
     HFNumericsRotaryEmbedding,
-    _Experts,
     hf_add_deepstack,
     hf_add_rms_norm,
     hf_moe,
@@ -149,43 +150,52 @@ def test_rotary_rejects_non_default_rope_type():
         HFNumericsRotaryEmbedding(config)
 
 
-@pytest.mark.parametrize("device", _DEVICES)
-@pytest.mark.parametrize("dtype", _DTYPES)
-def test_moe_matches_hf_grouped_mm_block(device: str, dtype: torch.dtype):
-    torch.manual_seed(0)
+def _hf_moe_block(dtype: torch.dtype, experts_implementation: str = "grouped_mm"):
     config = _text_config()
-    config._experts_implementation = "grouped_mm"
-    block = Qwen3OmniMoeThinkerTextSparseMoeBlock(config).to(device=device, dtype=dtype)
+    config._experts_implementation = experts_implementation
+    block = Qwen3OmniMoeThinkerTextSparseMoeBlock(config).to(device="cuda", dtype=dtype)
     for p in block.parameters():
         p.data.normal_(0, 0.2)
-    x = torch.randn(9, 32, dtype=dtype, device=device)
-    ref = block(x[None])[0]
-    out = hf_moe(x, block.gate.weight, block.experts.gate_up_proj, block.experts.down_proj, 2, True, "silu")
-    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+    return block
 
 
-@pytest.mark.cpu
-def test_experts_stub_has_what_grouped_mm_reads():
-    experts = _Experts(torch.empty(4, 16, 32), torch.empty(4, 32, 8), "silu")
-    for name in (
-        "has_gate",
-        "has_bias",
-        "is_transposed",
-        "is_concatenated",
-        "_apply_gate",
-        "num_experts",
-        "act_fn",
-        "gate_up_proj",
-        "down_proj",
-    ):
-        assert hasattr(experts, name)
-    assert experts._is_expert_parallel is False
+def _hf_router_then_fused_experts(block, x: torch.Tensor) -> torch.Tensor:
+    """What a trainer computes with the HF router and ``fused_experts`` registered as its experts."""
+    _, top_k_weights, top_k_index = block.gate(x)
+    return fused_experts(
+        x, block.experts.gate_up_proj, block.experts.down_proj, top_k_weights.float(), top_k_index.to(torch.int32)
+    )
 
 
-_requires_native_grouped_mm = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (9, 10),
-    reason="needs torch grouped_mm's native kernel (SM90/SM100)",
-)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@_requires_cuda
+@pytest.mark.parametrize("dtype", _DTYPES)
+def test_moe_matches_hf_router_with_fused_experts(dtype: torch.dtype):
+    torch.manual_seed(0)
+    block = _hf_moe_block(dtype)
+    x = torch.randn(9, 32, dtype=dtype, device="cuda")
+    out = hf_moe(x, block.gate.weight, block.experts.gate_up_proj, block.experts.down_proj, 2, True)
+    torch.testing.assert_close(out, _hf_router_then_fused_experts(block, x), rtol=0, atol=0)
+    torch.testing.assert_close(out, block(x[None])[0], rtol=2e-2, atol=2e-2)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@_requires_cuda
+def test_moe_rows_do_not_depend_on_the_batch(monkeypatch):
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    fused_moe_module.get_moe_configs.cache_clear()
+    torch.manual_seed(0)
+    block = _hf_moe_block(torch.bfloat16)
+    x = torch.randn(256, 32, dtype=torch.bfloat16, device="cuda")
+
+    def moe(rows):
+        return hf_moe(rows, block.gate.weight, block.experts.gate_up_proj, block.experts.down_proj, 2, True)
+
+    whole = moe(x)
+    for chunk in (1, 8, 32):
+        torch.testing.assert_close(
+            torch.cat([moe(x[i : i + chunk]) for i in range(0, 256, chunk)]), whole, rtol=0, atol=0
+        )
 
 
 @pytest.fixture(scope="module")
@@ -233,24 +243,15 @@ def _load_hf_experts(layer: HFNumericsDecoderLayer, hf_block) -> None:
     experts.quant_method.process_weights_after_loading(experts)
 
 
-def _hf_moe_block(dtype: torch.dtype):
-    config = _text_config()
-    config._experts_implementation = "grouped_mm"
-    block = Qwen3OmniMoeThinkerTextSparseMoeBlock(config).to(device="cuda", dtype=dtype)
-    for p in block.parameters():
-        p.data.normal_(0, 0.2)
-    return block
-
-
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @_requires_cuda
-def test_triton_loaded_moe_matches_hf_grouped_mm(_dist, tmp_path):
+def test_triton_loaded_moe_matches_hf_router_with_fused_experts(_dist, tmp_path):
     torch.manual_seed(0)
     layer = _build_layer(tmp_path, enforce_eager=True)
     hf_block = _hf_moe_block(torch.bfloat16)
     _load_hf_experts(layer, hf_block)
     x = torch.randn(9, 32, dtype=torch.bfloat16, device="cuda")
-    torch.testing.assert_close(layer.mlp(x), hf_block(x[None])[0], rtol=0, atol=0)
+    torch.testing.assert_close(layer.mlp(x), _hf_router_then_fused_experts(hf_block, x), rtol=0, atol=0)
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
@@ -270,14 +271,6 @@ def test_flashinfer_cutlass_moe_backend_is_rejected(_dist, tmp_path, monkeypatch
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @_requires_cuda
-def test_cuda_graphs_without_native_grouped_mm_are_rejected(_dist, tmp_path):
-    _build_layer(tmp_path, dtype=torch.float32, enforce_eager=True)
-    with pytest.raises(ValueError, match="enforce_eager"):
-        _build_layer(tmp_path, dtype=torch.float32)
-
-
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-@_requires_native_grouped_mm
 def test_moe_capture_replay_matches_eager(_dist, tmp_path):
     torch.manual_seed(0)
     layer = _build_layer(tmp_path)
