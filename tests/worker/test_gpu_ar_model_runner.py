@@ -769,6 +769,7 @@ def test_build_omni_output_uses_snapshots_after_accumulation(monkeypatch, cache_
             num_scheduled_tokens={"r1": 1, "r2": 2},
         ),
         hidden_states=torch.tensor([[1.0], [2.0], [3.0]]),
+        scheduled_token_ranges={"r1": (10, 11), "r2": (20, 22)},
         staged_hidden_states_cpu=None,
         multimodal_outputs={"foo": torch.tensor([10.0, 20.0, 30.0])},
         req_ids_output_copy=["r1", "r2"],
@@ -1351,6 +1352,7 @@ def test_build_omni_output_never_leaks_internal_pooler_output_on_wire(monkeypatc
             num_scheduled_tokens={"r1": 1, "r2": 2},
         ),
         hidden_states=torch.tensor([[1.0], [2.0], [3.0]]),
+        scheduled_token_ranges={"r1": (0, 1), "r2": (0, 2)},
         staged_hidden_states_cpu=None,
         multimodal_outputs={"foo": torch.tensor([10.0, 20.0, 30.0])},
         req_ids_output_copy=["r1", "r2"],
@@ -2479,3 +2481,212 @@ def test_full_payload_cache_recovery_uses_per_key_ends_without_double_clipping(m
     assert payload["hidden"].flatten().tolist() == list(range(max(delivered, end)))
     assert payload["codes.audio"].flatten().tolist() == list(range(max(delivered - 2, end)))
     assert progress.delivered_upto == max(delivered - 2, end)
+
+
+@pytest.fixture
+def full_payload_steps(mocker):
+    runner = _make_async_output_runner(engine_output_type="latent")
+    runner._async_chunk = False
+    runner.use_async_scheduling = True
+    runner.speculative_config = None
+    runner.use_async_spec_decode = False
+    runner.num_prompt_logprobs = {}
+    runner.late_interaction_runner = mocker.Mock()
+    mocker.patch.object(runner, "_may_reorder_batch")
+    mocker.patch("vllm_omni.worker.gpu_model_runner.get_pp_group", return_value=mocker.Mock(is_last_rank=True))
+    runner.model.use_async_omni_output = True
+    runner.model.supports_async_whole_payload = True
+    runner.broadcast_pp_output = False
+    runner.kv_connector_output = None
+    runner.device = torch.device("cpu")
+    runner.async_output_copy_stream = None
+    runner._pending_full_payload_send = {}
+    runner._full_payload_token_ends = {}
+    runner._full_payload_replace_keys_cached = frozenset()
+    runner.input_batch = mocker.Mock(
+        spec=InputBatch, req_ids=["r1", "r2"], req_id_to_index={"r1": 0, "r2": 1}, vocab_size=10
+    )
+    runner.query_start_loc = object.__new__(CpuGpuBuffer)
+    runner.query_start_loc.cpu = torch.tensor([0, 1, 2], dtype=torch.int32)
+    runner._omni_num_scheduled_tokens_np = np.array([1, 1], dtype=np.int32)
+    sampler = SamplerOutput(sampled_token_ids=torch.tensor([[7], [8]]), logprobs_tensors=None)
+    mocker.patch.object(runner, "_sample", return_value=sampler)
+    mocker.patch.object(runner, "_update_states_after_model_execute")
+    mocker.patch.object(
+        runner, "_bookkeeping_sync", return_value=({}, None, None, [], {}, ["r1", "r2"], {"r1": 0, "r2": 1}, [])
+    )
+    mocker.patch.object(runner, "_run_post_sample_talker_mtp", return_value={})
+    mocker.patch.object(runner, "eplb_step")
+    mocker.patch.object(runner, "get_omni_connector_output", return_value=None)
+    mocker.patch.object(gpu_ar_model_runner, "get_pp_group", return_value=mocker.Mock(world_size=1))
+    mocker.patch.object(runner, "_resolve_pooler_payload_req_ids", side_effect=lambda ids: ("latent", ids))
+    mocker.patch.object(runner, "_should_accumulate_full_payload_output", return_value=True)
+    snapshots = mocker.patch.object(runner, "_snapshot_omni_output_tensors_for_async_output")
+    # Replace only CUDA transport/thread launch; invoke the actual captured builders below.
+    constructor = mocker.patch.object(gpu_ar_model_runner, "OmniAsyncGPUModelRunnerOutput")
+    constructor.return_value.sampled_token_ids_cpu = sampler.sampled_token_ids
+    for rid, request in runner.requests.items():
+        runner.accumulate_full_payload_output(
+            rid, {"hidden": torch.arange(8).reshape(-1, 1)}, request, token_range=(0, 8)
+        )
+
+    def step(start, *, cache=False):
+        runner.input_batch.num_computed_tokens_cpu = np.array([0, 0])
+        scheduler = SchedulerOutput.make_empty()
+        scheduler.num_scheduled_tokens = {"r1": 1, "r2": 1}
+        scheduler.total_num_scheduled_tokens = 2
+        cached = scheduler.scheduled_cached_reqs
+        cached.req_ids = ["r1", "r2"]
+        cached.num_computed_tokens = [start, start]
+        cached.new_block_ids = [None, None]
+        cached.num_output_tokens = [0, 0]
+        gpu_ar_model_runner.OmniGPUModelRunner._update_states(runner, scheduler)
+        hidden = torch.tensor([[start], [start]])
+        snapshots.return_value = gpu_ar_model_runner._OmniOutputTensorSnapshot(hidden, None, {})
+        runner.execute_model_state = ExecuteModelState(
+            scheduler, None, None, None, hidden, None, None, None, None, None, {}, None, start if cache else None
+        )
+        runner.sample_tokens(None)
+        return constructor.call_args.kwargs["model_runner_output_builder"]
+
+    return runner, step
+
+
+def test_full_payload_cache_off_keeps_executed_positions(full_payload_steps):
+    runner, step = full_payload_steps
+    first = step(8)
+    second = step(9)  # The next step has advanced the same live request before the first builder runs.
+    first()
+    second()
+    for entry in runner._pending_full_payload_send.values():
+        payload, _ = runner._materialize_full_payload_entry(entry)
+        assert payload["hidden"].flatten().tolist() == list(range(10))
+
+
+@pytest.mark.parametrize("cache", [False, True])
+def test_full_payload_builders_prepare_concurrently_but_accumulate_in_order(full_payload_steps, mocker, cache):
+    runner, step = full_payload_steps
+    if cache:
+        runner.omni_prefix_cache = _delivery_test_manager()
+        progress = {rid: PrefixCacheRequestProgress(delivered_upto=8) for rid in runner.requests}
+
+        def sources(**kwargs):
+            start = kwargs["step_id"]
+            ranges = {rid: (start, start + 1) for rid in runner.requests}
+            return None, StageCacheOutputs(
+                hidden_states={rid: torch.tensor([[start]]) for rid in runner.requests},
+                mm_outputs={},
+                token_ranges=ranges,
+                scheduled_token_ranges=ranges,
+                _progress=progress,
+            )
+
+        mocker.patch.object(runner, "_prepare_prefix_cache_pooler_payload_sources", side_effect=sources)
+    first, second = step(8, cache=cache), step(9, cache=cache)
+    release_first, second_prepared, second_done = threading.Event(), threading.Event(), threading.Event()
+    build_payload = runner._build_omni_pooler_payload
+
+    def prepare(**kwargs):
+        payload = build_payload(**kwargs)
+        if kwargs["rid"] == "r2":
+            if payload["hidden"].item() == 8:
+                assert release_first.wait(5)
+            else:
+                second_prepared.set()
+        return payload
+
+    mocker.patch.object(runner, "_build_omni_pooler_payload", side_effect=prepare)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        a, b = pool.submit(first), pool.submit(second)
+        b.add_done_callback(lambda _: second_done.set())
+        try:
+            assert second_prepared.wait(5), "later payload preparation must not wait for the earlier builder"
+            finished_early = second_done.wait(0.2)
+        finally:
+            release_first.set()
+        a.result(timeout=5)
+        b.result(timeout=5)
+    for entry in runner._pending_full_payload_send.values():
+        payload, _ = runner._materialize_full_payload_entry(entry)
+        assert payload["hidden"].flatten().tolist() == list(range(10))
+    assert not finished_early
+
+
+@pytest.mark.parametrize("aborted", [False, True])
+def test_full_payload_terminal_drains_pending_builder(full_payload_steps, mocker, aborted):
+    from contextlib import nullcontext
+
+    runner, step = full_payload_steps
+    build = step(8)
+    release, entered, terminal_done = threading.Event(), threading.Event(), threading.Event()
+    build_payload = runner._build_omni_pooler_payload
+
+    def prepare(**kwargs):
+        entered.set()
+        assert release.wait(5)
+        return build_payload(**kwargs)
+
+    mocker.patch.object(runner, "_build_omni_pooler_payload", side_effect=prepare)
+    runner._warmup_state_cleared = True
+    runner._stage_id = "0"
+    runner._omni_connector = object()
+    runner.kv_transfer_manager = mocker.Mock()
+    runner.kv_caches = []
+    runner.cache_config = SimpleNamespace(block_size=16, cache_dtype="auto")
+    runner.synchronize_input_prep = nullcontext
+    mocker.patch.object(runner, "recv_full_payload_inputs")
+    mocker.patch.object(gpu_ar_model_runner, "has_kv_transfer_group", return_value=False)
+    mocker.patch.object(runner, "_update_states", side_effect=RuntimeError("stop before forward"))
+    sent = []
+    mocker.patch.object(
+        runner, "send_full_payload_outputs", side_effect=lambda **kwargs: sent.append(kwargs["outputs"])
+    )
+    terminal = SchedulerOutput.make_empty()
+    terminal.finished_req_ids = {"r1", "r2"}
+    terminal.discarded_req_ids = terminal.finished_req_ids if aborted else set()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        output = pool.submit(build)
+        assert entered.wait(5)
+        ending = pool.submit(runner.execute_model, terminal)
+        ending.add_done_callback(lambda _: terminal_done.set())
+        try:
+            finished_early = terminal_done.wait(0.2)
+        finally:
+            release.set()
+        output.result(timeout=5)
+        with pytest.raises(RuntimeError, match="stop before forward"):
+            ending.result(timeout=5)
+    assert not finished_early
+    assert not runner._pending_full_payload_send
+    assert not runner._full_payload_token_ends
+    if aborted:
+        assert sent == []
+    else:
+        assert len(sent) == 1
+        for payload, _ in sent[0].values():
+            assert payload["hidden"].flatten().tolist() == list(range(9))
+
+
+def test_full_payload_builder_failure_reaches_later_output(full_payload_steps, mocker):
+    runner, step = full_payload_steps
+    first, second = step(8), step(9)
+    build_payload = runner._build_omni_pooler_payload
+    second_prepared = threading.Event()
+
+    def prepare(**kwargs):
+        payload = build_payload(**kwargs)
+        if payload["hidden"].item() == 8:
+            assert second_prepared.wait(5)
+            raise RuntimeError("payload preparation failed")
+        second_prepared.set()
+        return payload
+
+    mocker.patch.object(runner, "_build_omni_pooler_payload", side_effect=prepare)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outputs = [pool.submit(first), pool.submit(second)]
+        for output in outputs:
+            with pytest.raises(RuntimeError, match="payload preparation failed"):
+                output.result(timeout=5)
+    for entry in runner._pending_full_payload_send.values():
+        payload, _ = runner._materialize_full_payload_entry(entry)
+        assert payload["hidden"].flatten().tolist() == list(range(8))
