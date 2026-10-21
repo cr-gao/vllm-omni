@@ -1438,7 +1438,13 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         if pooler_inter and self._should_accumulate_full_payload_output():
             with record_function_or_nullcontext("omni_output_builder:accumulate_full_payload_output"):
                 self._prefix_cache_accumulate_full_payload(
-                    req_ids_output_copy, pooler_inter, scheduler_output.num_scheduled_tokens, cache_outputs
+                    req_ids_output_copy,
+                    pooler_inter,
+                    {
+                        rid: (self.requests[rid].num_computed_tokens, self.requests[rid].num_computed_tokens + count)
+                        for rid, count in scheduler_output.num_scheduled_tokens.items()
+                    },
+                    cache_outputs,
                 )
 
         inter_stage_outputs = self._build_multimodal_outputs(pooler_inter)

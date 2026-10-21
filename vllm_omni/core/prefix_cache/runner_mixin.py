@@ -310,7 +310,7 @@ class PrefixCacheRunnerMixin:
         self,
         req_ids: list[str],
         payloads: Sequence[dict[str, Any] | None],
-        scheduled_tokens: dict[str, int],
+        token_ranges: dict[str, tuple[int, int]],
         cache_outputs: StageCacheOutputs | None,
     ) -> None:
         for rid, payload in zip(req_ids, payloads):
@@ -325,8 +325,7 @@ class PrefixCacheRunnerMixin:
                     keys.add("hidden")
                 cached_keys = frozenset(keys)
             else:
-                start = request.num_computed_tokens
-                token_range = (start, start + scheduled_tokens[rid])
+                token_range = token_ranges[rid]
             self.accumulate_full_payload_output(
                 rid, payload, request, token_range=token_range, prefix_cache_keys=cached_keys
             )
