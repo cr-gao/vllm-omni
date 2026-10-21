@@ -18,7 +18,7 @@ from vllm.config import KernelConfig, ModelConfig, VllmConfig, set_current_vllm_
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.utils.torch_utils import set_default_torch_dtype
 
-from tests.helpers.mark import hardware_marks
+from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.model_executor.models.qwen3_omni.hf_numerics import (
     HFNumericsDecoderLayer,
     HFNumericsRMSNorm,
@@ -32,12 +32,13 @@ from vllm_omni.model_executor.models.qwen3_omni.hf_numerics import (
 )
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
+pytestmark = [pytest.mark.core_model]
 
 _DTYPES = [torch.float32, torch.bfloat16]
+_requires_cuda = pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="needs CUDA")
 _DEVICES = [
-    "cpu",
-    pytest.param("cuda", marks=pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="no CUDA")),
+    pytest.param("cpu", marks=pytest.mark.cpu),
+    pytest.param("cuda", marks=[*hardware_marks(res={"cuda": "L4"}, num_cards=1), _requires_cuda]),
 ]
 
 
@@ -102,6 +103,7 @@ def test_add_deepstack_matches_hf_deepstack_process(device: str):
     assert not torch.equal((x + deepstack) + residual, ref)
 
 
+@pytest.mark.cpu
 def test_rms_norm_module_dispatches_to_the_ops():
     norm = HFNumericsRMSNorm(32, eps=1e-6)
     assert isinstance(norm, RMSNorm)
@@ -139,6 +141,7 @@ def test_mrope_matches_hf_rotary(device: str, dtype: torch.dtype, positions_dim:
     torch.testing.assert_close(hf_mrope(positions, q, k, rope.inv_freq, [3, 3, 2], d)[0], q_out, rtol=0, atol=0)
 
 
+@pytest.mark.cpu
 def test_rotary_rejects_non_default_rope_type():
     config = _text_config()
     config.rope_parameters["rope_type"] = "yarn"
@@ -161,6 +164,7 @@ def test_moe_matches_hf_grouped_mm_block(device: str, dtype: torch.dtype):
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
 
 
+@pytest.mark.cpu
 def test_experts_stub_has_what_grouped_mm_reads():
     experts = _Experts(torch.empty(4, 16, 32), torch.empty(4, 32, 8), "silu")
     for name in (
@@ -178,7 +182,6 @@ def test_experts_stub_has_what_grouped_mm_reads():
     assert experts._is_expert_parallel is False
 
 
-_requires_cuda = pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="needs CUDA")
 _requires_native_grouped_mm = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (9, 10),
     reason="needs torch grouped_mm's native kernel (SM90/SM100)",
@@ -239,6 +242,7 @@ def _hf_moe_block(dtype: torch.dtype):
     return block
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @_requires_cuda
 def test_triton_loaded_moe_matches_hf_grouped_mm(_dist, tmp_path):
     torch.manual_seed(0)
@@ -249,6 +253,7 @@ def test_triton_loaded_moe_matches_hf_grouped_mm(_dist, tmp_path):
     torch.testing.assert_close(layer.mlp(x), hf_block(x[None])[0], rtol=0, atol=0)
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @_requires_cuda
 def test_flashinfer_cutlass_moe_backend_is_rejected(_dist, tmp_path, monkeypatch):
     from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
@@ -263,6 +268,7 @@ def test_flashinfer_cutlass_moe_backend_is_rejected(_dist, tmp_path, monkeypatch
         _build_layer(tmp_path, enforce_eager=True)
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @_requires_cuda
 def test_cuda_graphs_without_native_grouped_mm_are_rejected(_dist, tmp_path):
     _build_layer(tmp_path, dtype=torch.float32, enforce_eager=True)
@@ -270,6 +276,7 @@ def test_cuda_graphs_without_native_grouped_mm_are_rejected(_dist, tmp_path):
         _build_layer(tmp_path, dtype=torch.float32)
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @_requires_native_grouped_mm
 def test_moe_capture_replay_matches_eager(_dist, tmp_path):
     torch.manual_seed(0)
