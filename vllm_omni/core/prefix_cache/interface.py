@@ -8,9 +8,12 @@ Naming aligns with vLLM's v1/core KV-cache design.
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, TypeAlias
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 import torch
+
+if TYPE_CHECKING:
+    from vllm_omni.core.prefix_cache.manager import _RequestProgress
 
 # Four identities (still str/int at runtime, not interchangeable):
 #   TensorName  which cached tensor (hidden / mm), not a prefix hash
@@ -112,13 +115,6 @@ class PrefixCacheConfig:
 
 
 @dataclass
-class PrefixCacheRequestProgress:
-    """Successful local handoff boundary, retained across preemption."""
-
-    delivered_upto: int = 0
-
-
-@dataclass
 class StageCacheOutputs:
     """Materialized rows and their save-time request positions."""
 
@@ -128,7 +124,7 @@ class StageCacheOutputs:
     scheduled_token_ranges: dict[ReqId, tuple[int, int]] = field(default_factory=dict)
     cached_mm_keys: frozenset[TensorName] = frozenset()
     token_mm_keys: frozenset[TensorName] = frozenset()
-    _progress: dict[ReqId, PrefixCacheRequestProgress] = field(default_factory=dict, repr=False)
+    _progress: dict[ReqId, "_RequestProgress"] = field(default_factory=dict, repr=False)
     delivery_starts: dict[ReqId, int] = field(default_factory=dict)
 
 
