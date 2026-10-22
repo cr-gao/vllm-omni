@@ -76,8 +76,8 @@ def hf_mrope(
     head_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     pos = positions if positions.dim() == 2 else positions[None].expand(3, -1)
-    inv_freq_expanded = inv_freq[None, :, None].float().expand(3, -1, 1)
-    freqs = (inv_freq_expanded @ pos[:, None, :].float()).transpose(1, 2)
+    # Elementwise like Transformers; a matmul here would run through vLLM's batch-invariant bmm override.
+    freqs = pos[..., None].float() * inv_freq.float()
     freqs_t = freqs[0]
     for dim, offset in enumerate((1, 2), start=1):
         idx = slice(offset, mrope_section[dim] * 3, 3)

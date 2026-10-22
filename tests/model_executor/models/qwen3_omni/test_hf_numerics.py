@@ -142,6 +142,43 @@ def test_mrope_matches_hf_rotary(device: str, dtype: torch.dtype, positions_dim:
     torch.testing.assert_close(hf_mrope(positions, q, k, rope.inv_freq, [3, 3, 2], d)[0], q_out, rtol=0, atol=0)
 
 
+_MROPE_UNDER_BATCH_INVARIANCE = """
+import os, torch
+os.environ["VLLM_BATCH_INVARIANT"] = "1"
+from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
+init_batch_invariance()
+from transformers import Qwen3OmniMoeTextConfig
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import apply_rotary_pos_emb
+from vllm_omni.model_executor.models.qwen3_omni.hf_numerics import HFNumericsRotaryEmbedding
+torch.manual_seed(0)
+config = Qwen3OmniMoeTextConfig(hidden_size=32, num_attention_heads=4, num_key_value_heads=2, head_dim=16,
+    rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "mrope_section": [3, 3, 2]})
+n, heads, kv_heads, d = 64, 4, 2, 16
+q = torch.randn(n, heads * d, dtype=torch.bfloat16, device="cuda")
+k = torch.randn(n, kv_heads * d, dtype=torch.bfloat16, device="cuda")
+positions = torch.arange(3000, 3000 + n, device="cuda")
+rope = HFNumericsRotaryEmbedding(config).cuda()
+freqs = positions[:, None].float() * rope.inv_freq
+freqs = torch.cat((freqs, freqs), dim=-1)
+cos, sin = freqs.cos().to(q.dtype)[None], freqs.sin().to(q.dtype)[None]
+q_ref, _ = apply_rotary_pos_emb(q.view(1, n, heads, d).transpose(1, 2), k.view(1, n, kv_heads, d).transpose(1, 2), cos, sin)
+q_out, _ = rope(positions, q, k)
+torch.testing.assert_close(q_out.view(n, heads, d), q_ref[0].transpose(0, 1), rtol=0, atol=0)
+"""
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@_requires_cuda
+def test_mrope_matches_hf_rotary_under_batch_invariance():
+    # vLLM's batch-invariant mode overrides bmm with a Triton kernel that runs fp32 matmuls at TF32 precision; the
+    # frequency product must stay an exact elementwise multiply. The mode is process-global, hence the subprocess.
+    import subprocess
+    import sys
+
+    result = subprocess.run([sys.executable, "-c", _MROPE_UNDER_BATCH_INVARIANCE], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr[-2000:]
+
+
 @pytest.mark.cpu
 def test_rotary_rejects_non_default_rope_type():
     config = _text_config()
