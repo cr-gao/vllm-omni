@@ -148,8 +148,10 @@ class HFNumericsRotaryEmbedding(nn.Module):
         if rope.get("rope_type", "default") != "default":
             raise ValueError(f"hf_numerics supports rope_type 'default' only, got {rope['rope_type']!r}")
         dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-        inv_freq = 1.0 / (rope["rope_theta"] ** (torch.arange(0, dim, 2, dtype=torch.int64).float() / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        # On the CPU like Transformers: the CUDA pow differs from it in the last bit for some frequencies.
+        arange = torch.arange(0, dim, 2, dtype=torch.int64, device="cpu")
+        inv_freq = 1.0 / (rope["rope_theta"] ** (arange.float() / dim))
+        self.register_buffer("inv_freq", inv_freq.to(torch.get_default_device()), persistent=False)
         self.mrope_section = list(rope["mrope_section"])
         self.head_size = dim
 

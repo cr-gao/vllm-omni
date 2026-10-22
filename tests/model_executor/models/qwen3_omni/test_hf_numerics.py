@@ -179,6 +179,25 @@ def test_mrope_matches_hf_rotary_under_batch_invariance():
     assert result.returncode == 0, result.stderr[-2000:]
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@_requires_cuda
+def test_rotary_inv_freq_matches_hf_when_built_on_cuda():
+    # vLLM builds the model under a CUDA default device, while Transformers computes inv_freq on the CPU; the two
+    # pow implementations differ in the last bit for some frequencies at the thinker's head_dim and rope_theta.
+    config = Qwen3OmniMoeTextConfig(
+        hidden_size=2048,
+        num_attention_heads=32,
+        num_key_value_heads=4,
+        head_dim=128,
+        rope_parameters={"rope_type": "default", "rope_theta": 1000000.0, "mrope_section": [24, 20, 20]},
+    )
+    with torch.device("cuda"):
+        rope = HFNumericsRotaryEmbedding(config)
+    hf_inv_freq = Qwen3OmniMoeThinkerTextRotaryEmbedding(config).inv_freq
+    assert rope.inv_freq.device.type == "cuda"
+    torch.testing.assert_close(rope.inv_freq.cpu(), hf_inv_freq, rtol=0, atol=0)
+
+
 @pytest.mark.cpu
 def test_rotary_rejects_non_default_rope_type():
     config = _text_config()
