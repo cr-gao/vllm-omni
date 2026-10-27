@@ -15,6 +15,7 @@ call time) so ``tests/core`` keeps loading the package without vLLM.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -139,12 +140,34 @@ class PrefixCacheRunnerMixin:
         """Per-step lifecycle entry; must run before ``_update_states``
         removes finished requests (finished/abort escalation happens inside
         ``new_step_starts``). Builds the manager on the first real step."""
+        recovery_starts = {}
+        if (
+            getattr(self, "_full_payload_token_ends", None) is not None
+            and self._should_accumulate_full_payload_output()
+        ):
+            for req_id in getattr(scheduler_output, "replaced_req_ids", ()):
+                self._pending_full_payload_send.pop(req_id, None)
+                self._full_payload_token_ends.pop(req_id, None)
+            recovery_starts = {
+                req_id: self.resume_full_payload_output(req_id, delivered)
+                for req_id, delivered in getattr(scheduler_output, "resumed_delivered_upto", {}).items()
+            }
         if self.omni_prefix_cache is None and self._omni_prefix_cache_cfg is not None:
             self._ensure_omni_prefix_cache()
         if self.omni_prefix_cache is not None:
             if self._prefix_cache_adapter is None or self._prefix_cache_group_view is None:
                 raise RuntimeError("prefix-cache adapter and view were not initialized together")
             step = self._prefix_cache_adapter.translate_step(scheduler_output)
+            if recovery_starts:
+                step = replace(
+                    step,
+                    events=tuple(
+                        replace(event, recovery_start=recovery_starts[event.req_id])
+                        if event.req_id in recovery_starts
+                        else event
+                        for event in step.events
+                    ),
+                )
             self._prefix_cache_step = step
             self._prefix_cache_pure_decode = (
                 self._prefix_cache_decode_cfg is not None
@@ -337,8 +360,3 @@ class PrefixCacheRunnerMixin:
             self.accumulate_full_payload_output(
                 rid, payload, request, token_range=token_range, prefix_cache_keys=cached_keys
             )
-            if cache_outputs is not None:
-                assert self.omni_prefix_cache is not None
-                self.omni_prefix_cache.record_full_payload_delivery(
-                    cache_outputs, rid, min(self._full_payload_token_ends[rid].values())
-                )

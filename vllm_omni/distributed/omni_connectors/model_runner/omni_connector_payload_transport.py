@@ -688,6 +688,41 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         token_ends.update({key: end for key in reconciled})
         return reconciled
 
+    def resume_full_payload_output(self, req_id: str, delivered_upto: int) -> int:
+        """Drop an unaccepted tail before replay and return local recovery coverage."""
+        ends = self._full_payload_token_ends.get(req_id, {})
+        entry = self._pending_full_payload_send.get(req_id)
+        if entry is not None:
+            chunks, latest, rows, _ = entry
+            replace_keys = self._resolve_full_payload_replace_keys()
+            for key, end in ends.items():
+                if end > delivered_upto and key in chunks and key not in replace_keys and rows[key] != end:
+                    raise ValueError(
+                        f"Cannot truncate full payload {key!r} for {req_id!r}: "
+                        f"{rows[key]} rows do not establish token coverage [0, {end})."
+                    )
+            for key, end in tuple(ends.items()):
+                if end <= delivered_upto:
+                    continue
+                if key in chunks and key not in replace_keys:
+                    keep = max(0, rows[key] - (end - delivered_upto))
+                    kept = []
+                    remaining = keep
+                    for tensor in chunks[key]:
+                        if remaining <= 0:
+                            break
+                        kept.append(tensor if tensor.shape[0] <= remaining else tensor[:remaining].clone())
+                        remaining -= tensor.shape[0]
+                    chunks[key] = kept
+                    rows[key] = keep
+                    ends[key] = delivered_upto
+                else:
+                    chunks.pop(key, None)
+                    latest.pop(key, None)
+                    rows.pop(key, None)
+                    ends.pop(key)
+        return min(ends.values(), default=0)
+
     def accumulate_full_payload_output(
         self,
         req_id: str,

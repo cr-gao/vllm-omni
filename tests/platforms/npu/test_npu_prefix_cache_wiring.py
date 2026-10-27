@@ -81,7 +81,7 @@ def test_execute_model_state_keeps_prefix_cache_sid_last():
     assert gpu_fields[-1] == "prefix_cache_step_id"
 
 
-def test_npu_output_builder_views_then_acks_delivery_after_connector():
+def test_npu_output_builder_uses_delivery_snapshot_without_advancing_it():
     tree = ast.parse(_NPU_RUNNER.read_text())
     sample = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "sample_tokens")
     calls = {
@@ -91,7 +91,43 @@ def test_npu_output_builder_views_then_acks_delivery_after_connector():
         and isinstance(node.func, ast.Attribute)
         and node.func.attr in {"delivery_view", "ack_delivery", "get_omni_connector_output"}
     }
-    assert calls["delivery_view"] < calls["get_omni_connector_output"] < calls["ack_delivery"]
+    assert calls["delivery_view"] < calls["get_omni_connector_output"]
+    assert "ack_delivery" not in calls
+    branch = next(
+        node
+        for node in ast.walk(sample)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(stmt, ast.Assign)
+            and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Attribute)
+            and stmt.value.func.attr == "delivery_view"
+            for stmt in node.body
+        )
+    )
+    raw = StageCacheOutputs(
+        hidden_states={"r1": torch.arange(4, 10).reshape(-1, 1)},
+        mm_outputs={},
+        token_ranges={"r1": (4, 10)},
+        scheduled_token_ranges={"r1": (4, 10)},
+        delivery_starts={"r1": 8},
+    )
+    scope = {
+        "cache_outputs": raw,
+        "audio_sparse_output": False,
+        "downstream_req_ids": ["r1"],
+        "self": SimpleNamespace(
+            omni_prefix_cache=OmniPrefixCacheManager.__new__(OmniPrefixCacheManager),
+            _should_accumulate_full_payload_output=lambda: False,
+        ),
+    }
+    code = compile(
+        ast.fix_missing_locations(ast.Module(body=[copy.deepcopy(branch)], type_ignores=[])), str(_NPU_RUNNER), "exec"
+    )
+    exec(code, scope)
+    assert scope["combined_hidden_states"]["r1"].flatten().tolist() == [8, 9]
+    assert raw.delivery_starts == {"r1": 8}
+    assert raw.hidden_states["r1"].flatten().tolist() == list(range(4, 10))
 
 
 def test_npu_partial_downstream_hidden_uses_only_unseen_scheduled_rows():

@@ -78,7 +78,6 @@ from vllm_omni.core.prefix_cache.interface import (
     OmniPrefixCacheStagingTimeoutError,
     OmniPrefixCacheUnmatchError,
     PrefixCacheConfig,
-    PrefixCacheRequestProgress,
     ReqId,
     StageCacheOutputs,
     StepId,
@@ -269,7 +268,6 @@ class _StepContext:
     # Packed layout in batch order: req -> [start, end) of this step's rows.
     spans: dict[ReqId, tuple[int, int]]
     token_ranges: dict[ReqId, tuple[int, int]]
-    progress: dict[ReqId, PrefixCacheRequestProgress]
     delivery_starts: dict[ReqId, int]
     hit_starts: dict[ReqId, int]
     token_mm_keys: frozenset[TensorName]
@@ -436,7 +434,7 @@ class OmniPrefixCacheManager:
         if (hk := self._policy.hidden_key) is not None:
             self._slot_status.init_table(hk)
         self._request_tasks = _RequestTaskTable()
-        self._request_progress: dict[ReqId, PrefixCacheRequestProgress] = {}
+        self._delivery_starts: dict[ReqId, int] = {}
         # Join worklists — not occupancy, not the request-task table.
         self._join_next_step_tids: list[Tid] = []
         self._join_finished_tids: set[Tid] = set()  # escalated on finish/abort
@@ -498,11 +496,15 @@ class OmniPrefixCacheManager:
             #    would leave future hits ABSENT. The next save waits
             #    join_host_ready. (Not leftover_mm — those are this-step reads.)
             for event in events:
-                if event.kind not in (PrefixCacheEventKind.FINISHED, PrefixCacheEventKind.ABORTED):
+                if event.kind not in (
+                    PrefixCacheEventKind.FINISHED,
+                    PrefixCacheEventKind.ABORTED,
+                    PrefixCacheEventKind.REPLACED,
+                ):
                     continue
                 req_id = event.req_id
                 tids, dtask = self._request_tasks.finish(req_id)
-                self._request_progress.pop(req_id, None)
+                self._delivery_starts.pop(req_id, None)
                 if dtask is not None:
                     tids.add(dtask.tid)
                 pending_tasks = [tid for tid in tids if self._controller.lookup(tid) is not None]
@@ -517,13 +519,13 @@ class OmniPrefixCacheManager:
             self._clear_hit_infos()
             for event in events:
                 req_id = event.req_id
-                if event.kind is PrefixCacheEventKind.STARTED:
-                    self._request_progress[req_id] = PrefixCacheRequestProgress()
+                if event.kind in (PrefixCacheEventKind.STARTED, PrefixCacheEventKind.REPLACED):
+                    self._delivery_starts[req_id] = 0
                 elif event.kind is not PrefixCacheEventKind.RESUMED:
                     continue
-                progress = self._request_progress[req_id]
+                self._delivery_starts[req_id] = event.delivered_upto
                 num_computed = int(event.hit_end)
-                hit_start = progress.delivered_upto
+                hit_start = event.delivered_upto if event.recovery_start is None else event.recovery_start
                 if num_computed > hit_start:
                     # block_ids is per-kv-group; group 0 only.
                     block_groups = event.block_ids
@@ -768,7 +770,6 @@ class OmniPrefixCacheManager:
                 scheduled_token_ranges={r: ctx.token_ranges[r] for r in req_ids},
                 cached_mm_keys=frozenset(ctx.cached_keys),
                 token_mm_keys=ctx.token_mm_keys,
-                _progress={r: ctx.progress[r] for r in req_ids},
                 delivery_starts={r: ctx.delivery_starts[r] for r in req_ids},
             )
         finally:
@@ -783,6 +784,11 @@ class OmniPrefixCacheManager:
 
     def release_device_bytes(self, nbytes: int) -> None:
         self._controller.release_bytes(nbytes)
+
+    @_locked
+    def snapshot_delivery_starts(self, token_ranges: dict[ReqId, tuple[int, int]]) -> dict[ReqId, int]:
+        """Capture resume clipping for outputs whose cache write is buffered."""
+        return {r: min(end, max(start, self._delivery_starts[r])) for r, (start, end) in token_ranges.items()}
 
     def delivery_view(self, outputs: StageCacheOutputs, req_ids: list[str]) -> StageCacheOutputs:
         """Clip replay using save-time boundaries, independent of builder completion order."""
@@ -809,21 +815,8 @@ class OmniPrefixCacheManager:
             scheduled_token_ranges={r: outputs.scheduled_token_ranges[r] for r in req_ids},
             cached_mm_keys=outputs.cached_mm_keys,
             token_mm_keys=outputs.token_mm_keys,
-            _progress={r: outputs._progress[r] for r in req_ids},
             delivery_starts={r: outputs.delivery_starts[r] for r in req_ids},
         )
-
-    @_locked
-    def ack_delivery(self, outputs: StageCacheOutputs) -> None:
-        """Record successful local handoff; cache reads and writes are not delivery."""
-        for req_id, (_, end) in outputs.token_ranges.items():
-            progress = outputs._progress[req_id]
-            progress.delivered_upto = max(progress.delivered_upto, end)
-
-    @_locked
-    def record_full_payload_delivery(self, outputs: StageCacheOutputs, req_id: str, delivered_end: int) -> None:
-        """Use the accumulator's emitted boundary for subsequent prefix recovery."""
-        outputs._progress[req_id].delivered_upto = delivered_end
 
     @_locked
     def discard_step(self, step_id: int) -> None:
@@ -985,12 +978,10 @@ class OmniPrefixCacheManager:
             self._invalidate_overwritten_prefetches()
             self._prefetch_hit_spans()
         self._next_step_id = step_id + 1
-        progress = {req_id: self._request_progress[req_id] for req_id in token_ranges}
         self._step_ctxs[step_id] = _StepContext(
             token_ranges=dict(token_ranges),
-            progress=progress,
             delivery_starts={
-                r: min(end, max(self._hit_starts.get(r, start), progress[r].delivered_upto))
+                r: min(end, max(self._hit_starts.get(r, start), self._delivery_starts[r]))
                 for r, (start, end) in token_ranges.items()
             },
             hit_starts=dict(self._hit_starts),

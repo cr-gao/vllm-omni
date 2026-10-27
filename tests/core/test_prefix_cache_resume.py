@@ -12,7 +12,6 @@ from vllm.config import CacheConfig, DeviceConfig, ModelConfig, ParallelConfig, 
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
-from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
 from vllm.v1.outputs import ModelRunnerOutput
@@ -23,6 +22,7 @@ from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
 from vllm_omni.core.prefix_cache.group_view import FullAttentionGroupView
 from vllm_omni.core.prefix_cache.interface import HIDDEN_KEY, PrefixCacheConfig
 from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
+from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler as Scheduler
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -141,7 +141,6 @@ class _CPUCacheRun:
         raw = self.manager.materialize(step_id, req_ids)
         delivery = self.manager.delivery_view(raw, req_ids)
         delivered = delivery.hidden_states
-        self.manager.ack_delivery(delivery)
         for req_id in req_ids:
             logger.info(
                 "req=%s resumed=%s scheduled=[%d,%d) delivered=%s",
@@ -224,6 +223,7 @@ def test_growing_hit_delivers_only_missing_absolute_rows(cpu_run):
 
     run.scheduler.finish_requests("helper", RequestStatus.FINISHED_ABORTED)
     resumed, delivered, _ = run.step()
+    assert resumed.resumed_delivered_upto == {"victim": 8}
     assert _resume_hit_end(resumed, "victim") == 16
     assert _positions(delivered, "victim") == list(range(8, 20))
 
@@ -242,6 +242,7 @@ def test_shrinking_hit_saves_replay_without_redelivering_it(cpu_run):
     _preempt(run, victim)
     run.scheduler.kv_cache_manager.block_pool.evict_blocks(set(blocks[2:]))
     resumed, delivered, layout = run.step()
+    assert resumed.resumed_delivered_upto == {"victim": 16}
     assert _resume_hit_end(resumed, "victim") == 8
     assert _positions(delivered, "victim") == []
 

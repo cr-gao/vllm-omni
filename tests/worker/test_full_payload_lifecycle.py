@@ -39,6 +39,7 @@ def scheduler(request):
     sched.num_waiting_for_streaming_input = 0
     sched.chunk_transfer_adapter = None
     sched.input_coordinator = None
+    sched._kv_fetch_stages = {}
     sched.connector = None
     sched.ec_connector = None
     sched.aux_output_connector = None
@@ -105,6 +106,10 @@ def runner(request):
     model_config.worker_type = "ar"
     model_config.custom_process_next_stage_input_func = None
     host.init_omni_connectors(model_config)
+    host._hs_pending_buffer = {}
+    host._hs_saved_boundary = {}
+    host._hs_buffer_origin = {}
+    host._hs_mm_features = {}
     host.requests = {}
     host.execute_model_state = None
     host.routed_experts_initialized = False
@@ -302,3 +307,18 @@ def test_scaled_delta_is_not_inferred_as_cached_prefix(runner, previous_end):
     payload, _ = runner._materialize_full_payload_entry(runner._pending_full_payload_send["r"])
     assert torch.equal(payload["audio"], expected)
     assert runner._full_payload_token_ends["r"]["audio"] == (3 if previous_end == 3 else 4)
+
+
+def test_resume_rejects_ambiguous_tail_before_mutating_other_fields(runner):
+    runner.accumulate_full_payload_output(
+        "r", {"hidden": torch.ones(2, 1), "audio": torch.ones(4, 1)}, None, token_range=(0, 2)
+    )
+    runner.accumulate_full_payload_output(
+        "r", {"hidden": torch.zeros(2, 1), "audio": torch.zeros(4, 1)}, None, token_range=(2, 4)
+    )
+    with pytest.raises(ValueError, match="Cannot truncate"):
+        runner.resume_full_payload_output("r", 2)
+    payload, _ = runner._materialize_full_payload_entry(runner._pending_full_payload_send["r"])
+    assert payload["hidden"].shape[0] == 4
+    assert payload["audio"].shape[0] == 8
+    assert runner._full_payload_token_ends["r"] == {"hidden": 4, "audio": 4}

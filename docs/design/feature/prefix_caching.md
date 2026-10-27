@@ -291,39 +291,35 @@ The manager consumes these snapshots without reading scheduler or batch state:
 - `async_chunk` continuation arrives as an `EXTENDED` event. It retains the
   request's delivery progress and does not replay earlier output.
 - On preemption, vLLM resets `num_computed_tokens` and looks up the prefix
-  again when resuming. The V1 runner's `RESUMED` event carries the new hit
-  boundary and replacement block table. The manager recovers the hit portion
-  not yet delivered. If the new hit ends before the delivery boundary, the
-  runner still saves every recomputed row, but the outgoing payload excludes
-  positions already handed off. With prefix caching enabled, the in-flight
-  step output during preemption is delivered and acknowledged; recovery starts
-  after that output. V2 resume and prompt-content replacement are separate
-  lifecycle contracts and are not covered by this path.
+  again when resuming. The V1 runner receives the new hit boundary `h` and
+  the scheduler's accepted-output boundary `d`. The manager recovers `[d, h)`
+  when the hit grows. When the hit shrinks below `d`, recomputed rows still
+  enter the cache, while outgoing payloads exclude the replayed prefix.
+- Explicit prompt replacement resets delivery progress for the same request ID.
+  Ordinary streaming extensions retain it. V2 resume remains a separate contract.
 
-Each request keeps one `delivered_upto` boundary for successful local handoff.
-Execution positions come from the saved step ranges; cache write completion and
-readability remain owned by the controller and slot state.
+The scheduler owns `delivered_upto`. It advances only for accepted frames after
+stale-output and failure checks, using immutable scheduled positions and excluding
+rejected draft tokens. Preemption retains the boundary; prompt replacement and
+new logical requests start at zero. This describes local scheduler acceptance,
+not connector or client receipt.
 
 `materialize` restores raw step outputs for postprocess. A delivery view clips
-replayed rows using the delivery start captured when the step was saved. Adjacent
-background builders may finish out of order without clipping each other's rows.
-Acknowledgement advances the request boundary monotonically only after successful
-payload construction. A replay-only step produces no outgoing payload.
+replayed rows using the resume boundary captured at save time. Buffered decode
+outputs snapshot the same clipping boundary even before their cache writes flush.
+The flush preserves absolute token ranges and only coalesces consecutive positions
+in a stable batch. Cache write completion remains owned by the controller and slot
+state. Output builders never advance delivery progress.
 
-The executor joins an asynchronous output builder before returning its result to
-the scheduler. A preempted request cannot resume in the same scheduling step, so
-its earlier output is acknowledged before recovery. Delivery starts are captured
-on the engine thread; output builders do not need an additional ordering chain.
-
-Saved step outputs retain their original request progress object. A terminal
-event removes the live entry without changing a pending output; reusing the same
-request ID starts independent progress. Discarding a step does not acknowledge
-delivery. Full-payload accumulation receives raw materialized rows and the
-cache-merged field names, then clips replay independently for each field.
-Prefix recovery uses a snapshot of the smallest emitted end; replacement fields
-retain their existing policy. These boundaries describe local handoff, not
-connector or client receipt. Sparse list-only audio bypasses token clipping
-because its emission does not follow scheduler token ranges.
+Full-payload accumulation retains its own per-field coverage and clips replay
+independently for each field. Before resume, the worker joins pending output
+builders, removes any accumulated tail the scheduler did not accept, and snapshots
+local coverage for cache recovery. An empty accumulator starts recovery at zero.
+Truncating an unaccepted tail requires token-aligned coverage from position zero;
+ambiguous scaled or late-starting fields raise instead of silently slicing by
+token count. Ordered builders propagate failures to later outputs. Terminal notifications join
+pending builders before flush or discard. Sparse list-only audio bypasses token
+clipping because its emission does not follow scheduler token ranges.
 
 Stages whose decode state cannot be reconstructed from token IDs declare
 `recompute_preemption="fail"` in their AR pipeline topology. Capacity

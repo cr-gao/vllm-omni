@@ -1083,7 +1083,11 @@ class GPUARModelRunner(
             if hasattr(self.model, "_clear_warmup_state"):
                 self.model._clear_warmup_state()
 
-        if scheduler_output.finished_req_ids and self._full_payload_output_future is not None:
+        if (
+            scheduler_output.finished_req_ids
+            or getattr(scheduler_output, "resumed_delivered_upto", {})
+            or getattr(scheduler_output, "replaced_req_ids", ())
+        ) and self._full_payload_output_future is not None:
             self._full_payload_output_future.result()
             self._full_payload_output_future = None
 
@@ -1989,6 +1993,7 @@ class GPUARModelRunner(
         restored_mm: dict[str, dict[str, torch.Tensor]] | None = None,
         scheduled_token_ranges: dict[str, tuple[int, int]] | None = None,
         previous_full_payload_output: Future[None] | None = None,
+        delivery_starts: dict[str, int] | None = None,
     ) -> OmniModelRunnerOutput:
         combined_hidden_states = None
         combined_multimodal_outputs = None
@@ -2107,6 +2112,24 @@ class GPUARModelRunner(
                 combined_hidden_states = delivery.hidden_states
                 combined_multimodal_outputs = delivery.mm_outputs or None
 
+            elif (
+                delivery_starts is not None
+                and not self._should_accumulate_full_payload_output()
+                and not audio_sparse_output
+            ):
+                assert scheduled_token_ranges is not None
+                delivery = StageCacheOutputs(
+                    hidden_states=None,
+                    mm_outputs={},
+                    token_ranges={r: (delivery_starts[r], scheduled_token_ranges[r][1]) for r in downstream_req_ids},
+                    scheduled_token_ranges=scheduled_token_ranges,
+                )
+                if req_hidden_states_cpu is not None:
+                    req_hidden_states_cpu = {
+                        r: rows[max(0, delivery_starts[r] - scheduled_token_ranges[r][0]) :]
+                        for r, rows in req_hidden_states_cpu.items()
+                    }
+
             pooler_output = []
             with record_function_or_nullcontext("omni_output_builder:build_pooler_payloads"):
                 for rid in req_ids_output_copy:
@@ -2191,9 +2214,6 @@ class GPUARModelRunner(
                 cudagraph_stats=cudagraph_stats,
             )
             output.kv_extracted_req_ids = kv_extracted_req_ids
-        if delivery is not None:
-            assert self.omni_prefix_cache is not None
-            self.omni_prefix_cache.ack_delivery(delivery)
         return output
 
     @torch.inference_mode()
@@ -2234,11 +2254,17 @@ class GPUARModelRunner(
         ) = self.execute_model_state
         self.execute_model_state = None
         scheduled_token_ranges = None
-        if self._should_accumulate_full_payload_output():
+        if self._should_accumulate_full_payload_output() or (
+            self.omni_prefix_cache is not None and prefix_cache_step_id is None
+        ):
             scheduled_token_ranges = {
                 rid: (self.requests[rid].num_computed_tokens, self.requests[rid].num_computed_tokens + count)
                 for rid, count in scheduler_output.num_scheduled_tokens.items()
             }
+
+        delivery_starts = None
+        if self.omni_prefix_cache is not None and prefix_cache_step_id is None and scheduled_token_ranges is not None:
+            delivery_starts = self.omni_prefix_cache.snapshot_delivery_starts(scheduled_token_ranges)
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -2471,7 +2497,7 @@ class GPUARModelRunner(
 
         previous_full_payload_output = None
         full_payload_output: Future[None] | None = None
-        if use_async_omni_output and scheduled_token_ranges is not None:
+        if use_async_omni_output and self._should_accumulate_full_payload_output():
             previous_full_payload_output = self._full_payload_output_future
             full_payload_output = Future()
             self._full_payload_output_future = full_payload_output
@@ -2510,10 +2536,13 @@ class GPUARModelRunner(
                         restored_mm=restored_mm_snapshot,
                         scheduled_token_ranges=scheduled_token_ranges,
                         previous_full_payload_output=previous_full_payload_output,
+                        delivery_starts=delivery_starts,
                     )
                 output.omni_connector_output = omni_connector_output
                 if sampling_feedback is not None:
-                    output.invalid_logits_req_ids = {req_ids_output_copy[row] for row in sampling_feedback.invalid_rows()}
+                    output.invalid_logits_req_ids = {
+                        req_ids_output_copy[row] for row in sampling_feedback.invalid_rows()
+                    }
             except BaseException as exc:
                 if full_payload_output is not None:
                     if previous_full_payload_output is not None:

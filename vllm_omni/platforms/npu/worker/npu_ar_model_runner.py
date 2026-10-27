@@ -1496,9 +1496,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 
         if not self.use_async_scheduling:
-            if delivery is not None:
-                assert self.omni_prefix_cache is not None
-                self.omni_prefix_cache.ack_delivery(delivery)
             return model_runner_output
         async_output = AsyncGPUModelRunnerOutput(
             model_runner_output=model_runner_output,
@@ -1513,9 +1510,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             async_output.sampled_token_ids_cpu,
             async_output.async_copy_ready_event,
         )
-        if delivery is not None:
-            assert self.omni_prefix_cache is not None
-            self.omni_prefix_cache.ack_delivery(delivery)
         return async_output
 
     #  -------------------------------------- Omni-new -------------------------------------------------

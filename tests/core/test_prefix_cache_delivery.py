@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Position-based cache recovery and local output-builder delivery."""
+"""Position-based cache recovery and scheduler-owned delivery."""
+
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -21,13 +23,24 @@ from vllm_omni.core.prefix_cache.interface import HIDDEN_KEY
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def step(mgr, view, req_id, start, end, blocks, *, kind=None, hit=0, finished=(), mm=None):
+def step(
+    mgr, view, req_id, start, end, blocks, *, kind=None, hit=0, delivered=0, recovery_start=None, finished=(), mm=None
+):
     view.order = [req_id]
     view.req_blocks[req_id] = blocks
     view.computed[req_id] = start
     events = [Event(r, Kind.FINISHED) for r in finished]
     if kind is not None:
-        events.append(Event(req_id, kind, hit_end=hit, block_ids=(tuple(blocks),)))
+        events.append(
+            Event(
+                req_id,
+                kind,
+                hit_end=hit,
+                block_ids=(tuple(blocks),),
+                delivered_upto=delivered,
+                recovery_start=recovery_start,
+            )
+        )
     mgr.new_step_starts(PrefixCacheStep(tuple(events), ((req_id, end - start),)))
     layout = PrefixCacheSchedulerAdapter().build_write_layout(view, num_scheduled_tokens={req_id: end - start})
     rows = torch.arange(start, end, dtype=torch.float32).unsqueeze(1).expand(-1, HIDDEN).clone()
@@ -39,7 +52,6 @@ def step(mgr, view, req_id, start, end, blocks, *, kind=None, hit=0, finished=()
 def consume(mgr, sid, req_id="a"):
     raw = mgr.materialize(sid, [req_id])
     delivery = mgr.delivery_view(raw, [req_id])
-    mgr.ack_delivery(delivery)
     return delivery
 
 
@@ -47,11 +59,60 @@ def positions(out, req_id="a"):
     return out.hidden_states[req_id][:, 0].tolist()
 
 
+@pytest.mark.parametrize(
+    "hit,delivered,start,end,want",
+    [(12, 6, 12, 14, list(range(6, 14))), (4, 8, 4, 6, []), (4, 8, 4, 10, [8, 9])],
+)
+def test_resume_uses_scheduler_boundary_without_runner_ack(hit, delivered, start, end, want):
+    mgr, view = make_manager()
+    mgr.materialize(step(mgr, view, "a", 0, 12, [0, 1, 2], kind=Kind.STARTED), ["a"])
+    view.computed["a"] = start
+    view.req_blocks["a"] = [0, 1, 2, 3]
+    event = SimpleNamespace(
+        req_id="a",
+        kind=Kind.RESUMED,
+        hit_end=hit,
+        block_ids=((0, 1, 2, 3),),
+        delivered_upto=delivered,
+        recovery_start=None,
+    )
+    mgr.new_step_starts(PrefixCacheStep((event,), (("a", end - start),)))
+    layout = PrefixCacheSchedulerAdapter().build_write_layout(view, num_scheduled_tokens={"a": end - start})
+    rows = torch.arange(start, end, dtype=torch.float32).unsqueeze(1).expand(-1, HIDDEN).clone()
+    sid = mgr.save_outputs(
+        rows, {}, num_tokens_unpadded=end - start, num_tokens_padded=end - start, write_layout=layout
+    )
+    out = mgr.delivery_view(mgr.materialize(sid, ["a"]), ["a"])
+    assert positions(out) == want
+    if end < delivered:
+        tail = mgr.delivery_view(mgr.materialize(step(mgr, view, "a", end, 10, [0, 1, 2, 3]), ["a"]), ["a"])
+        assert positions(tail) == [8, 9]
+
+
+def test_adapter_captures_scheduler_resume_boundary():
+    sched = SimpleNamespace(
+        scheduled_new_reqs=[],
+        finished_req_ids=set(),
+        num_scheduled_tokens={"a": 2},
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=["a"],
+            resumed_req_ids={"a"},
+            num_computed_tokens=[4],
+            new_block_ids=[([0, 1],)],
+            num_output_tokens=[1],
+        ),
+        resumed_delivered_upto={"a": 8},
+    )
+    event = PrefixCacheSchedulerAdapter().translate_step(sched).events[0]
+    sched.resumed_delivered_upto["a"] = 10
+    assert getattr(event, "delivered_upto", None) == 8
+
+
 def test_resume_growing_hit_recovers_only_undelivered_positions():
     mgr, view = make_manager()
     consume(mgr, step(mgr, view, "a", 0, 6, [0, 1], kind=Kind.STARTED))
     consume(mgr, step(mgr, view, "peer", 0, 12, [0, 1, 2], kind=Kind.STARTED), "peer")
-    sid = step(mgr, view, "a", 12, 14, [0, 1, 2, 3], kind=Kind.RESUMED, hit=12)
+    sid = step(mgr, view, "a", 12, 14, [0, 1, 2, 3], kind=Kind.RESUMED, hit=12, delivered=6)
     out = consume(mgr, sid)
     assert positions(out) == list(range(6, 14))
     assert out.token_ranges["a"] == (6, 14)
@@ -60,10 +121,8 @@ def test_resume_growing_hit_recovers_only_undelivered_positions():
 def test_resume_shrinking_hit_saves_replay_but_delivers_only_new_suffix():
     mgr, view = make_manager()
     first = consume(mgr, step(mgr, view, "a", 0, 8, [0, 1], kind=Kind.STARTED))
-    replay = consume(mgr, step(mgr, view, "a", 4, 6, [0, 3, 4], kind=Kind.RESUMED, hit=4))
+    replay = consume(mgr, step(mgr, view, "a", 4, 6, [0, 3, 4], kind=Kind.RESUMED, hit=4, delivered=8))
     assert positions(replay) == []
-    progress = mgr._request_progress["a"]
-    assert progress.delivered_upto == 8
     tail = consume(mgr, step(mgr, view, "a", 6, 10, [0, 3, 4]))
     assert positions(first) + positions(replay) + positions(tail) == list(range(10))
     saved = plan_fetch(mgr, view.slots_for("a", 4, 10), HIDDEN_KEY, req_id="a")
@@ -77,9 +136,7 @@ def test_materialization_without_handoff_does_not_advance_delivery():
     first = mgr.delivery_view(raw, ["a"])
     retry = mgr.delivery_view(raw, ["a"])
     assert positions(first) == positions(retry) == list(range(8))
-    assert not mgr._request_progress["a"].delivered_upto
-    mgr.ack_delivery(first)
-    assert mgr._request_progress["a"].delivered_upto == 8
+    assert mgr._delivery_starts["a"] == 0
 
 
 def test_discard_is_not_delivery_and_resumed_hit_recovers_it():
@@ -94,16 +151,16 @@ def test_late_delivery_uses_old_request_progress_after_id_reuse():
     raw = mgr.materialize(step(mgr, view, "a", 0, 8, [0, 1], kind=Kind.STARTED), ["a"])
     old = mgr.delivery_view(raw, ["a"])
     sid = step(mgr, view, "a", 0, 2, [2], kind=Kind.STARTED, finished=["a"])
-    mgr.ack_delivery(old)
-    assert not mgr._request_progress["a"].delivered_upto
+    assert positions(old) == list(range(8))
+    assert mgr._delivery_starts["a"] == 0
     assert positions(consume(mgr, sid)) == [0, 1]
 
 
 def test_resume_snapshots_previous_step_handoff():
     mgr, view = make_manager(staging_depth=3)
     prior = mgr.materialize(step(mgr, view, "a", 0, 8, [0, 1], kind=Kind.STARTED), ["a"])
-    mgr.ack_delivery(mgr.delivery_view(prior, ["a"]))
-    sid = step(mgr, view, "a", 4, 10, [0, 1, 2], kind=Kind.RESUMED, hit=4)
+    assert positions(prior) == list(range(8))
+    sid = step(mgr, view, "a", 4, 10, [0, 1, 2], kind=Kind.RESUMED, hit=4, delivered=8)
     assert positions(consume(mgr, sid)) == [8, 9]
 
 
@@ -131,6 +188,7 @@ def test_cached_mm_is_clipped_but_global_metadata_is_preserved():
             [0, 1, 2],
             kind=Kind.RESUMED,
             hit=4,
+            delivered=8,
             mm={"codes": codes(4, 10), "metadata": torch.tensor([7])},
         ),
         ["a"],
@@ -141,10 +199,9 @@ def test_cached_mm_is_clipped_but_global_metadata_is_preserved():
 
 
 def test_delivery_clips_current_only_fields_relative_to_scheduled_origin():
-    from vllm_omni.core.prefix_cache.interface import PrefixCacheRequestProgress, StageCacheOutputs
+    from vllm_omni.core.prefix_cache.interface import StageCacheOutputs
 
     mgr, _ = make_manager()
-    progress = PrefixCacheRequestProgress(delivered_upto=13)
     raw = StageCacheOutputs(
         hidden_states={"a": torch.arange(6, 14).reshape(-1, 1)},
         mm_outputs={
@@ -156,7 +213,6 @@ def test_delivery_clips_current_only_fields_relative_to_scheduled_origin():
         scheduled_token_ranges={"a": (12, 14)},
         cached_mm_keys=frozenset({"cached"}),
         token_mm_keys=frozenset({"cached", "current"}),
-        _progress={"a": progress},
         delivery_starts={"a": 13},
     )
     view = mgr.delivery_view(raw, ["a"])
@@ -165,30 +221,12 @@ def test_delivery_clips_current_only_fields_relative_to_scheduled_origin():
     assert view.mm_outputs["global"]["a"].tolist() == [[90], [91]]
 
 
-def test_delivery_acknowledges_only_selected_requests():
-    from vllm_omni.core.prefix_cache.interface import PrefixCacheRequestProgress, StageCacheOutputs
-
-    mgr, _ = make_manager()
-    a, b = PrefixCacheRequestProgress(), PrefixCacheRequestProgress()
-    raw = StageCacheOutputs(
-        hidden_states={"a": torch.zeros(2, 1), "b": torch.zeros(2, 1)},
-        mm_outputs={},
-        token_ranges={"a": (0, 2), "b": (0, 2)},
-        scheduled_token_ranges={"a": (0, 2), "b": (0, 2)},
-        _progress={"a": a, "b": b},
-        delivery_starts={"a": 0, "b": 0},
-    )
-    mgr.ack_delivery(mgr.delivery_view(raw, ["b"]))
-    assert a.delivered_upto == 0
-    assert b.delivered_upto == 2
-
-
 @pytest.mark.parametrize("terminal", [Kind.FINISHED, Kind.ABORTED])
 def test_terminal_event_releases_progress_without_losing_pending_output(terminal):
     mgr, view = make_manager()
     sid = step(mgr, view, "a", 0, 4, [0], kind=Kind.STARTED)
     mgr.new_step_starts(PrefixCacheStep((Event("a", terminal),), ()))
-    assert "a" not in mgr._request_progress
+    assert "a" not in mgr._delivery_starts
     assert positions(consume(mgr, sid)) == list(range(4))
 
 
@@ -207,6 +245,7 @@ def test_repeated_resume_preserves_deferred_mm_positions():
             [0, 1, 2],
             kind=kind,
             hit=hit,
+            delivered=len(emitted),
             mm={"codes": torch.arange(start, end, dtype=torch.float32).reshape(-1, 1)},
         )
         emitted.extend(consume(mgr, sid).mm_outputs["codes"]["a"][:, 0].tolist())
@@ -216,26 +255,13 @@ def test_repeated_resume_preserves_deferred_mm_positions():
     assert saved[:, 0].tolist() == list(range(12))
 
 
-def test_full_payload_recovery_uses_emitted_per_key_boundary():
+def test_full_payload_recovery_boundary_is_independent_of_scheduler_delivery():
     mgr, view = make_manager()
-    raw = mgr.materialize(step(mgr, view, "a", 0, 8, [0, 1], kind=Kind.STARTED), ["a"])
-    ends = {"hidden": 8, "codes": 4}
-    mgr.record_full_payload_delivery(raw, "a", min(ends.values()))
-    assert raw._progress["a"].delivered_upto == 4
-    sid = step(mgr, view, "a", 8, 10, [0, 1, 2], kind=Kind.RESUMED, hit=8)
+    mgr.materialize(step(mgr, view, "a", 0, 8, [0, 1], kind=Kind.STARTED), ["a"])
+    sid = step(mgr, view, "a", 8, 10, [0, 1, 2], kind=Kind.RESUMED, hit=8, delivered=8, recovery_start=4)
     recovered = mgr.materialize(sid, ["a"])
     assert recovered.token_ranges["a"] == (4, 10)
-    ends["codes"] = 8
-    assert raw._progress["a"].delivered_upto == 4
-
-
-def test_late_full_payload_ack_preserves_new_id_progress():
-    mgr, view = make_manager()
-    raw = mgr.materialize(step(mgr, view, "a", 0, 4, [0], kind=Kind.STARTED), ["a"])
-    sid = step(mgr, view, "a", 0, 2, [2], kind=Kind.STARTED, finished=["a"])
-    mgr.record_full_payload_delivery(raw, "a", 4)
-    assert mgr._request_progress["a"].delivered_upto == 0
-    mgr.discard_step(sid)
+    assert positions(mgr.delivery_view(recovered, ["a"])) == [8, 9]
 
 
 def test_out_of_order_output_builders_preserve_both_step_ranges():
@@ -246,4 +272,33 @@ def test_out_of_order_output_builders_preserve_both_step_ranges():
     earlier = consume(mgr, first)
     assert positions(earlier) == [0, 1, 2, 3]
     assert positions(later) == [4, 5, 6, 7]
-    assert mgr._request_progress["a"].delivered_upto == 8
+    assert mgr._delivery_starts["a"] == 0
+
+
+def test_buffered_decode_delivery_snapshot_survives_later_resume():
+    mgr, view = make_manager()
+    mgr.materialize(step(mgr, view, "a", 0, 8, [0, 1], kind=Kind.STARTED), ["a"])
+    mgr.materialize(step(mgr, view, "a", 4, 5, [0, 1], kind=Kind.RESUMED, hit=4, delivered=8), ["a"])
+    starts = mgr.snapshot_delivery_starts({"a": (5, 6)})
+    assert starts == {"a": 6}
+    assert mgr.snapshot_delivery_starts({"a": (7, 9)}) == {"a": 8}
+    mgr.new_step_starts(PrefixCacheStep((Event("a", Kind.RESUMED, delivered_upto=10),), ()))
+    assert starts == {"a": 6}
+
+
+def test_prompt_replacement_resets_resume_floor():
+    mgr, view = make_manager()
+    mgr.materialize(step(mgr, view, "a", 0, 8, [0, 1], kind=Kind.STARTED), ["a"])
+    mgr.materialize(step(mgr, view, "a", 4, 5, [0, 1], kind=Kind.RESUMED, hit=4, delivered=8), ["a"])
+    sched = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(req_id="a", num_computed_tokens=0, block_ids=([2],))],
+        scheduled_cached_reqs=None,
+        num_scheduled_tokens={"a": 2},
+        replaced_req_ids={"a"},
+    )
+    adapter = PrefixCacheSchedulerAdapter()
+    adapter._observed_req_ids.add("a")
+    event = adapter.translate_step(sched).events[0]
+    assert event.kind is Kind.REPLACED
+    sid = step(mgr, view, "a", 0, 2, [2], kind=event.kind)
+    assert positions(consume(mgr, sid)) == [0, 1]

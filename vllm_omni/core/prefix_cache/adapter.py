@@ -27,8 +27,7 @@ class PrefixCacheEventKind(str, Enum):
     RESUMED = "resumed"
     FINISHED = "finished"
     ABORTED = "aborted"
-    # Reserved for the content-identity work in item 5. This adapter does
-    # not infer replacement from a reset or a prompt mutation.
+    # Explicit scheduler notification of a new prompt under the same ID.
     REPLACED = "replaced"
 
 
@@ -36,12 +35,13 @@ class PrefixCacheEventKind(str, Enum):
 class PrefixCacheRequestEvent:
     req_id: str
     kind: PrefixCacheEventKind
-    # Current supported hits are prefixes [0, hit_end). Arbitrary ranges
-    # and resume delivery watermarks belong to the follow-up items.
+    # KV hit and accepted output are independent absolute token boundaries.
     hit_end: int = 0
     block_ids: tuple[tuple[int, ...], ...] = ()
     scheduled_tokens: int = 0
     num_output_tokens: int = 0
+    delivered_upto: int = 0
+    recovery_start: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +107,7 @@ class PrefixCacheSchedulerAdapter:
         events: list[PrefixCacheRequestEvent] = []
         extended: list[str] = []
         cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        replaced = set(getattr(scheduler_output, "replaced_req_ids", ()))
         resumed = {str(req_id) for req_id in (getattr(cached, "resumed_req_ids", ()) or ())}
         finished = {str(req_id) for req_id in (getattr(scheduler_output, "finished_req_ids", ()) or ())}
         aborted = {str(req_id) for req_id in (getattr(scheduler_output, "aborted_req_ids", ()) or ())}
@@ -125,7 +126,7 @@ class PrefixCacheSchedulerAdapter:
             if req_id in emitted:
                 continue
             emitted.add(req_id)
-            if req_id in self._observed_req_ids:
+            if req_id in self._observed_req_ids and req_id not in replaced:
                 extended.append(req_id)
                 continue
             self._observed_req_ids.add(req_id)
@@ -134,7 +135,7 @@ class PrefixCacheSchedulerAdapter:
             events.append(
                 PrefixCacheRequestEvent(
                     req_id,
-                    PrefixCacheEventKind.STARTED,
+                    PrefixCacheEventKind.REPLACED if req_id in replaced else PrefixCacheEventKind.STARTED,
                     hit_end=computed_tokens,
                     block_ids=blocks,
                     scheduled_tokens=max(0, int(scheduled_tokens.get(req_id, 0))),
@@ -143,23 +144,24 @@ class PrefixCacheSchedulerAdapter:
 
         # Only resumed requests need a cached-request payload snapshot.
         # Iterate req_ids (scheduler order), not the resumed membership set.
-        req_ids = (getattr(cached, "req_ids", ()) or ()) if resumed else ()
+        req_ids = (getattr(cached, "req_ids", ()) or ()) if resumed or replaced else ()
         computed = getattr(cached, "num_computed_tokens", ()) or ()
         new_blocks = getattr(cached, "new_block_ids", ()) or ()
         output_tokens = getattr(cached, "num_output_tokens", ()) or ()
         for index, raw_req_id in enumerate(req_ids):
             req_id = str(raw_req_id)
-            if req_id not in resumed or req_id in emitted:
+            if req_id not in resumed | replaced or req_id in emitted:
                 continue
             self._observed_req_ids.add(req_id)
             events.append(
                 PrefixCacheRequestEvent(
                     req_id,
-                    PrefixCacheEventKind.RESUMED,
+                    PrefixCacheEventKind.REPLACED if req_id in replaced else PrefixCacheEventKind.RESUMED,
                     hit_end=int(computed[index]) if index < len(computed) else 0,
                     block_ids=self._blocks_value(new_blocks[index]) if index < len(new_blocks) else (),
                     scheduled_tokens=max(0, int(scheduled_tokens.get(req_id, 0))),
                     num_output_tokens=int(output_tokens[index]) if index < len(output_tokens) else 0,
+                    delivered_upto=getattr(scheduler_output, "resumed_delivered_upto", {}).get(req_id, 0),
                 )
             )
             emitted.add(req_id)

@@ -112,13 +112,6 @@ class PrefixCacheConfig:
 
 
 @dataclass
-class PrefixCacheRequestProgress:
-    """Successful local handoff boundary, retained across preemption."""
-
-    delivered_upto: int = 0
-
-
-@dataclass
 class StageCacheOutputs:
     """Materialized rows and their save-time request positions."""
 
@@ -128,7 +121,6 @@ class StageCacheOutputs:
     scheduled_token_ranges: dict[ReqId, tuple[int, int]] = field(default_factory=dict)
     cached_mm_keys: frozenset[TensorName] = frozenset()
     token_mm_keys: frozenset[TensorName] = frozenset()
-    _progress: dict[ReqId, PrefixCacheRequestProgress] = field(default_factory=dict, repr=False)
     delivery_starts: dict[ReqId, int] = field(default_factory=dict)
 
 
