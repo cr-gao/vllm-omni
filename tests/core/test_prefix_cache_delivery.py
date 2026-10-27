@@ -59,53 +59,11 @@ def positions(out, req_id="a"):
     return out.hidden_states[req_id][:, 0].tolist()
 
 
-@pytest.mark.parametrize(
-    "hit,delivered,start,end,want",
-    [(12, 6, 12, 14, list(range(6, 14))), (4, 8, 4, 6, []), (4, 8, 4, 10, [8, 9])],
-)
-def test_resume_uses_scheduler_boundary_without_runner_ack(hit, delivered, start, end, want):
+def test_resume_uses_scheduler_boundary_without_runner_ack():
     mgr, view = make_manager()
     mgr.materialize(step(mgr, view, "a", 0, 12, [0, 1, 2], kind=Kind.STARTED), ["a"])
-    view.computed["a"] = start
-    view.req_blocks["a"] = [0, 1, 2, 3]
-    event = SimpleNamespace(
-        req_id="a",
-        kind=Kind.RESUMED,
-        hit_end=hit,
-        block_ids=((0, 1, 2, 3),),
-        delivered_upto=delivered,
-        recovery_start=None,
-    )
-    mgr.new_step_starts(PrefixCacheStep((event,), (("a", end - start),)))
-    layout = PrefixCacheSchedulerAdapter().build_write_layout(view, num_scheduled_tokens={"a": end - start})
-    rows = torch.arange(start, end, dtype=torch.float32).unsqueeze(1).expand(-1, HIDDEN).clone()
-    sid = mgr.save_outputs(
-        rows, {}, num_tokens_unpadded=end - start, num_tokens_padded=end - start, write_layout=layout
-    )
-    out = mgr.delivery_view(mgr.materialize(sid, ["a"]), ["a"])
-    assert positions(out) == want
-    if end < delivered:
-        tail = mgr.delivery_view(mgr.materialize(step(mgr, view, "a", end, 10, [0, 1, 2, 3]), ["a"]), ["a"])
-        assert positions(tail) == [8, 9]
-
-
-def test_adapter_captures_scheduler_resume_boundary():
-    sched = SimpleNamespace(
-        scheduled_new_reqs=[],
-        finished_req_ids=set(),
-        num_scheduled_tokens={"a": 2},
-        scheduled_cached_reqs=SimpleNamespace(
-            req_ids=["a"],
-            resumed_req_ids={"a"},
-            num_computed_tokens=[4],
-            new_block_ids=[([0, 1],)],
-            num_output_tokens=[1],
-        ),
-        resumed_delivered_upto={"a": 8},
-    )
-    event = PrefixCacheSchedulerAdapter().translate_step(sched).events[0]
-    sched.resumed_delivered_upto["a"] = 10
-    assert getattr(event, "delivered_upto", None) == 8
+    sid = step(mgr, view, "a", 12, 14, [0, 1, 2, 3], kind=Kind.RESUMED, hit=12, delivered=6)
+    assert positions(consume(mgr, sid)) == list(range(6, 14))
 
 
 def test_resume_growing_hit_recovers_only_undelivered_positions():

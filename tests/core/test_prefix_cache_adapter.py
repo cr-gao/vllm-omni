@@ -97,22 +97,23 @@ def test_missing_abort_side_channel_never_infers_aborted():
 
 def test_resumed_event_snapshots_cached_request_payload():
     adapter = PrefixCacheSchedulerAdapter()
-    events = adapter.translate_step(
-        output(
-            resumed={"r"},
-            cached={
-                "req_ids": ["other", "r"],
-                "num_computed_tokens": [3, 8],
-                "new_block_ids": [[[1]], [[4, 5]]],
-                "num_output_tokens": [1, 6],
-            },
-        )
-    ).events
-    event = events[0]
+    scheduler_output = output(
+        resumed={"r"},
+        cached={
+            "req_ids": ["other", "r"],
+            "num_computed_tokens": [3, 8],
+            "new_block_ids": [[[1]], [[4, 5]]],
+            "num_output_tokens": [1, 6],
+        },
+    )
+    scheduler_output.resumed_delivered_upto = {"r": 8}
+    event = adapter.translate_step(scheduler_output).events[0]
+    scheduler_output.resumed_delivered_upto["r"] = 10
     assert (event.kind, event.req_id, event.hit_end) == (PrefixCacheEventKind.RESUMED, "r", 8)
     assert event.block_ids == ((4, 5),)
     assert event.scheduled_tokens == 0
     assert event.num_output_tokens == 6
+    assert event.delivered_upto == 8
 
 
 def test_resumed_block_snapshot_is_immutable():
@@ -234,6 +235,7 @@ def test_write_layout_uses_post_order_batch_and_slots():
     layout = PrefixCacheSchedulerAdapter().build_write_layout(FakeView(), num_scheduled_tokens={"b": 2, "a": 1})
     assert layout.total_rows == 3
     assert [(w.req_id, w.row_start, w.row_end) for w in layout.writes] == [("b", 0, 2), ("a", 2, 3)]
+    assert [(w.token_start, w.token_end) for w in layout.writes] == [(12, 14), (7, 8)]
     assert torch.equal(layout.slots_cpu, torch.tensor([20, 21, 7]))
     with pytest.raises(AttributeError):
         layout.writes = ()
@@ -382,9 +384,3 @@ def test_negative_continuation_does_not_become_a_new_hit():
     )
     assert step.events == ()
     assert step.scheduled_tokens == (("r", 0),)
-
-
-def test_write_layout_keeps_request_positions_separate_from_batch_rows():
-    layout = PrefixCacheSchedulerAdapter().build_write_layout(FakeView(), num_scheduled_tokens={"b": 2, "a": 1})
-    assert [(w.token_start, w.token_end) for w in layout.writes] == [(12, 14), (7, 8)]
-    assert [(w.row_start, w.row_end) for w in layout.writes] == [(0, 2), (2, 3)]
