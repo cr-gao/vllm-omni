@@ -528,6 +528,7 @@ def test_stale_prefill_delivery_uses_scheduled_end(
 
     scheduler_output = MagicMock(spec=SchedulerOutput)
     scheduler_output.num_scheduled_tokens = {request.request_id: 128}
+    scheduler_output.scheduled_token_ranges = {request.request_id: (128, 256)}
     scheduler_output.scheduled_cached_reqs = SimpleNamespace(
         req_ids=[request.request_id] if schedule_kind == "cached" else [],
         num_computed_tokens=[128] if schedule_kind == "cached" else [],
@@ -606,6 +607,7 @@ def test_preempted_in_flight_decode_uses_scheduled_end_without_placeholder_under
     scheduler_output = MagicMock(spec=SchedulerOutput)
     scheduler_output.num_scheduled_tokens = {request.request_id: 1}
     scheduler_output.scheduled_cached_reqs = SimpleNamespace(req_ids=[request.request_id], num_computed_tokens=[3])
+    scheduler_output.scheduled_token_ranges = {request.request_id: (3, 4)}
     scheduler_output.scheduled_spec_decode_tokens = {}
     scheduler_output.num_invalid_spec_tokens = 0
 
@@ -623,6 +625,7 @@ def test_preempted_in_flight_decode_uses_scheduled_end_without_placeholder_under
     model_runner_output.routed_experts = None
 
     bind_omits_transfer_helpers(sched)
+    scheduler_output.scheduled_cached_reqs.num_computed_tokens[0] = 0
     OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
 
     assert list(request.output_token_ids) == [42]
