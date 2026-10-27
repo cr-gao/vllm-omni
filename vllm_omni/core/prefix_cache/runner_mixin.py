@@ -233,7 +233,12 @@ class PrefixCacheRunnerMixin:
         if n > cfg.staging_capacity_tokens:
             return False
         if steps and (
-            writes != steps[0][0]
+            len(writes) != len(steps[-1][0])
+            or any(
+                (w.req_id, w.row_start, w.row_end, w.token_start)
+                != (prev.req_id, prev.row_start, prev.row_end, prev.token_end)
+                for w, prev in zip(writes, steps[-1][0])
+            )
             or rows.keys() != steps[0][2].keys()
             or (len(steps) + 1) * n > cfg.staging_capacity_tokens
         ):
@@ -255,7 +260,10 @@ class PrefixCacheRunnerMixin:
         count = len(steps)
         first = steps[0][0]
         n = len(first) * count
-        writes = tuple(PrefixCacheWrite(w.req_id, w.row_start * count, w.row_end * count) for w in first)
+        writes = tuple(
+            PrefixCacheWrite(w.req_id, w.row_start * count, w.row_end * count, w.token_start, last.token_end)
+            for w, last in zip(first, steps[-1][0])
+        )
         slots_cpu = torch.stack([slots for _, slots, _ in steps], dim=1).flatten()
         rows = {key: torch.stack([tensors[key] for _, _, tensors in steps], dim=1).flatten(0, 1) for key in steps[0][2]}
         steps.clear()

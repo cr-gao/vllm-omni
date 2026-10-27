@@ -417,7 +417,8 @@ class _DecodeRunner(PrefixCacheRunnerMixin):
         hidden = self.output_buffer[:n]
         torch.stack([_decode_row(r, p) for r, (_, s, n) in reqs.items() for p in range(s, s + n)], out=hidden)
         step_id = self._prefix_cache_save_step(hidden, mm, num_tokens_unpadded=n, num_tokens_padded=n)
-        out = self._prefix_cache_materialize(step_id, list(reqs)) if step_id is not None else (None, None)
+        outputs = self._prefix_cache_materialize(step_id, list(reqs))
+        out = (outputs.hidden_states, outputs.mm_outputs) if outputs is not None else (None, None)
         return step_id, out
 
 
@@ -459,6 +460,19 @@ def test_decode_batching_limits_and_prefix_hits(decode_runners, config, expected
     assert torch.equal(hidden["b"], _expect_decode_hit("a", range(8), ("b", 8)))
     step_id, _ = r.step({"b": ([0, 1, 5], 9, 1), "z": (Z_BLOCKS, 8, 1)})
     assert step_id is None
+
+
+def test_decode_flush_preserves_absolute_ranges(decode_runners):
+    r = decode_runners()
+    r.step({"a": (A_BLOCKS, 0, 4), "z": (Z_BLOCKS, 0, 8)}, new=["a", "z"])
+    for offset in range(4):
+        r.step({"a": (A_BLOCKS, 4 + offset, 1), "z": (Z_BLOCKS, 8 + offset, 1)})
+    assert r.save_sizes == [12, 8]
+    writes = r.save.call_args.kwargs["write_layout"].writes
+    assert [(w.req_id, w.row_start, w.row_end, w.token_start, w.token_end) for w in writes] == [
+        ("a", 0, 4, 4, 8),
+        ("z", 4, 8, 8, 12),
+    ]
 
 
 def test_decode_buffer_charges_its_batch_to_the_gpu_budget(decode_runners):
