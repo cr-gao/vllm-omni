@@ -30,6 +30,8 @@ import torch
 from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
 from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig, StageCacheOutputs
 from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
+from vllm_omni.data_entry_keys import flatten_payload
+from vllm_omni.utils.mm_outputs import slice_token_payload
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -81,86 +83,96 @@ def test_execute_model_state_keeps_prefix_cache_sid_last():
     assert gpu_fields[-1] == "prefix_cache_step_id"
 
 
-def test_npu_output_builder_uses_delivery_snapshot_without_advancing_it():
+def _run_npu_pooler_loop(scope):
     tree = ast.parse(_NPU_RUNNER.read_text())
     sample = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "sample_tokens")
-    calls = {
-        node.func.attr: node.lineno
-        for node in ast.walk(sample)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr in {"delivery_view", "ack_delivery", "get_omni_connector_output"}
-    }
-    assert calls["delivery_view"] < calls["get_omni_connector_output"]
-    assert "ack_delivery" not in calls
-    branch = next(
+    loop = next(
         node
         for node in ast.walk(sample)
-        if isinstance(node, ast.If)
-        and any(
-            isinstance(stmt, ast.Assign)
-            and isinstance(stmt.value, ast.Call)
-            and isinstance(stmt.value.func, ast.Attribute)
-            and stmt.value.func.attr == "delivery_view"
-            for stmt in node.body
-        )
+        if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "rid"
+        and any(isinstance(stmt, ast.Name) and stmt.id == "payload" for stmt in ast.walk(node))
     )
+    resolver = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_resolve_req_hidden_states"
+    )
+    resolver = copy.deepcopy(resolver)
+    resolver.decorator_list = []
+    namespace = {"torch": torch}
+    resolver_code = compile(
+        ast.fix_missing_locations(ast.Module(body=[resolver], type_ignores=[])), str(_NPU_RUNNER), "exec"
+    )
+    exec(resolver_code, namespace)
+    scope.update(
+        self=SimpleNamespace(
+            _resolve_req_hidden_states=namespace["_resolve_req_hidden_states"],
+            _is_full_payload_token_key=lambda key: key == "hidden",
+            _resolve_full_payload_replace_keys=frozenset,
+        ),
+        flatten_payload=flatten_payload,
+        slice_token_payload=slice_token_payload,
+        pooler_output=[],
+        audio_sparse_output=False,
+        combined_multimodal_outputs=None,
+        mm_cpu=None,
+    )
+    code = compile(
+        ast.fix_missing_locations(ast.Module(body=[copy.deepcopy(loop)], type_ignores=[])), str(_NPU_RUNNER), "exec"
+    )
+    exec(code, scope)
+    return scope["pooler_output"]
+
+
+def test_npu_output_builder_uses_delivery_snapshot_without_advancing_it():
     raw = StageCacheOutputs(
         hidden_states={"r1": torch.arange(4, 10).reshape(-1, 1)},
         mm_outputs={},
         token_ranges={"r1": (4, 10)},
-        scheduled_token_ranges={"r1": (4, 10)},
-        delivery_starts={"r1": 8},
     )
+    scheduler_output = SimpleNamespace(delivered_upto={"r1": 8})
     scope = {
         "cache_outputs": raw,
-        "audio_sparse_output": False,
-        "downstream_req_ids": ["r1"],
-        "self": SimpleNamespace(
-            omni_prefix_cache=OmniPrefixCacheManager.__new__(OmniPrefixCacheManager),
-            _should_accumulate_full_payload_output=lambda: False,
-        ),
+        "scheduler_output": scheduler_output,
+        "scheduled_token_ranges": {"r1": (6, 10)},
+        "req_ids_output_copy": ["r1"],
+        "req_id_to_index_output_copy": {"r1": 0},
+        "downstream_req_id_set": {"r1"},
+        "query_start_loc_cpu": [0],
+        "num_scheduled_tokens_np": [4],
+        "req_hidden_states_cpu": None,
+        "combined_hidden_states": raw.hidden_states,
+        "hidden_states_cpu": None,
     }
-    code = compile(
-        ast.fix_missing_locations(ast.Module(body=[copy.deepcopy(branch)], type_ignores=[])), str(_NPU_RUNNER), "exec"
-    )
-    exec(code, scope)
-    assert scope["combined_hidden_states"]["r1"].flatten().tolist() == [8, 9]
-    assert raw.delivery_starts == {"r1": 8}
+    payloads = _run_npu_pooler_loop(scope)
+    assert payloads[0]["hidden"].flatten().tolist() == [8, 9]
+    assert scheduler_output.delivered_upto == {"r1": 8}
     assert raw.hidden_states["r1"].flatten().tolist() == list(range(4, 10))
 
 
 def test_npu_partial_downstream_hidden_uses_only_unseen_scheduled_rows():
-    tree = ast.parse(_NPU_RUNNER.read_text())
-    sample = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "sample_tokens")
-    per_req_hidden = next(
-        node
-        for node in ast.walk(sample)
-        if isinstance(node, ast.If)
-        and any(
-            isinstance(stmt, ast.Assign)
-            and any(isinstance(target, ast.Name) and target.id == "req_hidden_states" for target in stmt.targets)
-            for stmt in node.body
-        )
-    )
-    branch = ast.fix_missing_locations(ast.Module(body=copy.deepcopy(per_req_hidden.body), type_ignores=[]))
     scope = {
         "req_hidden_states_cpu": {"r1": torch.tensor([[40.0], [50.0]])},
-        "delivery": StageCacheOutputs(
-            hidden_states=None,
-            mm_outputs={},
-            token_ranges={"r1": (5, 6)},
-            scheduled_token_ranges={"r1": (4, 6)},
-        ),
-        "rid": "r1",
-        "max": max,
+        "scheduler_output": SimpleNamespace(delivered_upto={"r1": 5}),
+        "scheduled_token_ranges": {"r1": (4, 6)},
+        "cache_outputs": None,
+        "req_ids_output_copy": ["r0", "r1"],
+        "req_id_to_index_output_copy": {"r0": 0, "r1": 1},
+        "downstream_req_id_set": {"r1"},
+        "query_start_loc_cpu": [0, 1],
+        "num_scheduled_tokens_np": [1, 2],
+        "combined_hidden_states": None,
     }
-    exec(compile(branch, str(_NPU_RUNNER), "exec"), scope)
-    assert scope["req_hidden_states"].flatten().tolist() == [50.0]
+    payloads = _run_npu_pooler_loop(scope)
+    assert payloads[0] == {}
+    assert payloads[1]["hidden"].flatten().tolist() == [50.0]
+    assert scope["req_hidden_states_cpu"]["r1"].flatten().tolist() == [40.0, 50.0]
 
-    scope["delivery"] = None
-    exec(compile(branch, str(_NPU_RUNNER), "exec"), scope)
-    assert scope["req_hidden_states"].flatten().tolist() == [40.0, 50.0]
+    scope["scheduler_output"].delivered_upto = {}
+    payloads = _run_npu_pooler_loop(scope)
+    assert payloads[1]["hidden"].flatten().tolist() == [40.0, 50.0]
 
 
 class _FakeView:

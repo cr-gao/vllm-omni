@@ -51,7 +51,7 @@ from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
 from vllm_omni.model_executor.models.interfaces import supports_multi_frame_decode
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
-from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
+from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, slice_token_payload, to_payload_element
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     needs_omni_connector,
@@ -904,11 +904,19 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 hidden_states, aux_hidden_states = hidden_states
 
             #  -------------------------------------- Omni-new -------------------------------------------------
+            if deferred_state_corrections_fn:
+                deferred_state_corrections_fn()
+                deferred_state_corrections_fn = None
+            scheduled_token_ranges = {
+                rid: (self.requests[rid].num_computed_tokens, self.requests[rid].num_computed_tokens + count)
+                for rid, count in scheduler_output.num_scheduled_tokens.items()
+            }
             prefix_cache_step_id = self._prefix_cache_save_step(
                 hidden_states,
                 multimodal_outputs,
                 num_tokens_unpadded=num_tokens_unpadded,
                 num_tokens_padded=num_tokens_padded,
+                token_ranges=scheduled_token_ranges,
             )
             #  -------------------------------------- Omni-new -------------------------------------------------
 
@@ -1090,6 +1098,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         self.execute_model_state = None
         hidden_seq_len = int(hidden_states.shape[0])
         scheduled_seq_len = int(scheduler_output.total_num_scheduled_tokens)
+        scheduled_token_ranges = self._scheduled_token_ranges
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -1291,7 +1300,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             query_start_loc_cpu = query_start_loc_cpu()
 
         pooler_output: list[dict[str, object]] | None = None
-        delivery = None
         cache_outputs = None
         if needs_pooler_payload:
             combined_hidden_states = None
@@ -1318,18 +1326,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 req_ids_filter=downstream_req_id_set,
             )
 
-            if (
-                cache_outputs is not None
-                and not self._should_accumulate_full_payload_output()
-                and (not audio_sparse_output or cache_outputs.token_mm_keys)
-            ):
-                assert self.omni_prefix_cache is not None
-                delivery = self.omni_prefix_cache.delivery_view(
-                    cache_outputs, downstream_req_ids
-                )
-                combined_hidden_states = delivery.hidden_states
-                combined_multimodal_outputs = delivery.mm_outputs or None
-
             if req_hidden_states_cpu is not None and combined_hidden_states is None:
                 for rid in downstream_req_ids:
                     idx = req_id_to_index_output_copy[rid]
@@ -1343,25 +1339,14 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 if rid not in downstream_req_id_set:
                     pooler_output.append({})
                     continue
-                if delivery is not None and delivery.token_ranges[rid][0] == delivery.token_ranges[rid][1]:
-                    pooler_output.append({})
-                    continue
                 idx = req_id_to_index_output_copy[rid]
                 start = int(query_start_loc_cpu[idx])
                 sched = int(num_scheduled_tokens_np[idx])
                 end = start + sched
-                if delivery is not None:
-                    start += max(0, delivery.token_ranges[rid][0] - delivery.scheduled_token_ranges[rid][0])
                 payload: dict[str, object] = {}
                 if not audio_sparse_output:
                     if req_hidden_states_cpu is not None and combined_hidden_states is None:
                         req_hidden_states = req_hidden_states_cpu[rid]
-                        if delivery is not None:
-                            offset = max(
-                                0,
-                                delivery.token_ranges[rid][0] - delivery.scheduled_token_ranges[rid][0],
-                            )
-                            req_hidden_states = req_hidden_states[offset:]
                     else:
                         req_hidden_states = self._resolve_req_hidden_states(
                             hidden_states_cpu,
@@ -1423,7 +1408,25 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                                 scheduled_seq_len=scheduled_seq_len,
                             )
                     payload.update(mm_payload)
-                pooler_output.append(flatten_payload(payload))
+                payload = flatten_payload(payload)
+                if rid in scheduled_token_ranges and not audio_sparse_output:
+                    token_keys = frozenset(key for key in payload if self._is_full_payload_token_key(key))
+                    cached_keys = frozenset()
+                    if cache_outputs is not None:
+                        token_keys |= cache_outputs.token_mm_keys
+                        cached_keys = cache_outputs.cached_mm_keys
+                        if cache_outputs.hidden_states is not None:
+                            cached_keys |= {"hidden"}
+                    token_keys -= self._resolve_full_payload_replace_keys()
+                    payload = slice_token_payload(
+                        payload,
+                        token_range=scheduled_token_ranges[rid],
+                        delivered_upto=getattr(scheduler_output, "delivered_upto", {}).get(rid, 0),
+                        token_keys=token_keys,
+                        cached_token_range=cache_outputs.token_ranges[rid] if cache_outputs is not None else None,
+                        cached_keys=cached_keys,
+                    )
+                pooler_output.append(payload)
 
         pooler_output = pooler_output or []
         if self._async_chunk and stage_sends_async_output(self.model_config):
@@ -1437,15 +1440,10 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # [Omni] Full-payload send-side accumulation. Mirrors gpu_ar_model_runner.py.
         if pooler_inter and self._should_accumulate_full_payload_output():
             with record_function_or_nullcontext("omni_output_builder:accumulate_full_payload_output"):
-                self._prefix_cache_accumulate_full_payload(
-                    req_ids_output_copy,
-                    pooler_inter,
-                    {
-                        rid: (self.requests[rid].num_computed_tokens, self.requests[rid].num_computed_tokens + count)
-                        for rid, count in scheduler_output.num_scheduled_tokens.items()
-                    },
-                    cache_outputs,
-                )
+                for rid, payload in zip(req_ids_output_copy, pooler_inter):
+                    request = self.requests.get(rid)
+                    if request is not None and payload:
+                        self.accumulate_full_payload_output(rid, payload, request)
 
         inter_stage_outputs = self._build_multimodal_outputs(pooler_inter)
         multimodal_outputs = (

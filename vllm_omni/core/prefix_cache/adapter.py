@@ -41,7 +41,6 @@ class PrefixCacheRequestEvent:
     scheduled_tokens: int = 0
     num_output_tokens: int = 0
     delivered_upto: int = 0
-    recovery_start: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,7 +160,7 @@ class PrefixCacheSchedulerAdapter:
                     block_ids=self._blocks_value(new_blocks[index]) if index < len(new_blocks) else (),
                     scheduled_tokens=max(0, int(scheduled_tokens.get(req_id, 0))),
                     num_output_tokens=int(output_tokens[index]) if index < len(output_tokens) else 0,
-                    delivered_upto=getattr(scheduler_output, "resumed_delivered_upto", {}).get(req_id, 0),
+                    delivered_upto=getattr(scheduler_output, "delivered_upto", {}).get(req_id, 0),
                 )
             )
             emitted.add(req_id)
@@ -196,6 +195,7 @@ class PrefixCacheSchedulerAdapter:
         group_view: Any,
         *,
         num_scheduled_tokens: Mapping[str, int],
+        token_ranges: Mapping[str, tuple[int, int]] | None = None,
     ) -> PrefixCacheWriteLayout:
         req_order = tuple(group_view.batch_req_ids())
         writes: list[PrefixCacheWrite] = []
@@ -204,7 +204,9 @@ class PrefixCacheSchedulerAdapter:
             count = int(num_scheduled_tokens.get(req_id, 0))
             if count < 0:
                 raise OmniPrefixCacheUnmatchError(f"negative scheduled token count for req {req_id}: {count}")
-            token_start, token_end = group_view.token_range(req_id, count)
+            token_start, token_end = (
+                token_ranges[req_id] if token_ranges is not None else group_view.token_range(req_id, count)
+            )
             writes.append(PrefixCacheWrite(req_id, cursor, cursor + count, token_start, token_end))
             cursor += count
         slots = group_view.step_slots_cpu(list(req_order), dict(num_scheduled_tokens))

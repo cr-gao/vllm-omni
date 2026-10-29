@@ -141,5 +141,5 @@ class OmniSchedulerOutput(SchedulerOutput):
     pending_request_prewarms: list[OmniRequestPrewarm] = field(default_factory=list)
     discarded_req_ids: set[str] = field(default_factory=set)
     scheduled_token_ranges: dict[str, tuple[int, int]] = field(default_factory=dict)
-    resumed_delivered_upto: dict[str, int] = field(default_factory=dict)
+    delivered_upto: dict[str, int] = field(default_factory=dict)
     replaced_req_ids: set[str] = field(default_factory=set)

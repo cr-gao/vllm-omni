@@ -23,6 +23,7 @@ from vllm_omni.core.prefix_cache.group_view import FullAttentionGroupView
 from vllm_omni.core.prefix_cache.interface import HIDDEN_KEY, PrefixCacheConfig
 from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler as Scheduler
+from vllm_omni.utils.mm_outputs import slice_token_payload
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -139,8 +140,17 @@ class _CPUCacheRun:
             write_layout=layout,
         )
         raw = self.manager.materialize(step_id, req_ids)
-        delivery = self.manager.delivery_view(raw, req_ids)
-        delivered = delivery.hidden_states
+        delivered = {
+            rid: slice_token_payload(
+                {"hidden": raw.hidden_states[rid]},
+                token_range=output.scheduled_token_ranges[rid],
+                delivered_upto=output.delivered_upto[rid],
+                token_keys=frozenset({"hidden"}),
+                cached_token_range=raw.token_ranges[rid],
+                cached_keys=frozenset({"hidden"}),
+            ).get("hidden", raw.hidden_states[rid][:0])
+            for rid in req_ids
+        }
         for req_id in req_ids:
             logger.info(
                 "req=%s resumed=%s scheduled=[%d,%d) delivered=%s",
@@ -209,6 +219,7 @@ def test_growing_hit_delivers_only_missing_absolute_rows(cpu_run):
     run.scheduler.add_request(victim)
     first, delivered, _ = run.step()
     assert first.num_scheduled_tokens == {"victim": 8}
+    assert first.delivered_upto == {"victim": 0}
     assert _positions(delivered, "victim") == list(range(8))
 
     _preempt(run, victim)
@@ -223,7 +234,7 @@ def test_growing_hit_delivers_only_missing_absolute_rows(cpu_run):
 
     run.scheduler.finish_requests("helper", RequestStatus.FINISHED_ABORTED)
     resumed, delivered, _ = run.step()
-    assert resumed.resumed_delivered_upto == {"victim": 8}
+    assert resumed.delivered_upto == {"victim": 8}
     assert _resume_hit_end(resumed, "victim") == 16
     assert _positions(delivered, "victim") == list(range(8, 20))
 
@@ -234,7 +245,8 @@ def test_shrinking_hit_saves_replay_without_redelivering_it(cpu_run):
     run.scheduler.add_request(victim)
     _, delivered, _ = run.step()
     assert _positions(delivered, "victim") == list(range(8))
-    _, delivered, _ = run.step()
+    second, delivered, _ = run.step()
+    assert second.delivered_upto == {"victim": 8}
     assert _positions(delivered, "victim") == list(range(8, 16))
 
     blocks = run.scheduler.kv_cache_manager.get_blocks("victim").get_block_ids()[0]
@@ -242,7 +254,7 @@ def test_shrinking_hit_saves_replay_without_redelivering_it(cpu_run):
     _preempt(run, victim)
     run.scheduler.kv_cache_manager.block_pool.evict_blocks(set(blocks[2:]))
     resumed, delivered, layout = run.step()
-    assert resumed.resumed_delivered_upto == {"victim": 16}
+    assert resumed.delivered_upto == {"victim": 16}
     assert _resume_hit_end(resumed, "victim") == 8
     assert _positions(delivered, "victim") == []
 

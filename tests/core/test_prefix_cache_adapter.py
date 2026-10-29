@@ -106,9 +106,9 @@ def test_resumed_event_snapshots_cached_request_payload():
             "num_output_tokens": [1, 6],
         },
     )
-    scheduler_output.resumed_delivered_upto = {"r": 8}
+    scheduler_output.delivered_upto = {"r": 8}
     event = adapter.translate_step(scheduler_output).events[0]
-    scheduler_output.resumed_delivered_upto["r"] = 10
+    scheduler_output.delivered_upto["r"] = 10
     assert (event.kind, event.req_id, event.hit_end) == (PrefixCacheEventKind.RESUMED, "r", 8)
     assert event.block_ids == ((4, 5),)
     assert event.scheduled_tokens == 0

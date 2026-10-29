@@ -196,7 +196,7 @@ def test_save_step_gates_and_passthrough(monkeypatch):
     assert save() is None  # cache off
     r.omni_prefix_cache = stub
     r._prefix_cache_adapter = SimpleNamespace(
-        build_write_layout=lambda view, *, num_scheduled_tokens: PrefixCacheWriteLayout((), 0)
+        build_write_layout=lambda view, *, num_scheduled_tokens, token_ranges: PrefixCacheWriteLayout((), 0)
     )
     r._prefix_cache_group_view = SimpleNamespace()
     r._prefix_cache_step = PrefixCacheStep((), ())

@@ -304,22 +304,23 @@ rejected draft tokens. Preemption retains the boundary; prompt replacement and
 new logical requests start at zero. This describes local scheduler acceptance,
 not connector or client receipt.
 
-`materialize` restores raw step outputs for postprocess. A delivery view clips
-replayed rows using the resume boundary captured at save time. Buffered decode
-outputs snapshot the same clipping boundary even before their cache writes flush.
-The flush preserves absolute token ranges and only coalesces consecutive positions
-in a stable batch. Cache write completion remains owned by the controller and slot
-state. Output builders never advance delivery progress.
+The scheduler sends its accepted boundary for every scheduled request.
+`materialize` restores raw step outputs for postprocess. The output builder then
+clips token fields using the frozen execution range and accepted boundary,
+for both chunk and full-payload delivery, with or without a cache. Buffered decode
+uses the same positions before its cache writes flush. The flush only coalesces
+consecutive positions in a stable batch. Cache write completion remains owned by
+the controller and slot state. Output builders never advance delivery progress.
 
-Full-payload accumulation retains its own per-field coverage and clips replay
-independently for each field. Before resume, the worker joins pending output
-builders, removes any accumulated tail the scheduler did not accept, and snapshots
-local coverage for cache recovery. An empty accumulator starts recovery at zero.
-Truncating an unaccepted tail requires token-aligned coverage from position zero;
-ambiguous scaled or late-starting fields raise instead of silently slicing by
-token count. Ordered builders propagate failures to later outputs. Terminal notifications join
-pending builders before flush or discard. Sparse list-only audio bypasses token
-clipping because its emission does not follow scheduler token ranges.
+Full-payload accumulation appends already-clipped token rows and replaces fields
+listed in the processor's `_FULL_PAYLOAD_REPLACE_KEYS`. Before resume, the worker
+joins pending builders and removes unaccepted rows from token fields declared by
+`_FULL_PAYLOAD_TOKEN_KEYS` (flat keys or namespace roots); `hidden` is token-aligned
+by default. Other fields retain their existing accumulation semantics. Fixed
+embeddings are replaced and never sliced by token count. Ordered builders
+propagate failures to later outputs. Terminal notifications join pending builders
+before flush or discard. Sparse list-only audio bypasses token clipping because
+its emission does not follow scheduler token ranges.
 
 Stages whose decode state cannot be reconstructed from token IDs declare
 `recompute_preemption="fail"` in their AR pipeline topology. Capacity

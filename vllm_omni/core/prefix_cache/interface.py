@@ -118,10 +118,8 @@ class StageCacheOutputs:
     hidden_states: dict[ReqId, torch.Tensor] | None
     mm_outputs: dict[TensorName, dict[ReqId, Any]]
     token_ranges: dict[ReqId, tuple[int, int]] = field(default_factory=dict)
-    scheduled_token_ranges: dict[ReqId, tuple[int, int]] = field(default_factory=dict)
     cached_mm_keys: frozenset[TensorName] = frozenset()
     token_mm_keys: frozenset[TensorName] = frozenset()
-    delivery_starts: dict[ReqId, int] = field(default_factory=dict)
 
 
 class OmniPrefixCacheUnmatchError(RuntimeError):

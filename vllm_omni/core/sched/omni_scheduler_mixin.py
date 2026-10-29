@@ -793,10 +793,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
                 for rid, start in starts.items()
                 if rid in base.num_scheduled_tokens
             },
-            resumed_delivered_upto={
-                rid: getattr(self.requests[rid], "delivered_upto", 0)
-                for rid in base.scheduled_cached_reqs.resumed_req_ids
-            },
+            delivered_upto={rid: getattr(self.requests[rid], "delivered_upto", 0) for rid in base.num_scheduled_tokens},
             replaced_req_ids=replaced_req_ids,
             discarded_req_ids=finished_discarded_req_ids,
             finished_requests_needing_kv_transfer=finished_requests_needing_kv_transfer or {},

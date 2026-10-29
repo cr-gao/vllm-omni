@@ -14,8 +14,6 @@ call time) so ``tests/core`` keeps loading the package without vLLM.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
-from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -60,8 +58,6 @@ class PrefixCacheRunnerMixin:
     kv_cache_config: Any
     is_pooling_model: bool
     requests: dict[str, Any]
-    _full_payload_token_ends: dict[str, dict[str, int]]
-    accumulate_full_payload_output: Callable[..., None]
 
     omni_prefix_cache: OmniPrefixCacheManager | None = None
     _omni_prefix_cache_cfg: PrefixCacheConfig | None = None
@@ -78,6 +74,7 @@ class PrefixCacheRunnerMixin:
     ) = None
     _prefix_cache_decode_reserved = 0
     _prefix_cache_pure_decode = False
+    _scheduled_token_ranges: dict[str, tuple[int, int]] | None = None
 
     def _snapshot_prefix_cache_model_policy(self, model) -> None:
         """Freeze the model's cache policy at load_model."""
@@ -140,34 +137,18 @@ class PrefixCacheRunnerMixin:
         """Per-step lifecycle entry; must run before ``_update_states``
         removes finished requests (finished/abort escalation happens inside
         ``new_step_starts``). Builds the manager on the first real step."""
-        recovery_starts = {}
-        if (
-            getattr(self, "_full_payload_token_ends", None) is not None
-            and self._should_accumulate_full_payload_output()
-        ):
+        if getattr(self, "_pending_full_payload_send", None) and self._should_accumulate_full_payload_output():
             for req_id in getattr(scheduler_output, "replaced_req_ids", ()):
                 self._pending_full_payload_send.pop(req_id, None)
-                self._full_payload_token_ends.pop(req_id, None)
-            recovery_starts = {
-                req_id: self.resume_full_payload_output(req_id, delivered)
-                for req_id, delivered in getattr(scheduler_output, "resumed_delivered_upto", {}).items()
-            }
+            cached = scheduler_output.scheduled_cached_reqs
+            for req_id in cached.resumed_req_ids:
+                self.resume_full_payload_output(req_id, scheduler_output.delivered_upto[req_id])
         if self.omni_prefix_cache is None and self._omni_prefix_cache_cfg is not None:
             self._ensure_omni_prefix_cache()
         if self.omni_prefix_cache is not None:
             if self._prefix_cache_adapter is None or self._prefix_cache_group_view is None:
                 raise RuntimeError("prefix-cache adapter and view were not initialized together")
             step = self._prefix_cache_adapter.translate_step(scheduler_output)
-            if recovery_starts:
-                step = replace(
-                    step,
-                    events=tuple(
-                        replace(event, recovery_start=recovery_starts[event.req_id])
-                        if event.req_id in recovery_starts
-                        else event
-                        for event in step.events
-                    ),
-                )
             self._prefix_cache_step = step
             self._prefix_cache_pure_decode = (
                 self._prefix_cache_decode_cfg is not None
@@ -191,6 +172,7 @@ class PrefixCacheRunnerMixin:
         *,
         num_tokens_unpadded: int,
         num_tokens_padded: int,
+        token_ranges: dict[str, tuple[int, int]] | None = None,
     ) -> int | None:
         """Write this step's outputs into the cache.
 
@@ -201,6 +183,7 @@ class PrefixCacheRunnerMixin:
         """
         from vllm.distributed.parallel_state import get_pp_group
 
+        self._scheduled_token_ranges = token_ranges
         if self.is_pooling_model or self.omni_prefix_cache is None or not get_pp_group().is_last_rank:
             return None
         if self._prefix_cache_adapter is None or self._prefix_cache_group_view is None:
@@ -209,7 +192,12 @@ class PrefixCacheRunnerMixin:
             raise RuntimeError("prefix-cache step snapshot was not initialized")
         layout = self._prefix_cache_adapter.build_write_layout(
             self._prefix_cache_group_view,
-            num_scheduled_tokens=dict(self._prefix_cache_step.scheduled_tokens),
+            num_scheduled_tokens=(
+                {rid: end - start for rid, (start, end) in token_ranges.items()}
+                if token_ranges is not None
+                else dict(self._prefix_cache_step.scheduled_tokens)
+            ),
+            token_ranges=self._scheduled_token_ranges,
         )
         mm = flatten_payload(multimodal_outputs) if multimodal_outputs else {}
         n = num_tokens_unpadded
@@ -336,27 +324,3 @@ class PrefixCacheRunnerMixin:
         if step_id is None or self.omni_prefix_cache is None:
             return None
         return self.omni_prefix_cache.materialize(step_id, list(req_ids))
-
-    def _prefix_cache_accumulate_full_payload(
-        self,
-        req_ids: list[str],
-        payloads: Sequence[dict[str, Any] | None],
-        token_ranges: dict[str, tuple[int, int]],
-        cache_outputs: StageCacheOutputs | None,
-    ) -> None:
-        for rid, payload in zip(req_ids, payloads):
-            request = self.requests.get(rid)
-            if request is None or not payload:
-                continue
-            cached_keys: frozenset[str] = frozenset()
-            if cache_outputs is not None:
-                token_range = cache_outputs.scheduled_token_ranges[rid]
-                keys = set(cache_outputs.cached_mm_keys)
-                if cache_outputs.hidden_states is not None:
-                    keys.add("hidden")
-                cached_keys = frozenset(keys)
-            else:
-                token_range = token_ranges[rid]
-            self.accumulate_full_payload_output(
-                rid, payload, request, token_range=token_range, prefix_cache_keys=cached_keys
-            )

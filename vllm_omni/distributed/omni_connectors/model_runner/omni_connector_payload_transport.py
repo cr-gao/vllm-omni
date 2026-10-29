@@ -62,6 +62,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
     """Own payload caching, full/chunk transport, and connector I/O."""
 
     _full_payload_replace_keys_cached: frozenset[str]
+    _full_payload_token_keys_cached: frozenset[str]
 
     # ------------------------------------------------------------------ #
     #  Local payload cache (RFC §2.4 – Model Runner ownership)
@@ -600,150 +601,79 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 output[k] = tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
         return output, request
 
-    def _resolve_full_payload_replace_keys(self) -> frozenset[str]:
-        """Per-model REPLACE-key set for the full-payload accumulator.
-
-        Looked up from the stage-input-processor module that ships the model's sync builder
-        (`model_config.custom_process_input_func.__module__`).  The module
-        declares ``_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str]``; if absent,
-        returns the empty set.
-
-        Cached per instance.  Keys in this set use REPLACE semantics in the
-        accumulator (subsequent emissions discard prior chunks) instead of
-        the default CONCAT semantics.  Use for tensors that carry the full
-        result so far rather than per-step deltas (e.g. ``model_outputs``).
-        """
-        cached = getattr(self, "_full_payload_replace_keys_cached", None)
+    def _resolve_full_payload_keys(self, declaration: str, cache_attr: str) -> frozenset[str]:
+        cached = getattr(self, cache_attr, None)
         if cached is not None:
             return cached
         proc = getattr(self, "_custom_process_func", None)
-        if proc is None:
-            self._full_payload_replace_keys_cached = frozenset()
-            return self._full_payload_replace_keys_cached
         module_name = getattr(proc, "__module__", None)
-        if module_name is None:
-            self._full_payload_replace_keys_cached = frozenset()
-            return self._full_payload_replace_keys_cached
-        try:
-            import sys as _sys
+        keys: Any = frozenset()
+        if module_name is not None:
+            try:
+                import sys as _sys
 
-            mod = _sys.modules.get(module_name) or importlib.import_module(module_name)
-            keys: Any = getattr(mod, "_FULL_PAYLOAD_REPLACE_KEYS", frozenset())
-        except ImportError:
-            logger.debug(
-                "Could not import stage input processor module %s while resolving "
-                "_FULL_PAYLOAD_REPLACE_KEYS; using CONCAT semantics for all keys.",
-                module_name,
-                exc_info=True,
-            )
-            keys = frozenset()
+                mod = _sys.modules.get(module_name) or importlib.import_module(module_name)
+                keys = getattr(mod, declaration, frozenset())
+            except ImportError:
+                logger.debug(
+                    "Could not import stage input processor module %s while resolving %s.",
+                    module_name,
+                    declaration,
+                    exc_info=True,
+                )
         if not isinstance(keys, (frozenset, set)):
-            logger.debug(
-                "Ignoring non-set _FULL_PAYLOAD_REPLACE_KEYS from %s: %s",
-                module_name,
-                type(keys).__name__,
-            )
+            logger.debug("Ignoring non-set %s from %s: %s", declaration, module_name, type(keys).__name__)
             keys = frozenset()
-        self._full_payload_replace_keys_cached = frozenset(keys)
-        logger.debug(
-            "Resolved _FULL_PAYLOAD_REPLACE_KEYS for %s: %s",
-            module_name,
-            sorted(self._full_payload_replace_keys_cached),
-        )
-        return self._full_payload_replace_keys_cached
+        resolved = frozenset(keys)
+        setattr(self, cache_attr, resolved)
+        return resolved
 
-    def _reconcile_full_payload_output(
-        self,
-        req_id: str,
-        output: dict[str, Any],
-        token_range: tuple[int, int],
-        replace_keys: frozenset[str],
-        prefix_cache_keys: frozenset[str],
-    ) -> dict[str, Any]:
-        """Keep previously emitted positions when an AR step replays a prefix."""
-        start, end = token_range
-        token_ends = self._full_payload_token_ends.setdefault(req_id, {})
-        reconciled = {}
-        for key, value in output.items():
-            if value is None:
-                continue
-            previous_end = token_ends.get(key)
-            if previous_end is not None:
-                if end <= previous_end:
-                    continue
-                if isinstance(value, torch.Tensor) and value.ndim >= 2 and key not in replace_keys:
-                    num_rows = value.shape[0]
-                    # Only cache-merged token-aligned tensors carry rows before this step.
-                    row_start = end - num_rows if key in prefix_cache_keys else start
-                    overlap = previous_end - row_start
-                    if overlap > 0:
-                        if num_rows != end - row_start:
-                            raise ValueError(
-                                f"Cannot reconcile replayed full payload {key!r} for {req_id!r}: "
-                                f"{num_rows} rows do not align with token range [{row_start}, {end})."
-                            )
-                        # Release the replayed prefix storage after keeping its new suffix.
-                        value = value[overlap:].clone()
-            reconciled[key] = value
-        token_ends.update({key: end for key in reconciled})
-        return reconciled
+    def _resolve_full_payload_replace_keys(self) -> frozenset[str]:
+        """Resolve processor fields whose latest value replaces earlier emissions."""
+        return self._resolve_full_payload_keys("_FULL_PAYLOAD_REPLACE_KEYS", "_full_payload_replace_keys_cached")
 
-    def resume_full_payload_output(self, req_id: str, delivered_upto: int) -> int:
-        """Drop an unaccepted tail before replay and return local recovery coverage."""
-        ends = self._full_payload_token_ends.get(req_id, {})
+    def _is_full_payload_token_key(self, key: str) -> bool:
+        """Match token-aligned fields or flattened namespaces declared by the processor."""
+        if key in self._resolve_full_payload_replace_keys():
+            return False
+        if key == "hidden":
+            return True
+        token_keys = self._resolve_full_payload_keys("_FULL_PAYLOAD_TOKEN_KEYS", "_full_payload_token_keys_cached")
+        return any(key == name or key.startswith(name + ".") for name in token_keys)
+
+    def resume_full_payload_output(self, req_id: str, delivered_upto: int) -> None:
+        """Drop unaccepted token rows before a request resumes."""
         entry = self._pending_full_payload_send.get(req_id)
-        if entry is not None:
-            chunks, latest, rows, _ = entry
-            replace_keys = self._resolve_full_payload_replace_keys()
-            for key, end in ends.items():
-                if end > delivered_upto and key in chunks and key not in replace_keys and rows[key] != end:
-                    raise ValueError(
-                        f"Cannot truncate full payload {key!r} for {req_id!r}: "
-                        f"{rows[key]} rows do not establish token coverage [0, {end})."
-                    )
-            for key, end in tuple(ends.items()):
-                if end <= delivered_upto:
-                    continue
-                if key in chunks and key not in replace_keys:
-                    keep = max(0, rows[key] - (end - delivered_upto))
-                    kept = []
-                    remaining = keep
-                    for tensor in chunks[key]:
-                        if remaining <= 0:
-                            break
-                        kept.append(tensor if tensor.shape[0] <= remaining else tensor[:remaining].clone())
-                        remaining -= tensor.shape[0]
-                    chunks[key] = kept
-                    rows[key] = keep
-                    ends[key] = delivered_upto
-                else:
-                    chunks.pop(key, None)
-                    latest.pop(key, None)
-                    rows.pop(key, None)
-                    ends.pop(key)
-        return min(ends.values(), default=0)
+        if entry is None:
+            return
+        chunks, _latest, rows, _request = entry
+        for key, tensors in chunks.items():
+            if not self._is_full_payload_token_key(key) or rows[key] <= delivered_upto:
+                continue
+            kept = []
+            remaining = delivered_upto
+            for tensor in tensors:
+                if remaining <= 0:
+                    break
+                kept.append(tensor if tensor.shape[0] <= remaining else tensor[:remaining].clone())
+                remaining -= tensor.shape[0]
+            chunks[key] = kept
+            rows[key] = delivered_upto
 
     def accumulate_full_payload_output(
         self,
         req_id: str,
         pooler_output: Any,
         request: Any,
-        *,
-        token_range: tuple[int, int] | None = None,
-        prefix_cache_keys: frozenset[str] = frozenset(),
     ) -> None:
         """Accumulate pooler_output for a request across steps (full_payload_mode).
 
-        Per-token tensors (2-D+, matching trailing dims) and the 1-D codec
+        Row tensors (2-D+, matching trailing dims) and the 1-D codec
         validity mask are concatenated along dim-0. Scalar / global tensors
         are replaced with the latest value.
 
-        AR callers provide the executed input-token range [start, end).
-        prefix_cache_keys identifies token-aligned tensors from the cache merge.
-        Previously emitted positions survive preemption: replayed prefixes
-        are skipped and only a new suffix is appended. Non-token-aligned
-        tensors cannot be sliced across a partial replay boundary. One-shot
-        generation outputs omit token_range and retain their existing policy.
+        Callers clip replayed token rows before accumulation. Other payload
+        fields retain their per-model CONCAT or REPLACE policy.
 
         Note: codec rows are NOT filtered for zero placeholders here. The
         downstream consumer ``_extract_qwen3_full_payload_codec_rows`` crops
@@ -757,15 +687,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         """
         replace_keys = self._resolve_full_payload_replace_keys()
         existing = self._pending_full_payload_send.get(req_id)
-        if token_range is not None:
-            if existing is None:
-                self._full_payload_token_ends.pop(req_id, None)
-            pooler_output = self._reconcile_full_payload_output(
-                req_id, pooler_output, token_range, replace_keys, prefix_cache_keys
-            )
-            if not pooler_output:
-                return
-
         if existing is None:
             chunks, latest, rows = self._new_full_payload_accumulator(pooler_output)
             self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
@@ -813,7 +734,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         """Discard failed accumulators and send normally finished payloads."""
         for req_id in discarded_req_ids or ():
             self._pending_full_payload_send.pop(req_id, None)
-            self._full_payload_token_ends.pop(req_id, None)
         pending_req_ids = set(self._pending_full_payload_send.keys())
         if not (finished_req_ids & pending_req_ids):
             return
@@ -827,7 +747,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         to_send: dict[str, tuple[Any, Any]] = {}
         for req_id in finished_req_ids:
             entry = self._pending_full_payload_send.pop(req_id, None)
-            self._full_payload_token_ends.pop(req_id, None)
             if entry is not None:
                 to_send[req_id] = self._materialize_full_payload_entry(entry)
         logger.debug("[Stage-%s] flush_full_payload_outputs: to_send=%s", self._stage_id, list(to_send.keys()))
